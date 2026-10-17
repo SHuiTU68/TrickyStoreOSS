@@ -33,10 +33,12 @@ val gitCommitHash =
 
 val verName = "v3.1.0"
 
+val androidNdkVersion = "29.0.14206865"
+
 android {
     namespace = "io.github.beakthoven.TrickyStoreOSS"
     compileSdk = 37
-    ndkVersion = "29.0.14206865"
+    ndkVersion = androidNdkVersion
 
     defaultConfig {
         applicationId = "io.github.beakthoven.TrickyStoreOSS"
@@ -94,8 +96,18 @@ dependencies {
 // --- Native cert generation (Rust) ---
 // Builds libcertgen.so for every supported ABI straight into app/src/main/jniLibs, which AGP
 // merges into the APK; the module packaging below then extracts it from the APK.
-val buildRustCertgen by
-    tasks.registering(Exec::class) {
+//
+// AGP 9 removed `android.ndkDirectory`, so resolve the NDK from the environment and let cargo-ndk
+// fall back to its own discovery when nothing is set.
+val ndkForCargo =
+    System.getenv("ANDROID_NDK_HOME")
+        ?: System.getenv("ANDROID_NDK_ROOT")
+        ?: System.getenv("ANDROID_NDK")
+        ?: (System.getenv("ANDROID_SDK_ROOT") ?: System.getenv("ANDROID_HOME"))
+            ?.let { "$it/ndk/$androidNdkVersion" }
+
+val buildRustCertgen =
+    tasks.register<Exec>("buildRustCertgen") {
         group = "TrickyStoreOSS Native Build"
         description = "Builds libcertgen.so via cargo-ndk for all supported ABIs."
 
@@ -123,7 +135,7 @@ val buildRustCertgen by
         inputs.file(rootProject.projectDir.resolve("native-certgen/Cargo.lock"))
         outputs.dir(rootProject.projectDir.resolve("app/src/main/jniLibs"))
 
-        environment("ANDROID_NDK_HOME", android.ndkDirectory.absolutePath)
+        ndkForCargo?.let { environment("ANDROID_NDK_HOME", it) }
         environment(
             "PATH",
             "${System.getProperty("user.home")}/.cargo/bin:${System.getenv("PATH") ?: ""}",
