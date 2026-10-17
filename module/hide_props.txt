@@ -1,0 +1,34 @@
+# Global system-property spoofing, applied once at boot through `resetprop`.
+#
+#   - `name=value` sets the system property `name` to `value` globally, so every process on the
+#     device sees the spoofed value. This is applied at boot only; edit and reboot to change it.
+#   - Lines starting with `#` are comments and blank lines are ignored.
+#   - Properties whose value already matches are skipped, so nothing is written unnecessarily.
+#   - Remove a line to stop spoofing that property (the original value returns on the next boot).
+#
+# Behaviour switches (keys without a dot):
+#   adb=off    disable USB debugging at boot (Settings.Global.adb_enabled = 0)
+#   usb=none   set the USB configuration to `none`, i.e. no data functions (MTP/ADB/…)
+
+# --- Verified boot / bootloader lock state ---
+ro.boot.verifiedbootstate=green
+ro.boot.flash.locked=1
+ro.boot.vbmeta.device_state=locked
+ro.boot.veritymode=enforcing
+ro.boot.warranty_bit=0
+ro.warranty_bit=0
+ro.vendor.boot.warranty_bit=0
+ro.vendor.warranty_bit=0
+sys.oem_unlock_allowed=0
+ro.oem_unlock_supported=0
+
+# --- Build / debug state ---
+ro.secure=1
+ro.debuggable=0
+ro.build.type=user
+ro.build.tags=release-keys
+ro.boot.selinux=enforcing
+
+# --- Boot hardening ---
+adb=off
+usb=none

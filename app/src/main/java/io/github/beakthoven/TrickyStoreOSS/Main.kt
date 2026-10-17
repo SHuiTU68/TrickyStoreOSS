@@ -24,6 +24,7 @@ fun main(args: Array<String>) {
         val probe = AttestUtils.probe()
         Logger.i("Startup attestation probe: ${probe.status} (${probe.failureCategory ?: "none"})")
         AndroidUtils.setupBootHash()
+        HideProps.apply()
         initializeInterceptors()
         maintainService()
     } catch (e: Exception) {

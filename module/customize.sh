@@ -95,3 +95,8 @@ if [ ! -f "$CONFIG_DIR/target.txt" ]; then
   ui_print "- Adding default target scope"
   install_file "target.txt" "$CONFIG_DIR"
 fi
+
+if [ ! -f "$CONFIG_DIR/hide_props.txt" ]; then
+  ui_print "- Adding default property spoofing config"
+  install_file "hide_props.txt" "$CONFIG_DIR"
+fi

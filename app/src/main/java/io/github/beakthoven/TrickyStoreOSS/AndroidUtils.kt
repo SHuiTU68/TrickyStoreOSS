@@ -103,11 +103,11 @@ object AndroidUtils {
 
     private fun setBootHashProp(bytes: ByteArray) {
         val hex = bytes.toHex()
-        try {
-            Logger.d("Setting ro.boot.vbmeta.digest")
-            SystemProperties.set("ro.boot.vbmeta.digest", hex)
-        } catch (e: Exception) {
-            Logger.e("Exception setting vbmeta digest: ${e.message}")
+        Logger.d("Setting ro.boot.vbmeta.digest")
+        // SystemProperties.set() cannot write an existing ro.* property, so go through resetprop,
+        // which also avoids leaving a detectable "property changed" trace.
+        if (!HideProps.setProperty("ro.boot.vbmeta.digest", hex)) {
+            Logger.e("Failed to set ro.boot.vbmeta.digest")
         }
     }
 

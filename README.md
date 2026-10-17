@@ -155,7 +155,29 @@ boot=device_default
 
 GMS overrides only `system`; it inherits `vendor=device_default` and `boot=no` from the global block. The demo app sets all three to `2025-09-15` via `all`, then carves boot back out to the real device value.
 
-> This only affects KeyAttestation results. `resetprop` can be used separately if you need to change system properties.
+> This only affects KeyAttestation results. Use [`hide_props.txt`](#hide_propstxt--global-property-spoofing) if you also need to change system properties.
+
+---
+
+### `hide_props.txt` — global property spoofing
+
+Optional. Lives at `/data/adb/tricky_store/hide_props.txt`. It spoofs system properties **globally** (every process on the device sees the spoofed value), which is what most root/bootloader detectors actually read. It is applied once at boot, and only writes properties whose value actually differs, so the cost is negligible.
+
+```sh
+# One name=value per line; # starts a comment.
+ro.boot.verifiedbootstate=green
+ro.boot.flash.locked=1
+ro.debuggable=0
+ro.build.type=user
+
+# Behaviour switches (keys without a dot):
+adb=off     # disable USB debugging at boot (adb_enabled = 0)
+usb=none    # set the USB configuration to `none` (no MTP/ADB data functions)
+```
+
+Writes go through `resetprop` (never `SystemProperties.set`), because `ro.*` properties are read-only once init has set them and a plain set would silently fail; `resetprop` also edits the property area directly, leaving no detectable "property changed" trace. Remove a line and reboot to stop spoofing that property. The module ships a default file with a sensible set of bootloader/root and build-state properties plus the `adb=off` / `usb=none` switches.
+
+> `usb=none` also sets `persist.sys.usb.config`, so re-enabling USB requires clearing that property (or editing the file and rebooting the device after removing that line).
 
 ---
 
