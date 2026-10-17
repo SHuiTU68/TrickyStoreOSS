@@ -519,8 +519,8 @@ object CertificateGen {
         appendSigningChain: Boolean,
     ): List<Certificate>? {
         if (!NativeCertGen.isAvailable) return null
-        val signingChain = signing.certChainDer
-        if (signingChain.isNullOrEmpty()) return null
+        val signingChain = signing.certChainDer ?: return null
+        if (signingChain.isEmpty()) return null
 
         val request =
             runCatching { encodeChainBuildRequest(keyPair, attestationDer, signing, params, appendSigningChain) }
