@@ -176,7 +176,7 @@ fn sign_tbs(tbs_der: &[u8], signing_key_der: &[u8], algorithm: Algorithm) -> Res
 
 /// Reads the signature algorithm to use from the signing key's PKCS#8 `AlgorithmIdentifier`, so a
 /// keybox key whose algorithm differs from the leaf key still signs with the right primitive.
-fn detect_signing_key_algorithm(pkcs8_der: &[u8]) -> Result<Algorithm> {
+pub(crate) fn detect_signing_key_algorithm(pkcs8_der: &[u8]) -> Result<Algorithm> {
     use der::Decode;
     let info = pkcs8::PrivateKeyInfo::from_der(pkcs8_der)
         .map_err(|e| CertGenError::SigningFailed(format!("PKCS8 parse: {e}")))?;
@@ -208,7 +208,7 @@ fn sign_tbs_ec(tbs_der: &[u8], signing_key_der: &[u8]) -> Result<Vec<u8>> {
     Ok(sig.as_ref().to_vec())
 }
 
-fn detect_ec_signing_algorithm(
+pub(crate) fn detect_ec_signing_algorithm(
     pkcs8_der: &[u8],
 ) -> Result<&'static ring::signature::EcdsaSigningAlgorithm> {
     use der::Decode;
@@ -577,7 +577,7 @@ fn encode_der_integer(value: &[u8]) -> Vec<u8> {
     }
 }
 
-fn encode_der_bit_string(bits: &[u8]) -> Vec<u8> {
+pub(crate) fn encode_der_bit_string(bits: &[u8]) -> Vec<u8> {
     // BIT STRING: tag 0x03, length, unused_bits (0), content
     let mut content = Vec::with_capacity(1 + bits.len());
     content.push(0x00); // 0 unused bits
@@ -597,7 +597,7 @@ fn encode_der_boolean(val: bool) -> Vec<u8> {
     encode_der_tag_length_value(0x01, &[if val { 0xFF } else { 0x00 }])
 }
 
-fn encode_der_oid(components: &[u64]) -> Vec<u8> {
+pub(crate) fn encode_der_oid(components: &[u64]) -> Vec<u8> {
     if components.len() < 2 {
         return encode_der_tag_length_value(0x06, &[]);
     }

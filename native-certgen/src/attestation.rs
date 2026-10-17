@@ -278,7 +278,7 @@ fn build_set_of(mut encoded: Vec<Vec<u8>>) -> Vec<u8> {
 
 // --- DER primitives ---
 
-fn enc_length(len: usize) -> Vec<u8> {
+pub(crate) fn enc_length(len: usize) -> Vec<u8> {
     if len < 0x80 {
         vec![len as u8]
     } else if len <= 0xFF {
@@ -292,7 +292,7 @@ fn enc_length(len: usize) -> Vec<u8> {
     }
 }
 
-fn enc_integer(value: i64) -> Vec<u8> {
+pub(crate) fn enc_integer(value: i64) -> Vec<u8> {
     // DER INTEGER: tag 0x02, minimal two's complement big-endian
     let bytes = integer_bytes(value);
     let mut out = vec![0x02];
@@ -332,7 +332,7 @@ fn integer_bytes(value: i64) -> Vec<u8> {
     raw[start..].to_vec()
 }
 
-fn enc_enumerated(value: i32) -> Vec<u8> {
+pub(crate) fn enc_enumerated(value: i32) -> Vec<u8> {
     // DER ENUMERATED: tag 0x0A, same value encoding as INTEGER
     let bytes = integer_bytes(value as i64);
     let mut out = vec![0x0A];
@@ -341,7 +341,7 @@ fn enc_enumerated(value: i32) -> Vec<u8> {
     out
 }
 
-fn enc_octet_string(data: &[u8]) -> Vec<u8> {
+pub(crate) fn enc_octet_string(data: &[u8]) -> Vec<u8> {
     let mut out = vec![0x04];
     out.extend_from_slice(&enc_length(data.len()));
     out.extend_from_slice(data);
@@ -352,12 +352,12 @@ fn enc_null() -> Vec<u8> {
     vec![0x05, 0x00]
 }
 
-fn enc_boolean(value: bool) -> Vec<u8> {
+pub(crate) fn enc_boolean(value: bool) -> Vec<u8> {
     // DER BOOLEAN: TRUE = 0xFF, FALSE = 0x00
     vec![0x01, 0x01, if value { 0xFF } else { 0x00 }]
 }
 
-fn enc_sequence(contents: &[u8]) -> Vec<u8> {
+pub(crate) fn enc_sequence(contents: &[u8]) -> Vec<u8> {
     let mut out = vec![0x30];
     out.extend_from_slice(&enc_length(contents.len()));
     out.extend_from_slice(contents);
@@ -371,7 +371,7 @@ fn enc_set(contents: &[u8]) -> Vec<u8> {
     out
 }
 
-fn enc_explicit_tag(tag_number: u32, inner: &[u8]) -> Vec<u8> {
+pub(crate) fn enc_explicit_tag(tag_number: u32, inner: &[u8]) -> Vec<u8> {
     // EXPLICIT context-specific constructed tag
     let mut out = Vec::new();
     if tag_number < 31 {

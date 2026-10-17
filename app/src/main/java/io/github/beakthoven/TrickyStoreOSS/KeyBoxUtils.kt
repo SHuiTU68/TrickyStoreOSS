@@ -8,7 +8,15 @@ package io.github.beakthoven.TrickyStoreOSS
 import android.security.keystore.KeyProperties
 import io.github.beakthoven.TrickyStoreOSS.CertificateGen.KeyBox
 import io.github.beakthoven.TrickyStoreOSS.logging.Logger
+import java.io.ByteArrayInputStream
+import java.io.DataInputStream
 import java.io.StringReader
+import java.nio.charset.StandardCharsets
+import java.security.KeyFactory
+import java.security.KeyPair
+import java.security.cert.Certificate
+import java.security.spec.PKCS8EncodedKeySpec
+import java.security.spec.X509EncodedKeySpec
 import java.util.Collections
 import org.xmlpull.v1.XmlPullParser
 import org.xmlpull.v1.XmlPullParserException
@@ -36,7 +44,10 @@ object KeyBoxUtils {
             return true
         }
 
-        val parsed = runCatching {
+        // The Rust parser performs the same structure checks on the document and returns the
+        // keybox material already decoded; XmlPullParser + BouncyCastle stays as the fallback.
+        val native = nativeKeyboxes(xmlData)
+        val parsed = if (native != null) Result.success(native) else runCatching {
             val parser =
                 XmlPullParserFactory.newInstance().newPullParser().apply {
                     setFeature(XmlPullParser.FEATURE_PROCESS_NAMESPACES, false)
@@ -246,6 +257,73 @@ object KeyBoxUtils {
         }
         Logger.i("Successfully updated ${candidate.size} keyboxes")
         return true
+    }
+
+    /**
+     * Parses the keybox with the native Rust parser, returning null — so the caller falls back to
+     * XmlPullParser + BouncyCastle — when the library is unavailable or the document is rejected.
+     */
+    private fun nativeKeyboxes(xmlData: String): Map<String, KeyBox>? {
+        if (!NativeCertGen.isAvailable) return null
+        return try {
+            decodeNativeKeyboxes(NativeCertGen.nativeParseKeybox(xmlData))
+        } catch (t: Throwable) {
+            Logger.e("Native keybox parse failed; falling back to XmlPullParser", t)
+            null
+        }
+    }
+
+    /** Rebuilds the keybox entries from the Rust `[u32 BE length]`-prefixed response blob. */
+    private fun decodeNativeKeyboxes(blob: ByteArray): Map<String, KeyBox> {
+        val data = DataInputStream(ByteArrayInputStream(blob))
+        val count = data.readInt()
+        if (count < 0) throw IllegalStateException("Invalid native keybox count: $count")
+        val candidate = LinkedHashMap<String, KeyBox>(count)
+        repeat(count) {
+            val algorithm = String(readNativeBlob(data), StandardCharsets.UTF_8)
+            val privateKeyDer = readNativeBlob(data)
+            val certificateCount = data.readInt()
+            if (certificateCount <= 0) throw IllegalStateException("Invalid certificate count: $certificateCount")
+            val certificates = ArrayList<Certificate>(certificateCount)
+            repeat(certificateCount) {
+                val der = readNativeBlob(data)
+                certificates.add(
+                    CertificateUtils.certificateFactory.generateCertificate(ByteArrayInputStream(der))
+                )
+            }
+            candidate[algorithm] = buildKeyBox(algorithm, privateKeyDer, certificates)
+        }
+        if (data.available() != 0) throw IllegalStateException("Trailing bytes in native keybox response")
+        return Collections.unmodifiableMap(candidate)
+    }
+
+    /**
+     * Rebuilds one keybox entry. The private key comes back as PKCS#8 DER, and its public half is
+     * taken from the leaf certificate the key was issued with, so both halves stay consistent with
+     * the chain that will be signed against them.
+     */
+    private fun buildKeyBox(
+        algorithm: String,
+        privateKeyDer: ByteArray,
+        certificates: List<Certificate>,
+    ): KeyBox {
+        val leaf = certificates.first()
+        val privateKey =
+            KeyFactory.getInstance(algorithm).generatePrivate(PKCS8EncodedKeySpec(privateKeyDer))
+        val publicKey =
+            KeyFactory.getInstance(leaf.publicKey.algorithm)
+                .generatePublic(X509EncodedKeySpec(leaf.publicKey.encoded))
+        return KeyBox(KeyPair(publicKey, privateKey), Collections.unmodifiableList(certificates))
+    }
+
+    private fun readNativeBlob(data: DataInputStream): ByteArray {
+        val length = data.readInt()
+        if (length < 0 || length > data.available()) {
+            throw IllegalStateException("Invalid native keybox field length: $length")
+        }
+        val bytes = ByteArray(length)
+        data.readFully(bytes)
+        return bytes
     }
 
     private fun readElementText(parser: XmlPullParser): String {

@@ -25,7 +25,6 @@ fun main(args: Array<String>) {
         Logger.i("Startup attestation probe: ${probe.status} (${probe.failureCategory ?: "none"})")
         AndroidUtils.setupBootHash()
         HideProps.apply()
-        ForegroundPropGate.start()
         NativeCertGen.initialize()
         initializeInterceptors()
         maintainService()

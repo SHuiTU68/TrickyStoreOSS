@@ -26,9 +26,6 @@ import java.io.File
  * The whole config is resolved once at startup and applied in a single shell invocation: properties
  * whose value already matches are skipped outright, so the cost is a couple of fork/execs per boot
  * and the keystore hot path stays untouched.
- *
- * Lines grouped under an `@<package>` marker are not global: they are held back here and applied by
- * [ForegroundPropGate] only while that package is in the foreground.
  */
 object HideProps {
     private const val CONFIG_FILE = "/data/adb/tricky_store/hide_props.txt"
@@ -53,7 +50,7 @@ object HideProps {
 
     /** Applies the global spoofing once at boot; a missing [CONFIG_FILE] is a no-op. */
     fun apply() {
-        val entries = parseConfig(File(CONFIG_FILE)).global
+        val entries = parseConfig(File(CONFIG_FILE))
         if (entries.isEmpty()) return
 
         val resetpropPath = resetprop
@@ -111,52 +108,24 @@ object HideProps {
         script.append(SETPROP).append(" persist.sys.usb.config ").append(shellQuote(value)).append('\n')
     }
 
-    /**
-     * Parsed `hide_props.txt`: [global] entries are applied unconditionally at boot, [scoped] entries
-     * only while their package (an `@package` line) is in the foreground — see [ForegroundPropGate].
-     */
-    private class Config(
-        val global: List<Pair<String, String>>,
-        val scoped: Map<String, List<Pair<String, String>>>,
-    )
-
-    /** The per-package foreground overrides, consumed by [ForegroundPropGate]. */
-    fun scopedEntries(): Map<String, List<Pair<String, String>>> = parseConfig(File(CONFIG_FILE)).scoped
-
-    private fun parseConfig(file: File): Config {
-        val empty = Config(emptyList(), emptyMap())
-        if (!file.exists()) return empty
-        val global = mutableListOf<Pair<String, String>>()
-        val scoped = linkedMapOf<String, MutableList<Pair<String, String>>>()
-        var current: MutableList<Pair<String, String>>? = null
+    private fun parseConfig(file: File): List<Pair<String, String>> {
+        if (!file.exists()) return emptyList()
         return runCatching {
-                file.readLines().forEach { line ->
+                file.readLines().mapNotNull { line ->
                     val entry = line.substringBefore('#').trim()
-                    if (entry.isEmpty()) return@forEach
-                    // An `@package` line opens a foreground-only scope for the lines that follow.
-                    if (entry.startsWith('@')) {
-                        val pkg = entry.substring(1).trim()
-                        if (pkg.isEmpty()) {
-                            Logger.w("ignoring malformed hide_props scope: $line")
-                            return@forEach
-                        }
-                        current = scoped.getOrPut(pkg) { mutableListOf() }
-                        return@forEach
-                    }
+                    if (entry.isEmpty()) return@mapNotNull null
                     val separator = entry.indexOf('=')
                     if (separator <= 0) {
                         Logger.w("ignoring malformed hide_props line: $line")
-                        return@forEach
+                        return@mapNotNull null
                     }
                     val name = entry.substring(0, separator).trim()
                     val value = entry.substring(separator + 1).trim()
-                    if (name.isEmpty()) return@forEach
-                    if (current == null) global.add(name to value) else current.add(name to value)
+                    name.ifEmpty { null }?.let { it to value }
                 }
-                Config(global, scoped)
             }
             .onFailure { Logger.e("failed to read $CONFIG_FILE", it) }
-            .getOrDefault(empty)
+            .getOrDefault(emptyList())
     }
 
     private fun locateBinary(candidates: List<String>): String? {
@@ -170,7 +139,7 @@ object HideProps {
         return output?.trim()?.takeIf { it.isNotEmpty() }
     }
 
-    internal fun runShell(script: String): String? =
+    private fun runShell(script: String): String? =
         runCatching {
             val process = ProcessBuilder(SHELL, "-c", script).redirectErrorStream(true).start()
             val output = process.inputStream.bufferedReader().use { it.readText() }

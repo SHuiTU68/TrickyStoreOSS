@@ -9,13 +9,6 @@
 #     (e.g. `sys.oem_unlock_allowed` is only defined up to Android 15). Such lines are no-ops.
 #   - Remove a line to stop spoofing that property (the original value returns on the next boot).
 #
-#   - An `@<package>` line opens a foreground-only scope: the lines under it are applied *only*
-#     while that package is the foreground activity, and reverted the moment it leaves. Use it to
-#     satisfy a detector that insists on a specific value (e.g. `persist.sys.usb.config=mtp`) without
-#     actually keeping that behaviour on (the global `usb=none` stays in force everywhere else).
-#     The original value of every property in the scope is snapshotted and restored on exit, so the
-#     override never leaks outside the detector's foreground window.
-#
 # Behaviour switches (keys without a dot):
 #   adb=off    disable USB debugging at boot (Settings.Global.adb_enabled = 0)
 #   usb=none   set the USB configuration to `none`, i.e. no data functions (MTP/ADB/…)
@@ -29,7 +22,6 @@ ro.boot.warranty_bit=0
 ro.warranty_bit=0
 ro.vendor.boot.warranty_bit=0
 ro.vendor.warranty_bit=0
-sys.oem_unlock_allowed=0
 ro.oem_unlock_supported=0
 
 # --- Build / debug state ---
@@ -40,15 +32,6 @@ ro.build.tags=release-keys
 ro.boot.selinux=enforcing
 
 # --- Boot hardening ---
-# USB data stays off globally (`none`); the detector-only override lives in the scope below.
+# USB data stays off: the `none` configuration exposes no data functions (MTP/ADB/…).
 adb=off
 usb=none
-
-# --- Foreground-only overrides ---
-# While the listed package is the foreground activity, these properties read their "normal" value
-# so the detector's consistency check passes; they revert to the global values the instant it closes.
-# `persist.sys.usb.config` / `sys.usb.config` already exist on this build, so the override rewrites
-# them in place (no new entry, no property-area mtime change) and USB data is never actually enabled.
-@com.studio.duckdetector
-persist.sys.usb.config=mtp
-sys.usb.config=mtp

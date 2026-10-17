@@ -7,11 +7,8 @@ pub enum CertGenError {
     KeyGenFailed(String),
     SerializationFailed(String),
     InvalidParameter(String),
-    #[allow(dead_code)] // constructed by the staged keybox parser
     KeyboxParseFailed(String),
-    #[allow(dead_code)] // constructed by the staged certificate builder
     CertBuildFailed(String),
-    #[allow(dead_code)] // constructed by the staged certificate builder
     SigningFailed(String),
 }
 

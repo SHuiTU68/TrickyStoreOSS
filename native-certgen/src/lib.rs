@@ -9,10 +9,16 @@
 mod error;
 // Parses the keybox ahead of the certbuilder that consumes it.
 mod keybox;
+// Parses the keybox XML document itself, handed over by the Kotlin config loader.
+mod keybox_xml;
 // Builds the DER certificates for the attestation chain.
 mod certbuilder;
 // Builds the KeyMint attestation extension the certbuilder embeds in the leaf.
 mod attestation;
+// Rewrites an existing leaf's attestation extension and re-signs it with the keybox.
+mod hack_leaf;
+// Reads the verified-boot fields back out of a probe certificate's attestation extension.
+mod attest_parse;
 // Request/response wire format for the certificate-chain JNI entry point.
 mod chaingen;
 // Request wire format for the attestation-extension JNI entry point.
@@ -21,8 +27,10 @@ mod keygen;
 mod types;
 // Bounds-checked reader shared by the request blobs.
 mod wire;
+// Minimal DER reader shared by the hand-rolled parsers.
+mod tlv;
 
-use jni::objects::{JByteArray, JClass};
+use jni::objects::{JByteArray, JClass, JString};
 use jni::sys::{jboolean, jbyteArray, jint, jlong, jstring};
 use jni::JNIEnv;
 
@@ -140,6 +148,56 @@ pub extern "system" fn Java_io_github_beakthoven_TrickyStoreOSS_NativeCertGen_na
     byte_array_result(&mut env, result)
 }
 
+/// Rewrites an existing leaf certificate's KeyMint attestation extension — forging the
+/// `rootOfTrust` and patching the patch-level fields — then re-signs it with the keybox, from a
+/// packed request blob (see [`hack_leaf`]). Returns the leaf-first concatenated DER chain.
+///
+/// Any unsupported or malformed input throws, so the Kotlin caller falls back to BouncyCastle.
+#[no_mangle]
+pub extern "system" fn Java_io_github_beakthoven_TrickyStoreOSS_NativeCertGen_nativeHackCertificateChain(
+    mut env: JNIEnv,
+    _this: JClass,
+    request: jbyteArray,
+) -> jbyteArray {
+    let result = read_byte_array(&mut env, request)
+        .and_then(|bytes| hack_leaf::hack_certificate_chain_blob(&bytes));
+    byte_array_result(&mut env, result)
+}
+
+/// Parses the keybox XML document natively and returns the entries as a length-prefixed blob (see
+/// [`keybox_xml`]): `[u32 count]{ [u32 algorithm][u32 PKCS#8 key]{ [u32 certCount]{ [u32 cert] }
+/// } }`. Kotlin rebuilds the key pairs and certificates from it.
+///
+/// Any unsupported or malformed document throws, so the Kotlin caller falls back to XmlPullParser
+/// and BouncyCastle.
+#[no_mangle]
+pub extern "system" fn Java_io_github_beakthoven_TrickyStoreOSS_NativeCertGen_nativeParseKeybox(
+    mut env: JNIEnv,
+    _this: JClass,
+    xml: JString,
+) -> jbyteArray {
+    let result = read_string(&mut env, &xml).and_then(|text| keybox_xml::parse_keybox_blob(&text));
+    byte_array_result(&mut env, result)
+}
+
+/// Reads the verified-boot fields back out of a probe certificate's KeyMint attestation extension,
+/// from a packed request blob (see [`attest_parse`]): `[u32 certLen][certificate DER][u32
+/// challengeLen][challenge]`. Returns the fields as a length-prefixed blob for Kotlin to rebuild
+/// `AttestUtils.AttestationData`.
+///
+/// Any malformed input or a challenge mismatch throws, so the Kotlin caller falls back to
+/// BouncyCastle.
+#[no_mangle]
+pub extern "system" fn Java_io_github_beakthoven_TrickyStoreOSS_NativeCertGen_nativeParseAttestation(
+    mut env: JNIEnv,
+    _this: JClass,
+    request: jbyteArray,
+) -> jbyteArray {
+    let result = read_byte_array(&mut env, request)
+        .and_then(|bytes| attest_parse::parse_attestation_blob(&bytes));
+    byte_array_result(&mut env, result)
+}
+
 /// Turns the entry point's result into a JNI byte array, throwing the mapped Java exception and
 /// returning null on failure. Shared by every entry point that hands a byte blob back.
 fn byte_array_result(env: &mut JNIEnv, result: Result<Vec<u8>>) -> jbyteArray {
@@ -170,6 +228,17 @@ fn read_byte_array(env: &mut JNIEnv, array: jbyteArray) -> Result<Vec<u8>> {
     let array = unsafe { JByteArray::from_raw(array) };
     env.convert_byte_array(&array)
         .map_err(|e| CertGenError::InvalidParameter(format!("chain request read failed: {e}")))
+}
+
+/// Copies a JNI string into a `String`, rejecting a null handle so the parser never sees a missing
+/// document.
+fn read_string(env: &mut JNIEnv, value: &JString) -> Result<String> {
+    if value.is_null() {
+        return Err(CertGenError::InvalidParameter("keybox xml was null".into()));
+    }
+    env.get_string(value)
+        .map(String::from)
+        .map_err(|e| CertGenError::InvalidParameter(format!("keybox xml read failed: {e}")))
 }
 
 // ring::error::Unspecified does not implement std::error::Error, so map each failure to a

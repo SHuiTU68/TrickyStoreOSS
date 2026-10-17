@@ -22,6 +22,10 @@ import android.system.keystore2.IKeystoreService
 import android.system.keystore2.KeyDescriptor
 import android.system.keystore2.ResponseCode
 import io.github.beakthoven.TrickyStoreOSS.logging.Logger
+import java.io.ByteArrayInputStream
+import java.io.ByteArrayOutputStream
+import java.io.DataInputStream
+import java.io.DataOutputStream
 import java.security.KeyPairGenerator
 import java.security.KeyStore
 import java.security.SecureRandom
@@ -246,6 +250,66 @@ object AttestUtils {
     }
 
     private fun parseAttestationData(encodedCertificate: ByteArray, expectedChallenge: ByteArray): AttestationData? =
+        parseAttestationDataNative(encodedCertificate, expectedChallenge)
+            ?: parseAttestationDataBouncyCastle(encodedCertificate, expectedChallenge)
+
+    /**
+     * Parses the attestation extension with the native Rust reader, returning null — so the caller
+     * falls back to BouncyCastle — when the library is unavailable or the certificate is rejected.
+     */
+    private fun parseAttestationDataNative(
+        encodedCertificate: ByteArray,
+        expectedChallenge: ByteArray,
+    ): AttestationData? {
+        if (!NativeCertGen.isAvailable) return null
+        return try {
+            val request = ByteArrayOutputStream().also { out ->
+                DataOutputStream(out).also { data ->
+                    data.writeInt(encodedCertificate.size)
+                    data.write(encodedCertificate)
+                    data.writeInt(expectedChallenge.size)
+                    data.write(expectedChallenge)
+                }
+            }.toByteArray()
+            decodeAttestationData(NativeCertGen.nativeParseAttestation(request))
+        } catch (t: Throwable) {
+            Logger.w("Native attestation parse failed; falling back to BouncyCastle", t)
+            null
+        }
+    }
+
+    /** Rebuilds [AttestationData] from the Rust presence-tagged response blob. */
+    private fun decodeAttestationData(blob: ByteArray): AttestationData {
+        val data = DataInputStream(ByteArrayInputStream(blob))
+        val attestVersion = data.readInt()
+        val keymasterVersion = data.readInt()
+        val verifiedBootKey = readNativeOptionalBlob(data)
+        val verifiedBootHash = readNativeOptionalBlob(data)
+        val osVersion = if (data.readUnsignedByte() != 0) data.readInt() else null
+        val moduleHash = readNativeOptionalBlob(data)
+        if (data.available() != 0) {
+            throw IllegalStateException("Trailing bytes in native attestation response")
+        }
+        return AttestationData(verifiedBootKey, verifiedBootHash, attestVersion, keymasterVersion, osVersion, moduleHash)
+    }
+
+    private fun readNativeOptionalBlob(data: DataInputStream): ByteArray? =
+        if (data.readUnsignedByte() != 0) readNativeBlob(data) else null
+
+    private fun readNativeBlob(data: DataInputStream): ByteArray {
+        val length = data.readInt()
+        if (length < 0 || length > data.available()) {
+            throw IllegalStateException("Invalid native attestation field length: $length")
+        }
+        val bytes = ByteArray(length)
+        data.readFully(bytes)
+        return bytes
+    }
+
+    private fun parseAttestationDataBouncyCastle(
+        encodedCertificate: ByteArray,
+        expectedChallenge: ByteArray,
+    ): AttestationData? =
         runCatching {
             val holder = X509CertificateHolder(encodedCertificate)
             val extension = holder.getExtension(ATTESTATION_OID) ?: return null

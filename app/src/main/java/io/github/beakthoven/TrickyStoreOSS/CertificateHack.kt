@@ -11,6 +11,8 @@ import android.hardware.security.keymint.Tag
 import android.system.keystore2.Authorization
 import io.github.beakthoven.TrickyStoreOSS.logging.Logger
 import java.io.ByteArrayInputStream
+import java.io.ByteArrayOutputStream
+import java.io.DataOutputStream
 import java.security.cert.Certificate
 import java.security.cert.X509Certificate
 import java.util.LinkedList
@@ -76,6 +78,7 @@ object CertificateHack {
                 as X509Certificate
         val leafHolder = X509CertificateHolder(leaf.encoded)
         val extension = leafHolder.getExtension(ATTESTATION_OID) ?: return certificateChain
+        hackLeafNative(leaf, uid)?.let { return it }
         val encodables = ASN1Sequence.getInstance(extension.extnValue.octets).toArray()
         // Some Android 11 Keymasters emit softwareEnforced/teeEnforced swapped.
         val teeIndex = if (containsRootOfTrust(encodables[6])) 6 else 7
@@ -127,6 +130,61 @@ object CertificateHack {
                 )
         )
         return certs.toTypedArray()
+    }
+
+    /**
+     * Native-first leaf hack: packs the request the Rust `hack_leaf` module expects, calls it, and
+     * parses the returned leaf-first DER chain. Returns null — so the caller falls back to the
+     * BouncyCastle path — when the native library is unavailable, no keybox matches, or the rewrite
+     * fails.
+     */
+    private fun hackLeafNative(leaf: X509Certificate, uid: Int): Array<Certificate>? {
+        if (!NativeCertGen.isAvailable) return null
+        val keybox = selectKeybox(leaf.publicKey.algorithm) ?: return null
+        return try {
+            val hacked = NativeCertGen.nativeHackCertificateChain(buildNativeHackRequest(leaf, keybox, uid))
+            val certs = hacked.toCertificates()
+            if (certs.isEmpty()) return null
+            certs.map { it as Certificate }.toTypedArray()
+        } catch (t: Throwable) {
+            Logger.e("Native leaf hack failed; falling back to BouncyCastle", t)
+            null
+        }
+    }
+
+    private fun selectKeybox(algorithm: String): CertificateGen.KeyBox? =
+        KeyBoxUtils.keyboxes[algorithm] ?: KeyBoxUtils.keyboxes.entries.firstOrNull()?.value
+
+    /** Packs the Rust `hack_leaf` request blob: big-endian, length-prefixed (see that module). */
+    private fun buildNativeHackRequest(leaf: X509Certificate, keybox: CertificateGen.KeyBox, uid: Int): ByteArray {
+        val patch = AndroidUtils.resolvePatchLevels(uid)
+        val out = ByteArrayOutputStream()
+        DataOutputStream(out).use { data ->
+            writeBlob(data, leaf.encoded)
+            writeBlob(data, keybox.keyPair.private.encoded)
+            writeBlob(data, keybox.certificates.toByteArray() ?: ByteArray(0))
+            writeBlob(data, AndroidUtils.bootKey)
+            writeBlob(data, AndroidUtils.getBootHashFromProp() ?: ByteArray(0))
+            data.writeInt(AndroidUtils.osVersion)
+            writeOptionalInt(data, patch.osOverride)
+            writeOptionalInt(data, patch.vendorOverride)
+            writeOptionalInt(data, patch.bootOverride)
+        }
+        return out.toByteArray()
+    }
+
+    private fun writeBlob(data: DataOutputStream, bytes: ByteArray) {
+        data.writeInt(bytes.size)
+        data.write(bytes)
+    }
+
+    private fun writeOptionalInt(data: DataOutputStream, value: Int?) {
+        if (value == null) {
+            data.writeByte(0)
+        } else {
+            data.writeByte(1)
+            data.writeInt(value)
+        }
     }
 
     fun hackCertificateChain(certificateChain: Array<Certificate>?, uid: Int): Array<Certificate> {
