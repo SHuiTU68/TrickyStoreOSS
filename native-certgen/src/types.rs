@@ -42,11 +42,11 @@ impl TryFrom<i32> for EcCurve {
 }
 
 /// Everything the native certificate pipeline needs for one request, mirroring the fields the
-/// Kotlin `CertGenConfig` carries. The chain builder reads only the algorithm, validity, subject
-/// and purpose fields — the attestation extension itself is built by the Kotlin caller and handed
-/// over pre-encoded — so the remaining fields stay as placeholders for a future native attestation
-/// stage and are marked dead for now.
-#[allow(dead_code)] // staged: only the certbuilder fields are read so far
+/// Kotlin `CertGenConfig` carries. The certificate builder reads the algorithm, validity, subject
+/// and purpose fields, and the attestation builder reads the challenge, root-of-trust, patch-level
+/// and authorization fields; the Kotlin caller still computes the AAID and unique-id inputs, which
+/// are handed over pre-encoded. The few fields no native stage consumes yet stay marked dead.
+#[allow(dead_code)] // a handful of fields are staged: no native stage reads them so far
 pub struct CertGenParams {
     pub algorithm: Algorithm,
     pub key_size: u32,
@@ -56,6 +56,19 @@ pub struct CertGenParams {
     pub attestation_challenge: Option<Vec<u8>>,
     pub purposes: Vec<i32>,
     pub digests: Vec<i32>,
+    pub block_mode: Vec<i32>,
+    pub padding: Vec<i32>,
+    pub mgf_digest: Vec<i32>,
+
+    pub user_secure_ids: Vec<i64>,
+    pub user_auth_type: Option<i32>,
+    pub auth_timeout: Option<i32>,
+    pub allow_while_on_body: bool,
+    pub trusted_user_presence_required: bool,
+    pub trusted_confirmation_required: bool,
+
+    pub max_uses_per_boot: i32,
+    pub origin: i32,
 
     pub cert_serial: Option<Vec<u8>>,
     pub cert_subject: Option<Vec<u8>>,
@@ -79,6 +92,7 @@ pub struct CertGenParams {
 
     pub creation_datetime: i64,
     pub attestation_application_id: Vec<u8>,
+    pub unique_id: Vec<u8>,
     pub module_hash: Option<Vec<u8>>,
 
     pub id_brand: Option<Vec<u8>>,
@@ -115,6 +129,17 @@ impl Default for CertGenParams {
             attestation_challenge: None,
             purposes: Vec::new(),
             digests: Vec::new(),
+            block_mode: Vec::new(),
+            padding: Vec::new(),
+            mgf_digest: Vec::new(),
+            user_secure_ids: Vec::new(),
+            user_auth_type: None,
+            auth_timeout: None,
+            allow_while_on_body: false,
+            trusted_user_presence_required: false,
+            trusted_confirmation_required: false,
+            max_uses_per_boot: 0,
+            origin: 0,
             cert_serial: None,
             cert_subject: None,
             cert_not_before: -1,
@@ -132,6 +157,7 @@ impl Default for CertGenParams {
             boot_hash: Vec::new(),
             creation_datetime: 0,
             attestation_application_id: Vec::new(),
+            unique_id: Vec::new(),
             module_hash: None,
             id_brand: None,
             id_device: None,

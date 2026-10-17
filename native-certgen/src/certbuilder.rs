@@ -690,6 +690,7 @@ mod tests {
             no_auth_required: false,
             uid: 0,
             debug_logging: false,
+            ..Default::default()
         }
     }
 

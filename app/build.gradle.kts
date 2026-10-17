@@ -225,7 +225,7 @@ androidComponents {
 
         tasks.register<Zip>("zip${capitalized}") {
             dependsOn("prepareModuleFiles${capitalized}")
-            archiveFileName.set("Tricky-Store-OSS-$verName-$gitCommitCount-$gitCommitHash-${capitalized}.zip")
+            archiveFileName.set("Tricky-Store-OSS-RS-$verName-$gitCommitCount-$gitCommitHash-${capitalized}.zip")
             destinationDirectory.set(project.rootDir.resolve("out"))
             from(tempModuleDir)
         }

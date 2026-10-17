@@ -14,7 +14,7 @@ if [ "$KSU" = true ] && [ "$KSU_VER_CODE" -lt 10670 ]; then
 fi
 
 # --- Version Info ---
-ui_print "- Installing Tricky Store OSS $(grep_prop version "$TMPDIR/module.prop")"
+ui_print "- Installing Tricky Store OSS-RS $(grep_prop version "$TMPDIR/module.prop")"
 ui_print ""
 
 # --- Architecture Handling ---

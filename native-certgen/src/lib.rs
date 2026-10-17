@@ -1,9 +1,8 @@
 //! Native certificate/key generation for TrickyStoreOSS.
 //!
-//! Key generation and certificate-chain building both run in Rust and are exposed over JNI. The
-//! attestation extension itself is still built by the BouncyCastle path in the app and handed to
-//! the native builder pre-encoded; if that stage ever ports over, its JNI entry point will join the
-//! ones below.
+//! Key generation, certificate-chain building and the KeyMint attestation extension all run in
+//! Rust and are exposed over JNI. The app prefers these native paths and falls back to
+//! BouncyCastle whenever the shared object is unavailable or a request is unsupported.
 
 #![deny(clippy::unwrap_used, clippy::expect_used)]
 
@@ -12,14 +11,16 @@ mod error;
 mod keybox;
 // Builds the DER certificates for the attestation chain.
 mod certbuilder;
-// Staged for a possible native attestation port: builds the KeyMint extension the certbuilder would
-// embed in the leaf. The app still builds this in Kotlin, so it is not referenced yet.
-#[allow(dead_code)]
+// Builds the KeyMint attestation extension the certbuilder embeds in the leaf.
 mod attestation;
 // Request/response wire format for the certificate-chain JNI entry point.
 mod chaingen;
+// Request wire format for the attestation-extension JNI entry point.
+mod attreq;
 mod keygen;
 mod types;
+// Bounds-checked reader shared by the request blobs.
+mod wire;
 
 use jni::objects::{JByteArray, JClass};
 use jni::sys::{jboolean, jbyteArray, jint, jlong, jstring};
@@ -73,22 +74,9 @@ pub extern "system" fn Java_io_github_beakthoven_TrickyStoreOSS_NativeCertGen_na
     ec_curve: jint,
     rsa_public_exponent: jlong,
 ) -> jbyteArray {
-    match generate_key_pair_blob(algorithm, key_size, ec_curve, rsa_public_exponent) {
-        Ok(blob) => match env.byte_array_from_slice(&blob) {
-            Ok(array) => array.into_raw(),
-            Err(e) => {
-                let _ = env.throw_new(
-                    "java/lang/RuntimeException",
-                    format!("NativeCertGen: failed to allocate result array: {e}"),
-                );
-                std::ptr::null_mut()
-            }
-        },
-        Err(e) => {
-            let _ = env.throw_new("java/lang/RuntimeException", format!("NativeCertGen: {e}"));
-            std::ptr::null_mut()
-        }
-    }
+    let result =
+        generate_key_pair_blob(algorithm, key_size, ec_curve, rsa_public_exponent);
+    byte_array_result(&mut env, result)
 }
 
 fn generate_key_pair_blob(
@@ -129,10 +117,32 @@ pub extern "system" fn Java_io_github_beakthoven_TrickyStoreOSS_NativeCertGen_na
     _this: JClass,
     request: jbyteArray,
 ) -> jbyteArray {
-    let result = read_byte_array(&mut env, request).and_then(|bytes| {
-        chaingen::build_certificate_chain_blob(&bytes)
-    });
+    let result = read_byte_array(&mut env, request)
+        .and_then(|bytes| chaingen::build_certificate_chain_blob(&bytes));
+    byte_array_result(&mut env, result)
+}
 
+/// Builds the KeyMint attestation extension — the DER-encoded `KeyDescription` that the caller
+/// wraps in the leaf certificate's `1.3.6.1.4.1.11129.2.1.17` extension — from a packed request
+/// blob (see [`attreq`]). The attestation application id and unique id are still computed by the
+/// Kotlin layer (they need the PackageManager and the persisted HMAC key) and handed over already
+/// encoded.
+///
+/// Any unsupported or malformed input throws, so the Kotlin caller falls back to BouncyCastle.
+#[no_mangle]
+pub extern "system" fn Java_io_github_beakthoven_TrickyStoreOSS_NativeCertGen_nativeBuildAttestationExtension(
+    mut env: JNIEnv,
+    _this: JClass,
+    request: jbyteArray,
+) -> jbyteArray {
+    let result = read_byte_array(&mut env, request)
+        .and_then(|bytes| attreq::build_attestation_extension_blob(&bytes));
+    byte_array_result(&mut env, result)
+}
+
+/// Turns the entry point's result into a JNI byte array, throwing the mapped Java exception and
+/// returning null on failure. Shared by every entry point that hands a byte blob back.
+fn byte_array_result(env: &mut JNIEnv, result: Result<Vec<u8>>) -> jbyteArray {
     match result {
         Ok(blob) => match env.byte_array_from_slice(&blob) {
             Ok(array) => array.into_raw(),

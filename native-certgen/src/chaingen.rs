@@ -7,9 +7,10 @@
 //! keybox, signs the leaf and assembles the chain.
 
 use crate::certbuilder::build_certificate_chain;
-use crate::error::{CertGenError, Result};
+use crate::error::Result;
 use crate::keybox::parse_keybox;
 use crate::types::{Algorithm, CertGenParams, GeneratedKeyPair};
+use crate::wire::{malformed, Cursor};
 
 /// Decodes the request blob, builds the chain, and returns the concatenated DER certificates
 /// (leaf first). An empty `attestation_ext_der` means the leaf carries no attestation extension.
@@ -123,80 +124,6 @@ impl ChainBuildRequest {
             cert_subject,
         })
     }
-}
-
-/// A bounds-checked forward reader over the request blob.
-struct Cursor<'a> {
-    data: &'a [u8],
-    pos: usize,
-}
-
-impl<'a> Cursor<'a> {
-    fn new(data: &'a [u8]) -> Self {
-        Self { data, pos: 0 }
-    }
-
-    fn take(&mut self, len: usize) -> Result<&'a [u8]> {
-        let end = self
-            .pos
-            .checked_add(len)
-            .ok_or_else(|| malformed("field length overflow"))?;
-        if end > self.data.len() {
-            return Err(malformed("unexpected end of request"));
-        }
-        let slice = &self.data[self.pos..end];
-        self.pos = end;
-        Ok(slice)
-    }
-
-    fn u8(&mut self) -> Result<u8> {
-        Ok(self.take(1)?[0])
-    }
-
-    /// Reads a big-endian `u32`; used for both lengths and raw `i32` values reinterpreted at the
-    /// call site.
-    fn u32(&mut self) -> Result<u32> {
-        let bytes = self.take(4)?;
-        Ok(u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
-    }
-
-    fn i32(&mut self) -> Result<i32> {
-        Ok(self.u32()? as i32)
-    }
-
-    fn i64(&mut self) -> Result<i64> {
-        let bytes = self.take(8)?;
-        let mut value = [0u8; 8];
-        value.copy_from_slice(bytes);
-        Ok(i64::from_be_bytes(value))
-    }
-
-    fn length_prefixed(&mut self) -> Result<Vec<u8>> {
-        let len = self.u32()? as usize;
-        Ok(self.take(len)?.to_vec())
-    }
-
-    fn optional_length_prefixed(&mut self) -> Result<Option<Vec<u8>>> {
-        let bytes = self.length_prefixed()?;
-        Ok(if bytes.is_empty() { None } else { Some(bytes) })
-    }
-
-    fn i32_vec(&mut self) -> Result<Vec<i32>> {
-        let count = self.u32()? as usize;
-        let mut values = Vec::with_capacity(count);
-        for _ in 0..count {
-            values.push(self.i32()?);
-        }
-        Ok(values)
-    }
-
-    fn is_at_end(&self) -> bool {
-        self.pos >= self.data.len()
-    }
-}
-
-fn malformed(msg: &str) -> CertGenError {
-    CertGenError::InvalidParameter(format!("malformed chain request: {msg}"))
 }
 
 #[cfg(test)]

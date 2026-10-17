@@ -1,4 +1,4 @@
-# Tricky Store OSS
+# Tricky Store OSS-RS
 
 *A trick of Keystore they forgot to hide.*
 
@@ -73,7 +73,7 @@ All config files take effect immediately — no reboot needed after step 1.
 
 ### `target.txt` — mode selection
 
-Tricky Store OSS supports two modes: **leaf certificate hacking** and **certificate generation**. On TEE-broken devices, leaf hacking won't work since the leaf certificate can't be retrieved from TEE. The module picks the right mode automatically per device.
+Tricky Store OSS-RS supports two modes: **leaf certificate hacking** and **certificate generation**. On TEE-broken devices, leaf hacking won't work since the leaf certificate can't be retrieved from TEE. The module picks the right mode automatically per device.
 
 Override per package with a suffix:
 

@@ -574,6 +574,21 @@ object CertificateGen {
         write(bytes)
     }
 
+    private fun DataOutputStream.writeIntVector(values: List<Int>) {
+        writeInt(values.size)
+        values.forEach { writeInt(it) }
+    }
+
+    private fun DataOutputStream.writeLongVector(values: List<Long>) {
+        writeInt(values.size)
+        values.forEach { writeLong(it) }
+    }
+
+    private fun DataOutputStream.writeOptionalInt(value: Int?) {
+        writeBoolean(value != null)
+        value?.let { writeInt(it) }
+    }
+
     fun generateChain(uid: Int, params: KeyGenParameters, keyPair: KeyPair, securityLevel: Int = 1): List<ByteArray>? {
         val raw = runCatching {
             params.createdAtMs = params.createdAtMs ?: System.currentTimeMillis()
@@ -586,7 +601,9 @@ object CertificateGen {
 
     /**
      * Encodes the KeyMint `KeyDescription` as DER; the caller wraps it in the certificate's
-     * attestation extension, or hands the same bytes to the native chain builder.
+     * attestation extension, or hands the same bytes to the native chain builder. Prefers the
+     * native Rust builder (byte-identical to the BouncyCastle path) and falls back to BouncyCastle
+     * whenever the native library is unavailable or rejects the request.
      */
     private fun buildAttestationDer(
         params: KeyGenParameters,
@@ -594,6 +611,8 @@ object CertificateGen {
         securityLevel: Int = 1,
         creationTimeMs: Long,
     ): ByteArray {
+        buildNativeAttestationDer(params, uid, securityLevel, creationTimeMs)?.let { return it }
+
         val versions = AndroidUtils.attestationVersions(securityLevel)
         val attestationVersion = versions.attestation
         val keymasterVersion = versions.keymaster
@@ -688,6 +707,105 @@ object CertificateGen {
                 DERSequence(tee.toTypedArray()),
             )
         return DERSequence(keyDesc).encoded
+    }
+
+    /** Runs the native attestation builder, returning null so the caller falls back to BouncyCastle. */
+    private fun buildNativeAttestationDer(
+        params: KeyGenParameters,
+        uid: Int,
+        securityLevel: Int,
+        creationTimeMs: Long,
+    ): ByteArray? {
+        if (!NativeCertGen.isAvailable) return null
+
+        val request =
+            runCatching { encodeAttestationRequest(params, uid, securityLevel, creationTimeMs) }
+                .onFailure { Logger.e("Failed to encode native attestation request", it) }
+                .getOrNull() ?: return null
+
+        return runCatching { NativeCertGen.nativeBuildAttestationExtension(request) }
+            .onFailure {
+                Logger.d("Native attestation build unavailable for this request: ${it.message}")
+            }
+            .getOrNull()
+            ?.takeIf { it.isNotEmpty() }
+    }
+
+    /**
+     * Packs the attestation request for the native builder (see the Rust `attreq` module for the
+     * layout). Every value mirrors what the BouncyCastle path below reads, so the two encoders
+     * stay byte-identical: the native side only re-serialises the same fields. The attestation
+     * application id and unique id are still computed here (they need the PackageManager and the
+     * persisted HMAC key) and handed over already encoded. Nullable optionals are written as
+     * zero-length fields so the native side applies the same "omit this tag" default.
+     */
+    private fun encodeAttestationRequest(
+        params: KeyGenParameters,
+        uid: Int,
+        securityLevel: Int,
+        creationTimeMs: Long,
+    ): ByteArray {
+        val versions = AndroidUtils.attestationVersions(securityLevel)
+        val patchLevels = AndroidUtils.resolvePatchLevels(uid)
+        val applicationId = if (params.attestationChallenge != null) createApplicationId(uid) else null
+        val uniqueId =
+            if (params.includeUniqueId == true && applicationId != null) {
+                computeUniqueId(creationTimeMs, applicationId.octets)
+            } else {
+                ByteArray(0)
+            }
+
+        val out = ByteArrayOutputStream()
+        DataOutputStream(out).use { data ->
+            data.writeInt(params.algorithm)
+            data.writeInt(effectiveKeySize(params))
+            data.writeInt(params.ecCurve)
+            data.writeLong(params.rsaPublicExponent?.toLong() ?: 0L)
+            data.writeInt(securityLevel)
+            data.writeInt(versions.attestation)
+            data.writeInt(versions.keymaster)
+            data.writeInt(AndroidUtils.osVersion)
+            data.writeInt(patchLevels.os)
+            data.writeInt(patchLevels.vendor)
+            data.writeInt(patchLevels.boot)
+            data.writeLong(creationTimeMs)
+            data.writeInt(params.origin ?: 0)
+            data.writeLengthPrefixed(params.attestationChallenge ?: ByteArray(0))
+            data.writeLengthPrefixed(uniqueId)
+            data.writeLengthPrefixed(applicationId?.octets ?: ByteArray(0))
+            data.writeLengthPrefixed(AndroidUtils.moduleHash)
+            data.writeLengthPrefixed(AndroidUtils.bootKey)
+            data.writeLengthPrefixed(AndroidUtils.getBootHashFromProp() ?: ByteArray(0))
+            data.writeIntVector(params.purpose)
+            data.writeIntVector(params.digest)
+            data.writeIntVector(params.blockMode)
+            data.writeIntVector(params.padding)
+            data.writeIntVector(params.mgfDigest)
+            data.writeLongVector(params.userSecureIds)
+            data.writeOptionalInt(params.userAuthType)
+            data.writeOptionalInt(params.authTimeout)
+            data.writeBoolean(params.allowWhileOnBody == true)
+            data.writeBoolean(params.trustedUserPresenceRequired == true)
+            data.writeBoolean(params.trustedConfirmationRequired == true)
+            data.writeBoolean(params.unlockedDeviceRequired == true)
+            data.writeBoolean(params.noAuthRequiredIsValid)
+            data.writeBoolean(params.callerNonce == true)
+            data.writeLong(params.activeDateTime ?: -1L)
+            data.writeLong(params.originationExpireDateTime ?: -1L)
+            data.writeLong(params.usageExpireDateTime ?: -1L)
+            data.writeInt(params.maxUsesPerBoot)
+            data.writeInt(params.usageCountLimit)
+            data.writeLengthPrefixed(params.brand ?: ByteArray(0))
+            data.writeLengthPrefixed(params.device ?: ByteArray(0))
+            data.writeLengthPrefixed(params.product ?: ByteArray(0))
+            data.writeLengthPrefixed(params.serialno ?: ByteArray(0))
+            data.writeLengthPrefixed(params.imei1 ?: ByteArray(0))
+            data.writeLengthPrefixed(params.meid ?: ByteArray(0))
+            data.writeLengthPrefixed(params.manufacturer ?: ByteArray(0))
+            data.writeLengthPrefixed(params.model ?: ByteArray(0))
+            data.writeLengthPrefixed(params.imei2 ?: ByteArray(0))
+        }
+        return out.toByteArray()
     }
 
     // persisted so the unique_id stays stable across reboots; ephemeral fallback if unwritable

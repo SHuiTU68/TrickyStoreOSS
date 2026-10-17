@@ -1,22 +1,26 @@
 //! KeyMint attestation-extension construction.
 //!
-//! Ported from the Rust certificate generator used by TEESimulator-RS. Builds the `KeyDescription`
-//! ASN.1 structure that lands in the leaf certificate's `1.3.6.1.4.1.11129.2.1.17` extension:
-//! version/security-level header, the attestation challenge, and the software- and TEE-enforced
-//! authorization lists. The encoding is hand-rolled rather than derived so each field matches AOSP
-//! byte for byte — notably the security levels and `verifiedBootState` are ENUMERATED (0x0A), not
-//! INTEGER, and authorization lists are sorted by tag number.
+//! Builds the `KeyDescription` ASN.1 structure that lands in the leaf certificate's
+//! `1.3.6.1.4.1.11129.2.1.17` extension: version/security-level header, the attestation challenge,
+//! the unique id, and the software- and TEE-enforced authorization lists. The encoding is
+//! hand-rolled rather than derived so each field matches AOSP byte for byte — notably the security
+//! levels and `verifiedBootState` are ENUMERATED (0x0A), not INTEGER, caller-nonce is tag 1005 in
+//! the TEE list, and authorization lists are sorted by tag number.
+//!
+//! This mirrors the Kotlin `CertificateGen.buildAttestationDer` path field for field; the Kotlin
+//! layer still computes the attestation application id and unique id (it needs the PackageManager
+//! and the HMAC key) and hands those over pre-encoded.
 
 use crate::error::Result;
-use crate::types::CertGenParams;
+use crate::types::{Algorithm, CertGenParams};
 
 const DO_NOT_REPORT: i32 = -1;
 
 /// Encodes the full attestation extension as DER, ready to be wrapped in the certificate's
-/// attestation extension by the certificate builder.
+/// attestation-extension OCTET STRING by the certificate builder.
 pub fn build_attestation_extension(params: &CertGenParams) -> Result<Vec<u8>> {
-    let sw = build_software_enforced(params)?;
-    let tee = build_tee_enforced(params)?;
+    let sw = build_software_enforced(params);
+    let tee = build_tee_enforced(params);
 
     let mut inner = Vec::new();
     // attestationVersion — INTEGER
@@ -28,11 +32,9 @@ pub fn build_attestation_extension(params: &CertGenParams) -> Result<Vec<u8>> {
     // keymintSecurityLevel — ENUMERATED, not INTEGER
     inner.extend_from_slice(&enc_enumerated(params.security_level));
     // attestationChallenge — OCTET STRING
-    inner.extend_from_slice(&enc_octet_string(
-        params.attestation_challenge.as_deref().unwrap_or(&[]),
-    ));
-    // uniqueId — OCTET STRING (always empty)
-    inner.extend_from_slice(&enc_octet_string(&[]));
+    inner.extend_from_slice(&enc_octet_string(params.attestation_challenge.as_deref().unwrap_or(&[])));
+    // uniqueId — OCTET STRING (empty when the caller requested none)
+    inner.extend_from_slice(&enc_octet_string(&params.unique_id));
     // softwareEnforced
     inner.extend_from_slice(&sw);
     // teeEnforced
@@ -41,13 +43,8 @@ pub fn build_attestation_extension(params: &CertGenParams) -> Result<Vec<u8>> {
     Ok(enc_sequence(&inner))
 }
 
-fn build_software_enforced(params: &CertGenParams) -> Result<Vec<u8>> {
+fn build_software_enforced(params: &CertGenParams) -> Vec<u8> {
     let mut fields: Vec<(u32, Vec<u8>)> = Vec::new();
-
-    // Tag 303: CALLER_NONCE — NULL (presence = true)
-    if params.caller_nonce {
-        fields.push((303, enc_null()));
-    }
 
     // Tag 400: ACTIVE_DATETIME — INTEGER (milliseconds)
     if params.active_datetime >= 0 {
@@ -64,8 +61,13 @@ fn build_software_enforced(params: &CertGenParams) -> Result<Vec<u8>> {
         fields.push((402, enc_integer(params.usage_expire_datetime)));
     }
 
-    // Tag 405: USAGE_COUNT_LIMIT — INTEGER
-    if params.usage_count_limit >= 0 {
+    // Tag 404: MAX_USES_PER_BOOT — INTEGER (only when positive)
+    if params.max_uses_per_boot > 0 {
+        fields.push((404, enc_integer(params.max_uses_per_boot as i64)));
+    }
+
+    // Tag 405: USAGE_COUNT_LIMIT — INTEGER (only when positive)
+    if params.usage_count_limit > 0 {
         fields.push((405, enc_integer(params.usage_count_limit as i64)));
     }
 
@@ -77,9 +79,7 @@ fn build_software_enforced(params: &CertGenParams) -> Result<Vec<u8>> {
     // Tag 701: CREATION_DATETIME — INTEGER (milliseconds)
     fields.push((701, enc_integer(params.creation_datetime)));
 
-    // Tag 709: ATTESTATION_APPLICATION_ID — OCTET STRING
-    // The bytes are already the DER-encoded AttestationApplicationId wrapped in OCTET STRING
-    // by the Kotlin layer. We wrap them in an EXPLICIT tag.
+    // Tag 709: ATTESTATION_APPLICATION_ID — OCTET STRING (the pre-encoded AAID DER)
     if !params.attestation_application_id.is_empty() {
         fields.push((709, enc_octet_string(&params.attestation_application_id)));
     }
@@ -91,10 +91,10 @@ fn build_software_enforced(params: &CertGenParams) -> Result<Vec<u8>> {
         }
     }
 
-    Ok(build_authorization_list(&mut fields))
+    build_authorization_list(&mut fields)
 }
 
-fn build_tee_enforced(params: &CertGenParams) -> Result<Vec<u8>> {
+fn build_tee_enforced(params: &CertGenParams) -> Vec<u8> {
     let mut fields: Vec<(u32, Vec<u8>)> = Vec::new();
 
     // Tag 1: PURPOSE — SET OF INTEGER
@@ -102,29 +102,83 @@ fn build_tee_enforced(params: &CertGenParams) -> Result<Vec<u8>> {
         fields.push((1, build_set_of_integer(&params.purposes)));
     }
 
-    // Tag 2: ALGORITHM — INTEGER
+    // Tag 2: ALGORITHM — INTEGER (raw KeyMint value)
     fields.push((2, enc_integer(params.algorithm as i32 as i64)));
 
-    // Tag 3: KEY_SIZE — INTEGER
-    fields.push((3, enc_integer(params.key_size as i64)));
+    // Tag 3: KEY_SIZE — INTEGER (effective size, only when known)
+    if params.key_size > 0 {
+        fields.push((3, enc_integer(params.key_size as i64)));
+    }
+
+    // Tag 4: BLOCK_MODE — SET OF INTEGER
+    if !params.block_mode.is_empty() {
+        fields.push((4, build_set_of_integer(&params.block_mode)));
+    }
 
     // Tag 5: DIGEST — SET OF INTEGER
     if !params.digests.is_empty() {
         fields.push((5, build_set_of_integer(&params.digests)));
     }
 
-    // Tag 10: EC_CURVE — INTEGER (only for EC keys)
-    if let Some(curve) = params.ec_curve {
-        fields.push((10, enc_integer(curve as i32 as i64)));
+    // Tag 6: PADDING — SET OF INTEGER
+    if !params.padding.is_empty() {
+        fields.push((6, build_set_of_integer(&params.padding)));
     }
 
-    // Tag 503: NO_AUTH_REQUIRED — NULL (conditional)
+    // Tag 10: EC_CURVE — INTEGER (only for EC keys whose curve is set)
+    if params.algorithm == Algorithm::Ec {
+        if let Some(curve) = params.ec_curve {
+            fields.push((10, enc_integer(curve as i32 as i64)));
+        }
+    }
+
+    // Tag 200: RSA_PUBLIC_EXPONENT — INTEGER (only for RSA keys)
+    if params.algorithm == Algorithm::Rsa && params.rsa_public_exponent != 0 {
+        fields.push((200, enc_integer(params.rsa_public_exponent as i64)));
+    }
+
+    // Tag 203: RSA_OAEP_MGF_DIGEST — SET OF INTEGER (only when attestVersion >= 100)
+    if params.attest_version >= 100 && !params.mgf_digest.is_empty() {
+        fields.push((203, build_set_of_integer(&params.mgf_digest)));
+    }
+
+    // Tag 502: USER_SECURE_ID — SET OF INTEGER
+    if !params.user_secure_ids.is_empty() {
+        fields.push((502, build_set_of_integer_i64(&params.user_secure_ids)));
+    }
+
+    // Tag 503: NO_AUTH_REQUIRED — NULL (already validated by the Kotlin caller)
     if params.no_auth_required {
         fields.push((503, enc_null()));
     }
 
-    // Tag 702: ORIGIN — INTEGER 0 (GENERATED)
-    fields.push((702, enc_integer(0)));
+    // Tag 504: USER_AUTH_TYPE — INTEGER
+    if let Some(value) = params.user_auth_type {
+        fields.push((504, enc_integer(value as i64)));
+    }
+
+    // Tag 505: AUTH_TIMEOUT — INTEGER
+    if let Some(value) = params.auth_timeout {
+        fields.push((505, enc_integer(value as i64)));
+    }
+
+    // Tag 506: ALLOW_WHILE_ON_BODY — NULL
+    if params.allow_while_on_body {
+        fields.push((506, enc_null()));
+    }
+
+    // Tag 507: TRUSTED_USER_PRESENCE_REQUIRED — NULL
+    if params.trusted_user_presence_required {
+        fields.push((507, enc_null()));
+    }
+
+    // Tag 508: TRUSTED_CONFIRMATION_REQUIRED — NULL
+    if params.trusted_confirmation_required {
+        fields.push((508, enc_null()));
+    }
+
+    // Tag 702: ORIGIN — INTEGER
+    fields.push((702, enc_integer(params.origin as i64)));
 
     // Tag 704: ROOT_OF_TRUST — SEQUENCE
     fields.push((704, build_root_of_trust(params)));
@@ -140,30 +194,14 @@ fn build_tee_enforced(params: &CertGenParams) -> Result<Vec<u8>> {
     }
 
     // Tags 710-717: ATTESTATION_ID_* — OCTET STRING (optional)
-    if let Some(ref v) = params.id_brand {
-        fields.push((710, enc_octet_string(v)));
-    }
-    if let Some(ref v) = params.id_device {
-        fields.push((711, enc_octet_string(v)));
-    }
-    if let Some(ref v) = params.id_product {
-        fields.push((712, enc_octet_string(v)));
-    }
-    if let Some(ref v) = params.id_serial {
-        fields.push((713, enc_octet_string(v)));
-    }
-    if let Some(ref v) = params.id_imei {
-        fields.push((714, enc_octet_string(v)));
-    }
-    if let Some(ref v) = params.id_meid {
-        fields.push((715, enc_octet_string(v)));
-    }
-    if let Some(ref v) = params.id_manufacturer {
-        fields.push((716, enc_octet_string(v)));
-    }
-    if let Some(ref v) = params.id_model {
-        fields.push((717, enc_octet_string(v)));
-    }
+    push_octet_field(&mut fields, 710, &params.id_brand);
+    push_octet_field(&mut fields, 711, &params.id_device);
+    push_octet_field(&mut fields, 712, &params.id_product);
+    push_octet_field(&mut fields, 713, &params.id_serial);
+    push_octet_field(&mut fields, 714, &params.id_imei);
+    push_octet_field(&mut fields, 715, &params.id_meid);
+    push_octet_field(&mut fields, 716, &params.id_manufacturer);
+    push_octet_field(&mut fields, 717, &params.id_model);
 
     // Tag 718: VENDOR_PATCHLEVEL — INTEGER
     if params.vendor_patch_level != DO_NOT_REPORT {
@@ -177,12 +215,15 @@ fn build_tee_enforced(params: &CertGenParams) -> Result<Vec<u8>> {
 
     // Tag 723: ATTESTATION_ID_SECOND_IMEI — OCTET STRING (only if attestVersion >= 300)
     if params.attest_version >= 300 {
-        if let Some(ref v) = params.id_second_imei {
-            fields.push((723, enc_octet_string(v)));
-        }
+        push_octet_field(&mut fields, 723, &params.id_second_imei);
     }
 
-    Ok(build_authorization_list(&mut fields))
+    // Tag 1005: CALLER_NONCE — NULL (TEE list, sorts after 723)
+    if params.caller_nonce {
+        fields.push((1005, enc_null()));
+    }
+
+    build_authorization_list(&mut fields)
 }
 
 fn build_root_of_trust(params: &CertGenParams) -> Vec<u8> {
@@ -198,6 +239,13 @@ fn build_root_of_trust(params: &CertGenParams) -> Vec<u8> {
     enc_sequence(&inner)
 }
 
+/// Appends an optional OCTET STRING field, skipping a tag the build never defined.
+fn push_octet_field(fields: &mut Vec<(u32, Vec<u8>)>, tag: u32, value: &Option<Vec<u8>>) {
+    if let Some(bytes) = value {
+        fields.push((tag, enc_octet_string(bytes)));
+    }
+}
+
 /// Sorts the fields by tag number and wraps them as an `AuthorizationList` SEQUENCE.
 fn build_authorization_list(fields: &mut [(u32, Vec<u8>)]) -> Vec<u8> {
     fields.sort_by_key(|(tag, _)| *tag);
@@ -209,8 +257,17 @@ fn build_authorization_list(fields: &mut [(u32, Vec<u8>)]) -> Vec<u8> {
 }
 
 fn build_set_of_integer(values: &[i32]) -> Vec<u8> {
-    // DER SET OF: elements sorted by encoded byte value
-    let mut encoded: Vec<Vec<u8>> = values.iter().map(|v| enc_integer(*v as i64)).collect();
+    let encoded: Vec<Vec<u8>> = values.iter().map(|v| enc_integer(*v as i64)).collect();
+    build_set_of(encoded)
+}
+
+fn build_set_of_integer_i64(values: &[i64]) -> Vec<u8> {
+    let encoded: Vec<Vec<u8>> = values.iter().map(|v| enc_integer(*v)).collect();
+    build_set_of(encoded)
+}
+
+fn build_set_of(mut encoded: Vec<Vec<u8>>) -> Vec<u8> {
+    // DER SET OF: elements sorted by their encoded bytes
     encoded.sort();
     let mut inner = Vec::new();
     for e in &encoded {
@@ -508,7 +565,7 @@ mod tests {
         params.os_patch_level = DO_NOT_REPORT;
         params.vendor_patch_level = DO_NOT_REPORT;
         params.boot_patch_level = DO_NOT_REPORT;
-        let tee = build_tee_enforced(&params).unwrap();
+        let tee = build_tee_enforced(&params);
         let hex = hex_string(&tee);
         // Tags 706, 718, 719 should not appear
         // Tag 706 = BF 85 42, 718 = BF 85 4E, 719 = BF 85 4F
@@ -536,12 +593,18 @@ mod tests {
         let (_, rest) = skip_one_tlv(rest);
         // Field 3: keymintSecurityLevel — ENUMERATED (0x0A)
         assert_eq!(rest[0], 0x0A, "keymintSecurityLevel must be ENUMERATED");
+        let (_, rest) = skip_one_tlv(rest);
+        // Field 4: attestationChallenge — OCTET STRING (0x04)
+        assert_eq!(rest[0], 0x04);
+        let (_, rest) = skip_one_tlv(rest);
+        // Field 5: uniqueId — OCTET STRING (0x04)
+        assert_eq!(rest[0], 0x04, "uniqueId must be an OCTET STRING");
     }
 
     #[test]
     fn test_authorization_list_sorted_by_tag() {
         let params = make_test_params();
-        let tee = build_tee_enforced(&params).unwrap();
+        let tee = build_tee_enforced(&params);
         let inner = skip_tlv_header(&tee);
         let tags = extract_tag_numbers(inner);
         let mut sorted = tags.clone();
@@ -552,24 +615,34 @@ mod tests {
     #[test]
     fn test_enforcement_tags_in_software_enforced() {
         let mut params = make_test_params();
-        params.usage_count_limit = 3;
+        params.max_uses_per_boot = 3;
+        params.usage_count_limit = 5;
         params.unlocked_device_required = true;
-        params.caller_nonce = true;
         params.active_datetime = 1709913600000;
-        let sw = build_software_enforced(&params).unwrap();
+        let sw = build_software_enforced(&params);
         let inner = skip_tlv_header(&sw);
         let tags = extract_tag_numbers(inner);
-        assert!(tags.contains(&303), "CALLER_NONCE (303) must be in softwareEnforced");
         assert!(tags.contains(&400), "ACTIVE_DATETIME (400) must be in softwareEnforced");
+        assert!(tags.contains(&404), "MAX_USES_PER_BOOT (404) must be in softwareEnforced");
         assert!(tags.contains(&405), "USAGE_COUNT_LIMIT (405) must be in softwareEnforced");
         assert!(tags.contains(&509), "UNLOCKED_DEVICE_REQUIRED (509) must be in softwareEnforced");
+    }
+
+    #[test]
+    fn test_caller_nonce_is_tag_1005_in_tee() {
+        let mut params = make_test_params();
+        params.caller_nonce = true;
+        let tee = build_tee_enforced(&params);
+        let tags = extract_tag_numbers(skip_tlv_header(&tee));
+        assert!(tags.contains(&1005), "CALLER_NONCE must be tag 1005 in teeEnforced");
+        assert!(!tags.contains(&303), "CALLER_NONCE must not use the software tag 303");
     }
 
     #[test]
     fn test_no_auth_required_conditional() {
         let mut params = make_test_params();
         params.no_auth_required = false;
-        let tee = build_tee_enforced(&params).unwrap();
+        let tee = build_tee_enforced(&params);
         let inner = skip_tlv_header(&tee);
         let tags = extract_tag_numbers(inner);
         assert!(!tags.contains(&503), "NO_AUTH_REQUIRED (503) must be absent when false");
@@ -578,12 +651,12 @@ mod tests {
     #[test]
     fn test_enforcement_tags_omitted_when_unset() {
         let params = make_test_params();
-        let sw = build_software_enforced(&params).unwrap();
+        let sw = build_software_enforced(&params);
         let inner = skip_tlv_header(&sw);
         let tags = extract_tag_numbers(inner);
-        assert!(!tags.contains(&303), "CALLER_NONCE should be absent when false");
         assert!(!tags.contains(&400), "ACTIVE_DATETIME should be absent when -1");
-        assert!(!tags.contains(&405), "USAGE_COUNT_LIMIT should be absent when -1");
+        assert!(!tags.contains(&404), "MAX_USES_PER_BOOT should be absent when 0");
+        assert!(!tags.contains(&405), "USAGE_COUNT_LIMIT should be absent when 0");
         assert!(!tags.contains(&509), "UNLOCKED_DEVICE_REQUIRED should be absent when false");
     }
 
@@ -609,6 +682,17 @@ mod tests {
             attestation_challenge: Some(vec![0xAB; 32]),
             purposes: vec![2, 3],
             digests: vec![4],
+            block_mode: vec![],
+            padding: vec![],
+            mgf_digest: vec![],
+            user_secure_ids: vec![],
+            user_auth_type: None,
+            auth_timeout: None,
+            allow_while_on_body: false,
+            trusted_user_presence_required: false,
+            trusted_confirmation_required: false,
+            max_uses_per_boot: 0,
+            origin: 0,
             cert_serial: None,
             cert_subject: None,
             cert_not_before: -1,
@@ -626,6 +710,7 @@ mod tests {
             boot_hash: vec![0x02; 32],
             creation_datetime: 1709913600000,
             attestation_application_id: vec![0xDE, 0xAD],
+            unique_id: vec![0xBE, 0xEF],
             module_hash: None,
             id_brand: None,
             id_device: None,
@@ -639,7 +724,7 @@ mod tests {
             active_datetime: -1,
             origination_expire_datetime: -1,
             usage_expire_datetime: -1,
-            usage_count_limit: -1,
+            usage_count_limit: 0,
             caller_nonce: false,
             unlocked_device_required: false,
             no_auth_required: true,

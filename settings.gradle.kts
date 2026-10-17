@@ -24,5 +24,5 @@ dependencyResolutionManagement {
     }
 }
 
-rootProject.name = "Tricky Store OSS"
+rootProject.name = "Tricky Store OSS-RS"
 include(":app", ":stub")
