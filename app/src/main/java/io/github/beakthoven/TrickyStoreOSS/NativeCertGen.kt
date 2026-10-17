@@ -10,9 +10,10 @@ import io.github.beakthoven.TrickyStoreOSS.logging.Logger
 /**
  * JNI bridge to the native `libcertgen.so` (Rust `native-certgen` crate).
  *
- * Key generation runs natively; certificate building and attestation are still handled by the
- * BouncyCastle path, which callers fall back to whenever [isAvailable] is false or the requested
- * parameters are outside what the native crate supports.
+ * Key generation and certificate-chain building run natively; the attestation extension itself is
+ * still built by the BouncyCastle path and handed to the native builder pre-encoded, and callers
+ * fall back to the BouncyCastle path whenever [isAvailable] is false or the requested parameters
+ * are outside what the native crate supports.
  */
 object NativeCertGen {
     // Magisk/KernelSU/APatch all mount modules at this fixed path, and the daemon starts from here.
@@ -48,4 +49,11 @@ object NativeCertGen {
         ecCurve: Int,
         rsaPublicExponent: Long,
     ): ByteArray
+
+    /**
+     * Builds the attestation certificate chain natively from a packed request blob (see the Rust
+     * `chaingen` module) and returns the leaf-first, back-to-back concatenated DER certificates, or
+     * throws if the request is unsupported or malformed.
+     */
+    external fun nativeBuildCertificateChain(request: ByteArray): ByteArray
 }

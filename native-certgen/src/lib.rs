@@ -1,28 +1,27 @@
 //! Native certificate/key generation for TrickyStoreOSS.
 //!
-//! The key-generation stage now runs in Rust and is exposed over JNI. Certificate building and
-//! attestation extension construction are still handled by the BouncyCastle path in the app; as
-//! those move over, their JNI entry points will join the one below so the loop stays native.
+//! Key generation and certificate-chain building both run in Rust and are exposed over JNI. The
+//! attestation extension itself is still built by the BouncyCastle path in the app and handed to
+//! the native builder pre-encoded; if that stage ever ports over, its JNI entry point will join the
+//! ones below.
 
 #![deny(clippy::unwrap_used, clippy::expect_used)]
 
 mod error;
-// Staged for the certificate-chain port: parses the keybox ahead of the certbuilder/attestation
-// stages that will consume it, so it is not referenced yet.
-#[allow(dead_code)]
+// Parses the keybox ahead of the certbuilder that consumes it.
 mod keybox;
-// Staged for the certificate-chain port: builds DER certificates from a key pair plus the parsed
-// keybox, wired in once the JNI entry point for chain generation lands.
-#[allow(dead_code)]
+// Builds the DER certificates for the attestation chain.
 mod certbuilder;
-// Staged for the certificate-chain port: builds the KeyMint attestation extension the certbuilder
-// embeds into the leaf, wired in together with the chain JNI entry point.
+// Staged for a possible native attestation port: builds the KeyMint extension the certbuilder would
+// embed in the leaf. The app still builds this in Kotlin, so it is not referenced yet.
 #[allow(dead_code)]
 mod attestation;
+// Request/response wire format for the certificate-chain JNI entry point.
+mod chaingen;
 mod keygen;
 mod types;
 
-use jni::objects::JClass;
+use jni::objects::{JByteArray, JClass};
 use jni::sys::{jboolean, jbyteArray, jint, jlong, jstring};
 use jni::JNIEnv;
 
@@ -31,7 +30,7 @@ use ring::signature::{
     EcdsaKeyPair, KeyPair, UnparsedPublicKey, ECDSA_P256_SHA256_ASN1, ECDSA_P256_SHA256_ASN1_SIGNING,
 };
 
-use crate::error::Result;
+use crate::error::{CertGenError, Result};
 use crate::types::{Algorithm, EcCurve, GeneratedKeyPair};
 
 /// Build/version marker surfaced to Kotlin so a successful load can be confirmed in the daemon log.
@@ -117,6 +116,50 @@ fn encode_key_pair(key_pair: &GeneratedKeyPair) -> Vec<u8> {
     blob.extend_from_slice(&(key_pair.public_key_spki.len() as u32).to_be_bytes());
     blob.extend_from_slice(&key_pair.public_key_spki);
     blob
+}
+
+/// Builds an attestation certificate chain natively from a packed request blob (see
+/// [`chaingen`]) and returns the concatenated DER certificates, leaf first. The leaf key, the
+/// Kotlin-built attestation extension and the keybox/signing material are all carried in the blob.
+///
+/// Any unsupported or malformed input throws, so the Kotlin caller falls back to BouncyCastle.
+#[no_mangle]
+pub extern "system" fn Java_io_github_beakthoven_TrickyStoreOSS_NativeCertGen_nativeBuildCertificateChain(
+    mut env: JNIEnv,
+    _this: JClass,
+    request: jbyteArray,
+) -> jbyteArray {
+    let result = read_byte_array(&mut env, request).and_then(|bytes| {
+        chaingen::build_certificate_chain_blob(&bytes)
+    });
+
+    match result {
+        Ok(blob) => match env.byte_array_from_slice(&blob) {
+            Ok(array) => array.into_raw(),
+            Err(e) => {
+                let _ = env.throw_new(
+                    "java/lang/RuntimeException",
+                    format!("NativeCertGen: failed to allocate result array: {e}"),
+                );
+                std::ptr::null_mut()
+            }
+        },
+        Err(e) => {
+            let _ = env.throw_new("java/lang/RuntimeException", format!("NativeCertGen: {e}"));
+            std::ptr::null_mut()
+        }
+    }
+}
+
+/// Copies a JNI byte array into a `Vec`, rejecting a null handle so the builder never sees a
+/// missing request.
+fn read_byte_array(env: &mut JNIEnv, array: jbyteArray) -> Result<Vec<u8>> {
+    if array.is_null() {
+        return Err(CertGenError::InvalidParameter("chain request was null".into()));
+    }
+    let array = unsafe { JByteArray::from_raw(array) };
+    env.convert_byte_array(&array)
+        .map_err(|e| CertGenError::InvalidParameter(format!("chain request read failed: {e}")))
 }
 
 // ring::error::Unspecified does not implement std::error::Error, so map each failure to a

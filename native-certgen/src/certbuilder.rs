@@ -25,6 +25,9 @@ const OID_KEY_USAGE: &[u64] = &[2, 5, 29, 15];
 
 /// Builds a single self-signed certificate for the no-challenge case (AOSP `ta/src/keys.rs:451-478`:
 /// no challenge means a self-signed leaf, chain depth 1).
+///
+/// The app always signs through a keybox, so only the tests exercise this AOSP parity path today.
+#[allow(dead_code)]
 pub fn build_self_signed_cert(
     key_pair: &GeneratedKeyPair,
     params: &CertGenParams,
@@ -107,8 +110,10 @@ fn build_leaf_cert(
     params: &CertGenParams,
 ) -> Result<Vec<u8>> {
     let spki_der = extract_spki_from_pkcs8(&key_pair.private_key_pkcs8)?;
-    let sig_alg_der =
-        signature_algorithm_for_signing_key(&keybox.signing_key_der, params.algorithm)?;
+    // The leaf is signed by the keybox (or designated attest) key, which is independent of the
+    // leaf key's algorithm, so the signing algorithm must come from the signing key itself.
+    let signing_algorithm = detect_signing_key_algorithm(&keybox.signing_key_der)?;
+    let sig_alg_der = signature_algorithm_for_signing_key(&keybox.signing_key_der, signing_algorithm)?;
 
     // Serial number
     let serial_bytes = if let Some(ref serial) = params.cert_serial {
@@ -153,7 +158,7 @@ fn build_leaf_cert(
     ]);
 
     // Sign the TBS
-    let signature_bytes = sign_tbs(&tbs_der, &keybox.signing_key_der, params.algorithm)?;
+    let signature_bytes = sign_tbs(&tbs_der, &keybox.signing_key_der, signing_algorithm)?;
     let signature_bit_string = encode_der_bit_string(&signature_bytes);
 
     // Final certificate: SEQUENCE { TBS, sigAlgorithm, signature }
@@ -166,6 +171,24 @@ fn sign_tbs(tbs_der: &[u8], signing_key_der: &[u8], algorithm: Algorithm) -> Res
     match algorithm {
         Algorithm::Ec => sign_tbs_ec(tbs_der, signing_key_der),
         Algorithm::Rsa => sign_tbs_rsa(tbs_der, signing_key_der),
+    }
+}
+
+/// Reads the signature algorithm to use from the signing key's PKCS#8 `AlgorithmIdentifier`, so a
+/// keybox key whose algorithm differs from the leaf key still signs with the right primitive.
+fn detect_signing_key_algorithm(pkcs8_der: &[u8]) -> Result<Algorithm> {
+    use der::Decode;
+    let info = pkcs8::PrivateKeyInfo::from_der(pkcs8_der)
+        .map_err(|e| CertGenError::SigningFailed(format!("PKCS8 parse: {e}")))?;
+
+    let ec_oid: const_oid::ObjectIdentifier = "1.2.840.10045.2.1"
+        .parse()
+        .map_err(|_| CertGenError::SigningFailed("OID parse".into()))?;
+
+    if info.algorithm.oid == ec_oid {
+        Ok(Algorithm::Ec)
+    } else {
+        Ok(Algorithm::Rsa)
     }
 }
 
@@ -610,4 +633,160 @@ fn encode_oid_subidentifier(buf: &mut Vec<u8>, mut value: u64) {
     }
 
     buf.extend_from_slice(&bytes);
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)] // test assertions are allowed to unwrap
+mod tests {
+    use super::*;
+    use crate::keybox::parse_keybox;
+    use crate::keygen::generate_key_pair;
+    use crate::types::{Algorithm, CertGenParams, EcCurve, GeneratedKeyPair};
+    use der::{Decode, Encode};
+    use ring::signature::{UnparsedPublicKey, ECDSA_P256_SHA256_ASN1};
+
+    fn test_params() -> CertGenParams {
+        CertGenParams {
+            algorithm: Algorithm::Ec,
+            key_size: 256,
+            ec_curve: Some(EcCurve::P256),
+            rsa_public_exponent: 0,
+            attestation_challenge: None,
+            purposes: vec![2], // SIGN
+            digests: vec![],
+            cert_serial: None,
+            cert_subject: None,
+            cert_not_before: 1_700_000_000_000,
+            cert_not_after: -1,
+            keybox_private_key: vec![],
+            keybox_cert_chain: vec![],
+            security_level: 1,
+            attest_version: 200,
+            keymaster_version: 200,
+            os_version: 140000,
+            os_patch_level: 202503,
+            vendor_patch_level: 20250301,
+            boot_patch_level: 20250301,
+            boot_key: vec![],
+            boot_hash: vec![],
+            creation_datetime: 1_700_000_000_000,
+            attestation_application_id: vec![],
+            module_hash: None,
+            id_brand: None,
+            id_device: None,
+            id_product: None,
+            id_serial: None,
+            id_imei: None,
+            id_meid: None,
+            id_manufacturer: None,
+            id_model: None,
+            id_second_imei: None,
+            active_datetime: -1,
+            origination_expire_datetime: -1,
+            usage_expire_datetime: -1,
+            usage_count_limit: -1,
+            caller_nonce: false,
+            unlocked_device_required: false,
+            no_auth_required: false,
+            uid: 0,
+            debug_logging: false,
+        }
+    }
+
+    fn ec_key() -> GeneratedKeyPair {
+        generate_key_pair(Algorithm::Ec, 256, Some(EcCurve::P256), 0).unwrap()
+    }
+
+    /// The self-signed certificate must re-parse as a valid X.509 cert, embed the generated key,
+    /// and carry a signature that verifies against that key.
+    #[test]
+    fn self_signed_cert_is_valid_and_carries_the_key() {
+        let key = ec_key();
+        let chain = build_self_signed_cert(&key, &test_params()).unwrap();
+        assert_eq!(chain.len(), 1);
+
+        let cert = x509_cert::Certificate::from_der(&chain[0]).unwrap();
+        // issuer == subject for a self-signed certificate
+        assert_eq!(cert.tbs_certificate.issuer, cert.tbs_certificate.subject);
+        // the embedded subjectPublicKeyInfo matches the generated key's SPKI byte for byte
+        assert_eq!(
+            cert.tbs_certificate.subject_public_key_info.to_der().unwrap(),
+            key.public_key_spki
+        );
+
+        let point = cert.tbs_certificate.subject_public_key_info.subject_public_key.raw_bytes();
+        UnparsedPublicKey::new(&ECDSA_P256_SHA256_ASN1, point)
+            .verify(&cert.tbs_certificate.to_der().unwrap(), cert.signature.raw_bytes())
+            .unwrap();
+    }
+
+    /// The chain's leaf must be issued by the keybox, keep the keybox's raw issuer DN, bound its
+    /// validity to the keybox leaf, and verify against the keybox key; the keybox certs follow.
+    #[test]
+    fn chain_leaf_is_signed_by_the_keybox() {
+        // A self-signed certificate doubles as the keybox that signs the leaf.
+        let ca_key = ec_key();
+        let ca_certs = build_self_signed_cert(&ca_key, &test_params()).unwrap();
+        let keybox = parse_keybox(&ca_certs[0], &ca_key.private_key_pkcs8).unwrap();
+
+        let leaf_key = ec_key();
+        let chain = build_certificate_chain(&leaf_key, None, &keybox, &test_params()).unwrap();
+        assert_eq!(chain.len(), 2);
+        assert_eq!(chain[1], ca_certs[0], "keybox certificates are appended verbatim");
+
+        let leaf = x509_cert::Certificate::from_der(&chain[0]).unwrap();
+        // issuer DN reuses the keybox leaf's subject bytes verbatim
+        assert_eq!(leaf.tbs_certificate.issuer.to_der().unwrap(), keybox.issuer_dn_der);
+        // the leaf carries its own public key
+        assert_eq!(
+            leaf.tbs_certificate.subject_public_key_info.to_der().unwrap(),
+            leaf_key.public_key_spki
+        );
+        // the leaf notAfter is bounded by the keybox leaf (params.cert_not_after == -1)
+        assert_eq!(
+            leaf.tbs_certificate.validity.not_after.to_unix_duration().as_secs() as i64,
+            keybox.leaf_not_after
+        );
+
+        // signature verifies against the keybox CA key
+        let ca_point = x509_cert::Certificate::from_der(&ca_certs[0])
+            .unwrap()
+            .tbs_certificate
+            .subject_public_key_info
+            .subject_public_key
+            .raw_bytes()
+            .to_vec();
+        UnparsedPublicKey::new(&ECDSA_P256_SHA256_ASN1, &ca_point)
+            .verify(&leaf.tbs_certificate.to_der().unwrap(), leaf.signature.raw_bytes())
+            .unwrap();
+    }
+
+    /// Covers the RSA signing path: the certificate must re-parse, embed the RSA key, and verify.
+    #[test]
+    fn rsa_self_signed_cert_is_valid() {
+        use rsa::pkcs1v15::{Signature, VerifyingKey};
+        use rsa::pkcs8::DecodePublicKey;
+        use rsa::sha2::Sha256;
+        use rsa::signature::Verifier;
+
+        let key = generate_key_pair(Algorithm::Rsa, 2048, None, 0).unwrap();
+        let mut params = test_params();
+        params.algorithm = Algorithm::Rsa;
+        params.ec_curve = None;
+        params.key_size = 2048;
+
+        let chain = build_self_signed_cert(&key, &params).unwrap();
+        let cert = x509_cert::Certificate::from_der(&chain[0]).unwrap();
+        assert_eq!(
+            cert.tbs_certificate.subject_public_key_info.to_der().unwrap(),
+            key.public_key_spki
+        );
+
+        let public = rsa::RsaPublicKey::from_public_key_der(&key.public_key_spki).unwrap();
+        let verifying = VerifyingKey::<Sha256>::new(public);
+        let signature = Signature::try_from(cert.signature.raw_bytes()).unwrap();
+        verifying
+            .verify(&cert.tbs_certificate.to_der().unwrap(), &signature)
+            .unwrap();
+    }
 }

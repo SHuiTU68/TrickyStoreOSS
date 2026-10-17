@@ -42,9 +42,10 @@ impl TryFrom<i32> for EcCurve {
 }
 
 /// Everything the native certificate pipeline needs for one request, mirroring the fields the
-/// Kotlin `CertGenConfig` carries. The certificate-builder stage reads the algorithm, validity and
-/// purpose fields; the remaining attestation fields are filled in when that stage ports over next,
-/// so they are marked dead for now.
+/// Kotlin `CertGenConfig` carries. The chain builder reads only the algorithm, validity, subject
+/// and purpose fields — the attestation extension itself is built by the Kotlin caller and handed
+/// over pre-encoded — so the remaining fields stay as placeholders for a future native attestation
+/// stage and are marked dead for now.
 #[allow(dead_code)] // staged: only the certbuilder fields are read so far
 pub struct CertGenParams {
     pub algorithm: Algorithm,
@@ -102,6 +103,56 @@ pub struct CertGenParams {
     pub uid: i32,
     /// Mirrors the APK debug variant; gates the produced-extension dump so release stays quiet.
     pub debug_logging: bool,
+}
+
+impl Default for CertGenParams {
+    fn default() -> Self {
+        Self {
+            algorithm: Algorithm::Ec,
+            key_size: 256,
+            ec_curve: None,
+            rsa_public_exponent: 0,
+            attestation_challenge: None,
+            purposes: Vec::new(),
+            digests: Vec::new(),
+            cert_serial: None,
+            cert_subject: None,
+            cert_not_before: -1,
+            cert_not_after: -1,
+            keybox_private_key: Vec::new(),
+            keybox_cert_chain: Vec::new(),
+            security_level: 1,
+            attest_version: 0,
+            keymaster_version: 0,
+            os_version: -1,
+            os_patch_level: -1,
+            vendor_patch_level: -1,
+            boot_patch_level: -1,
+            boot_key: Vec::new(),
+            boot_hash: Vec::new(),
+            creation_datetime: 0,
+            attestation_application_id: Vec::new(),
+            module_hash: None,
+            id_brand: None,
+            id_device: None,
+            id_product: None,
+            id_serial: None,
+            id_imei: None,
+            id_meid: None,
+            id_manufacturer: None,
+            id_model: None,
+            id_second_imei: None,
+            active_datetime: -1,
+            origination_expire_datetime: -1,
+            usage_expire_datetime: -1,
+            usage_count_limit: -1,
+            caller_nonce: false,
+            unlocked_device_required: false,
+            no_auth_required: false,
+            uid: 0,
+            debug_logging: false,
+        }
+    }
 }
 
 /// A freshly generated key pair in standard DER encodings: the private key as PKCS#8 and the

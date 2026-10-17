@@ -19,6 +19,8 @@ import android.system.keystore2.KeyDescriptor
 import io.github.beakthoven.TrickyStoreOSS.config.PkgConfig
 import io.github.beakthoven.TrickyStoreOSS.interceptors.SecurityLevelInterceptor
 import io.github.beakthoven.TrickyStoreOSS.logging.Logger
+import java.io.ByteArrayOutputStream
+import java.io.DataOutputStream
 import java.io.File
 import java.math.BigInteger
 import java.nio.ByteBuffer
@@ -59,6 +61,17 @@ object CertificateGen {
     enum class AuthPolicyProvenance { UNKNOWN, RAW_REQUEST }
 
     data class KeyBox(val keyPair: KeyPair, val certificates: List<Certificate>)
+
+    /**
+     * The material used to sign a freshly generated leaf: the signing key, the issuer DN taken from
+     * its leaf certificate, and that certificate chain as DER (leaf first). The native builder only
+     * needs the DER form, while the BouncyCastle path uses the key and issuer directly.
+     */
+    private class SigningMaterial(
+        val keyPair: KeyPair,
+        val issuer: X500Name,
+        val certChainDer: ByteArray?,
+    )
 
     data class KeyGenParameters(
         var keySize: Int = 0,
@@ -323,14 +336,14 @@ object CertificateGen {
                 if (attestKeyDescriptor != null) {
                     getAttestationKeyInfo(uid, attestKeyDescriptor, securityLevel)
                 } else {
-                    keybox.keyPair to X509CertificateHolder(keybox.certificates[0].encoded).subject
+                    keyboxSigningMaterial(keybox)
                 }
 
-            val leaf = buildCertificate(keyPair, keybox, params, signing.second, uid, securityLevel, signing.first)
-            val chain = buildList {
-                add(leaf)
-                if (attestKeyDescriptor == null) addAll(keybox.certificates)
-            }
+            // A designated attestation key signs a standalone leaf; the keybox case appends the
+            // whole keybox chain after it.
+            val appendSigningChain = attestKeyDescriptor == null
+            val chain =
+                buildChain(keyPair, keybox, params, signing, uid, securityLevel, appendSigningChain)
             keyPair to chain
         }
         raw.exceptionOrNull()?.let { if (it is ServiceSpecificException) throw it }
@@ -356,7 +369,7 @@ object CertificateGen {
         uid: Int,
         descriptor: KeyDescriptor,
         securityLevel: Int,
-    ): Pair<KeyPair, X500Name> {
+    ): SigningMaterial {
         val resolved = SecurityLevelInterceptor.resolveDesignatedAttestationKey(uid, descriptor)
             ?: throw ServiceSpecificException(
                 KeymasterDefs.KM_ERROR_INVALID_ARGUMENT,
@@ -398,19 +411,28 @@ object CertificateGen {
             )
         }
         val signingKey = keyPair!!
-        return signingKey to X509CertificateHolder(certificates.first().encoded).subject
+        return SigningMaterial(
+            keyPair = signingKey,
+            issuer = X509CertificateHolder(certificates.first().encoded).subject,
+            certChainDer = CertificateUtils.run { certificates.toByteArray() },
+        )
     }
+
+    /** Wraps a keybox as the signing material for the freshly minted leaf. */
+    private fun keyboxSigningMaterial(keybox: KeyBox): SigningMaterial =
+        SigningMaterial(
+            keyPair = keybox.keyPair,
+            issuer = X509CertificateHolder(keybox.certificates[0].encoded).subject,
+            certChainDer = CertificateUtils.run { keybox.certificates.toByteArray() },
+        )
 
     private fun buildCertificate(
         keyPair: KeyPair,
-        keybox: KeyBox,
         params: KeyGenParameters,
         issuer: X500Name,
-        uid: Int,
-        securityLevel: Int = 1,
-        signingKeyPair: KeyPair = keybox.keyPair,
+        attestationDer: ByteArray,
+        signingKeyPair: KeyPair,
     ): Certificate {
-        val creationTimeMs = params.createdAtMs ?: System.currentTimeMillis().also { params.createdAtMs = it }
         val builder =
             JcaX509v3CertificateBuilder(
                 issuer,
@@ -433,7 +455,7 @@ object CertificateGen {
                     }
             }
         if (keyUsageBits != 0) builder.addExtension(Extension.keyUsage, true, KeyUsage(keyUsageBits))
-        builder.addExtension(buildAttestExtension(params, uid, securityLevel, creationTimeMs))
+        builder.addExtension(Extension(ATTESTATION_OID, false, DEROctetString(attestationDer)))
         val signerAlgorithm =
             when (signingKeyPair.private) {
                 is java.security.interfaces.ECPrivateKey -> "ECDSA"
@@ -458,23 +480,120 @@ object CertificateGen {
             ?: EC_CURVES.firstOrNull { it.size == keySize }?.name
             ?: "secp256r1"
 
+    /**
+     * Builds the leaf certificate and its chain for [keyPair], preferring the native Rust builder
+     * (keybox parsing, leaf signing and chain assembly all run there) and falling back to
+     * BouncyCastle whenever the native library is unavailable or rejects the request.
+     *
+     * [appendSigningChain] appends the signing certificate chain after the leaf — true for the
+     * keybox case, false when a designated attestation key signs a standalone leaf.
+     */
+    private fun buildChain(
+        keyPair: KeyPair,
+        keybox: KeyBox,
+        params: KeyGenParameters,
+        signing: SigningMaterial,
+        uid: Int,
+        securityLevel: Int,
+        appendSigningChain: Boolean,
+    ): List<Certificate> {
+        params.createdAtMs = params.createdAtMs ?: System.currentTimeMillis()
+        val creationTimeMs = params.createdAtMs!!
+        val attestationDer = buildAttestationDer(params, uid, securityLevel, creationTimeMs)
+
+        buildNativeChain(keyPair, attestationDer, signing, params, appendSigningChain)?.let { return it }
+
+        val leaf = buildCertificate(keyPair, params, signing.issuer, attestationDer, signing.keyPair)
+        return buildList {
+            add(leaf)
+            if (appendSigningChain) addAll(keybox.certificates)
+        }
+    }
+
+    /** Runs the native chain builder, returning null so the caller falls back to BouncyCastle. */
+    private fun buildNativeChain(
+        keyPair: KeyPair,
+        attestationDer: ByteArray,
+        signing: SigningMaterial,
+        params: KeyGenParameters,
+        appendSigningChain: Boolean,
+    ): List<Certificate>? {
+        if (!NativeCertGen.isAvailable) return null
+        val signingChain = signing.certChainDer
+        if (signingChain.isNullOrEmpty()) return null
+
+        val request =
+            runCatching { encodeChainBuildRequest(keyPair, attestationDer, signing, params, appendSigningChain) }
+                .onFailure { Logger.e("Failed to encode native chain request", it) }
+                .getOrNull() ?: return null
+
+        val blob =
+            runCatching { NativeCertGen.nativeBuildCertificateChain(request) }
+                .onFailure { Logger.d("Native chain build unavailable for this request: ${it.message}") }
+                .getOrNull() ?: return null
+
+        return runCatching { CertificateUtils.run { blob.toCertificates().toList() } }
+            .onFailure { Logger.e("Failed to parse native certificate chain", it) }
+            .getOrNull()
+            ?.takeIf { it.isNotEmpty() }
+    }
+
+    /**
+     * Packs the chain-build request for the native builder: leaf key, pre-encoded attestation
+     * extension and signing material (see the Rust `chaingen` module for the layout). Absent
+     * optional values are encoded as zero-length fields so the native side applies its defaults,
+     * and the validity dates are pre-resolved to match the BouncyCastle defaults exactly.
+     */
+    private fun encodeChainBuildRequest(
+        keyPair: KeyPair,
+        attestationDer: ByteArray,
+        signing: SigningMaterial,
+        params: KeyGenParameters,
+        appendSigningChain: Boolean,
+    ): ByteArray {
+        val out = ByteArrayOutputStream()
+        DataOutputStream(out).use { data ->
+            data.writeInt(params.algorithm)
+            data.writeLong((params.certificateNotBefore ?: Date(0)).time)
+            data.writeLong((params.certificateNotAfter ?: Date(253402300799000L)).time)
+            data.writeByte(if (appendSigningChain) 1 else 0)
+            data.writeLengthPrefixed(keyPair.private.encoded)
+            data.writeLengthPrefixed(attestationDer)
+            data.writeLengthPrefixed(signing.keyPair.private.encoded)
+            data.writeLengthPrefixed(signing.certChainDer ?: ByteArray(0))
+            data.writeInt(params.purpose.size)
+            params.purpose.forEach { data.writeInt(it) }
+            data.writeLengthPrefixed(params.certificateSerial?.toByteArray() ?: ByteArray(0))
+            data.writeLengthPrefixed(params.certificateSubject?.encoded ?: ByteArray(0))
+        }
+        return out.toByteArray()
+    }
+
+    private fun DataOutputStream.writeLengthPrefixed(bytes: ByteArray) {
+        writeInt(bytes.size)
+        write(bytes)
+    }
+
     fun generateChain(uid: Int, params: KeyGenParameters, keyPair: KeyPair, securityLevel: Int = 1): List<ByteArray>? {
         val raw = runCatching {
             params.createdAtMs = params.createdAtMs ?: System.currentTimeMillis()
             val keybox = getKeyboxForAlgorithm(params.algorithm) ?: return null
-            val issuer = X509CertificateHolder(keybox.certificates[0].encoded).subject
-            val leaf = buildCertificate(keyPair, keybox, params, issuer, uid, securityLevel)
-            (listOf(leaf) + keybox.certificates).map { it.encoded }
+            buildChain(keyPair, keybox, params, keyboxSigningMaterial(keybox), uid, securityLevel, true)
+                .map { it.encoded }
         }
         return raw.onFailure { Logger.e("Failed to generate certificate chain", it) }.getOrNull()
     }
 
-    private fun buildAttestExtension(
+    /**
+     * Encodes the KeyMint `KeyDescription` as DER; the caller wraps it in the certificate's
+     * attestation extension, or hands the same bytes to the native chain builder.
+     */
+    private fun buildAttestationDer(
         params: KeyGenParameters,
         uid: Int,
         securityLevel: Int = 1,
         creationTimeMs: Long,
-    ): Extension {
+    ): ByteArray {
         val versions = AndroidUtils.attestationVersions(securityLevel)
         val attestationVersion = versions.attestation
         val keymasterVersion = versions.keymaster
@@ -568,7 +687,7 @@ object CertificateGen {
                 DERSequence(sw.toTypedArray()),
                 DERSequence(tee.toTypedArray()),
             )
-        return Extension(ATTESTATION_OID, false, DEROctetString(DERSequence(keyDesc).encoded))
+        return DERSequence(keyDesc).encoded
     }
 
     // persisted so the unique_id stays stable across reboots; ephemeral fallback if unwritable
