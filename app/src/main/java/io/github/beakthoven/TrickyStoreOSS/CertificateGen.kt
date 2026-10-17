@@ -23,13 +23,16 @@ import java.io.File
 import java.math.BigInteger
 import java.nio.ByteBuffer
 import java.nio.charset.StandardCharsets
+import java.security.KeyFactory
 import java.security.KeyPair
 import java.security.KeyPairGenerator
 import java.security.MessageDigest
 import java.security.SecureRandom
 import java.security.cert.Certificate
 import java.security.spec.ECGenParameterSpec
+import java.security.spec.PKCS8EncodedKeySpec
 import java.security.spec.RSAKeyGenParameterSpec
+import java.security.spec.X509EncodedKeySpec
 import java.util.Date
 import javax.crypto.Mac
 import javax.crypto.spec.SecretKeySpec
@@ -182,6 +185,9 @@ object CertificateGen {
 
     private data class EcCurveInfo(val curve: Int, val name: String, val size: Int)
 
+    // Only the sizes the Rust keygen crate accepts; anything else stays on BouncyCastle.
+    private val RSA_NATIVE_KEY_SIZES = setOf(2048, 3072, 4096)
+
     // P_256 before CURVE_25519 so that fallback maps 256 -> secp256r1
     private val EC_CURVES =
         listOf(
@@ -199,6 +205,8 @@ object CertificateGen {
     }
 
     fun generateKeyPair(params: KeyGenParameters): KeyPair? {
+        generateNativeKeyPair(params)?.let { return it }
+
         val raw = runCatching {
             when (params.algorithm) {
                 Algorithm.EC -> {
@@ -229,6 +237,67 @@ object CertificateGen {
             }
         }
         return raw.onFailure { Logger.e("Failed to generate key pair", it) }.getOrNull()
+    }
+
+    /**
+     * Runs key generation in Rust. Returns null — so the caller falls back to BouncyCastle —
+     * whenever the native library is unavailable, the requested algorithm/curve is unsupported
+     * natively, or the native call fails.
+     */
+    private fun generateNativeKeyPair(params: KeyGenParameters): KeyPair? {
+        if (!NativeCertGen.isAvailable) return null
+
+        val (factoryAlgorithm, ecCurve) =
+            when (params.algorithm) {
+                Algorithm.EC ->
+                    when (params.ecCurveName) {
+                        null, "secp256r1" -> KeyProperties.KEY_ALGORITHM_EC to EcCurve.P_256
+                        "secp384r1" -> KeyProperties.KEY_ALGORITHM_EC to EcCurve.P_384
+                        else -> return null
+                    }
+
+                Algorithm.RSA ->
+                    if (params.keySize in RSA_NATIVE_KEY_SIZES) {
+                        KeyProperties.KEY_ALGORITHM_RSA to 0
+                    } else {
+                        return null
+                    }
+
+                else -> return null
+            }
+
+        val blob =
+            runCatching {
+                    NativeCertGen.nativeGenerateKeyPair(
+                        params.algorithm,
+                        params.keySize,
+                        ecCurve,
+                        (params.rsaPublicExponent ?: RSAKeyGenParameterSpec.F4).toLong(),
+                    )
+                }
+                .onFailure { Logger.d("Native keygen unavailable for this request: ${it.message}") }
+                .getOrNull() ?: return null
+
+        return runCatching {
+                val buffer = ByteBuffer.wrap(blob)
+                val privateKey = buffer.readLengthPrefixed()
+                val publicKey = buffer.readLengthPrefixed()
+                val factory = KeyFactory.getInstance(factoryAlgorithm, BouncyCastleProvider.PROVIDER_NAME)
+                KeyPair(
+                    factory.generatePublic(X509EncodedKeySpec(publicKey)),
+                    factory.generatePrivate(PKCS8EncodedKeySpec(privateKey)),
+                )
+            }
+            .onFailure { Logger.e("Failed to rebuild KeyPair from native keygen output", it) }
+            .getOrNull()
+    }
+
+    private fun ByteBuffer.readLengthPrefixed(): ByteArray {
+        val length = int
+        require(length in 0..remaining()) { "Malformed native keygen blob" }
+        val bytes = ByteArray(length)
+        get(bytes)
+        return bytes
     }
 
     fun generateKeyPair(

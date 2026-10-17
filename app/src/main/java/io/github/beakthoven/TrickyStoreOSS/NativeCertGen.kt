@@ -10,9 +10,9 @@ import io.github.beakthoven.TrickyStoreOSS.logging.Logger
 /**
  * JNI bridge to the native `libcertgen.so` (Rust `native-certgen` crate).
  *
- * The crate is currently a pipeline skeleton exposing only smoke-test entry points; the real
- * keygen / certificate / attestation port will add its JNI functions here. Until then [isAvailable]
- * gates nothing and callers keep using the BouncyCastle path.
+ * Key generation runs natively; certificate building and attestation are still handled by the
+ * BouncyCastle path, which callers fall back to whenever [isAvailable] is false or the requested
+ * parameters are outside what the native crate supports.
  */
 object NativeCertGen {
     // Magisk/KernelSU/APatch all mount modules at this fixed path, and the daemon starts from here.
@@ -34,4 +34,18 @@ object NativeCertGen {
     external fun nativeVersion(): String
 
     external fun selfTest(): Boolean
+
+    /**
+     * Generates a key pair natively, returning `[u32 BE privLen][PKCS#8 DER][u32 BE pubLen][SPKI
+     * DER]`, or throws if the algorithm/curve combination is unsupported natively.
+     *
+     * @param algorithm KeyMint [android.hardware.security.keymint.Algorithm] value.
+     * @param ecCurve KeyMint [android.hardware.security.keymint.EcCurve] value; ignored for RSA.
+     */
+    external fun nativeGenerateKeyPair(
+        algorithm: Int,
+        keySize: Int,
+        ecCurve: Int,
+        rsaPublicExponent: Long,
+    ): ByteArray
 }
