@@ -11,6 +11,14 @@ mod error;
 // stages that will consume it, so it is not referenced yet.
 #[allow(dead_code)]
 mod keybox;
+// Staged for the certificate-chain port: builds DER certificates from a key pair plus the parsed
+// keybox, wired in once the JNI entry point for chain generation lands.
+#[allow(dead_code)]
+mod certbuilder;
+// Staged for the certificate-chain port: builds the KeyMint attestation extension the certbuilder
+// embeds into the leaf, wired in together with the chain JNI entry point.
+#[allow(dead_code)]
+mod attestation;
 mod keygen;
 mod types;
 

@@ -9,6 +9,10 @@ pub enum CertGenError {
     InvalidParameter(String),
     #[allow(dead_code)] // constructed by the staged keybox parser
     KeyboxParseFailed(String),
+    #[allow(dead_code)] // constructed by the staged certificate builder
+    CertBuildFailed(String),
+    #[allow(dead_code)] // constructed by the staged certificate builder
+    SigningFailed(String),
 }
 
 impl fmt::Display for CertGenError {
@@ -20,6 +24,8 @@ impl fmt::Display for CertGenError {
             Self::SerializationFailed(msg) => write!(f, "serialization failed: {msg}"),
             Self::InvalidParameter(msg) => write!(f, "invalid parameter: {msg}"),
             Self::KeyboxParseFailed(msg) => write!(f, "keybox parse failed: {msg}"),
+            Self::CertBuildFailed(msg) => write!(f, "certificate build failed: {msg}"),
+            Self::SigningFailed(msg) => write!(f, "signing failed: {msg}"),
         }
     }
 }
