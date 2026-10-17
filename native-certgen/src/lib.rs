@@ -7,6 +7,10 @@
 #![deny(clippy::unwrap_used, clippy::expect_used)]
 
 mod error;
+// Staged for the certificate-chain port: parses the keybox ahead of the certbuilder/attestation
+// stages that will consume it, so it is not referenced yet.
+#[allow(dead_code)]
+mod keybox;
 mod keygen;
 mod types;
 

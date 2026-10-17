@@ -7,6 +7,8 @@ pub enum CertGenError {
     KeyGenFailed(String),
     SerializationFailed(String),
     InvalidParameter(String),
+    #[allow(dead_code)] // constructed by the staged keybox parser
+    KeyboxParseFailed(String),
 }
 
 impl fmt::Display for CertGenError {
@@ -17,6 +19,7 @@ impl fmt::Display for CertGenError {
             Self::KeyGenFailed(msg) => write!(f, "key generation failed: {msg}"),
             Self::SerializationFailed(msg) => write!(f, "serialization failed: {msg}"),
             Self::InvalidParameter(msg) => write!(f, "invalid parameter: {msg}"),
+            Self::KeyboxParseFailed(msg) => write!(f, "keybox parse failed: {msg}"),
         }
     }
 }
