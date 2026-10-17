@@ -1,7 +1,7 @@
 //! Key generation, ported from `CertificateGen.generateKeyPair` in the Kotlin app.
 //!
-//! Both private and public key material is emitted as DER so the BouncyCastle certificate builder
-//! can keep consuming a normal `java.security.KeyPair` while the key math runs natively.
+//! Both private and public key material is emitted as DER so Kotlin can rebuild a normal
+//! `java.security.KeyPair` from it while the key math runs natively.
 
 use crate::error::{CertGenError, Result};
 use crate::types::{Algorithm, EcCurve, GeneratedKeyPair};

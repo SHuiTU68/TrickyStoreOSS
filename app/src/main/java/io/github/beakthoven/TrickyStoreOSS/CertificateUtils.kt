@@ -11,19 +11,15 @@ import android.system.keystore2.KeyMetadata
 import io.github.beakthoven.TrickyStoreOSS.logging.Logger
 import java.io.ByteArrayInputStream
 import java.io.ByteArrayOutputStream
-import java.io.StringReader
-import java.security.KeyPair
+import java.io.DataInputStream
+import java.nio.charset.StandardCharsets
 import java.security.cert.Certificate
 import java.security.cert.CertificateException
 import java.security.cert.CertificateFactory
-import java.security.cert.CertificateParsingException
 import java.security.cert.X509Certificate
-import org.bouncycastle.asn1.ASN1Encodable
-import org.bouncycastle.asn1.DEROctetString
-import org.bouncycastle.openssl.PEMKeyPair
-import org.bouncycastle.openssl.PEMParser
-import org.bouncycastle.openssl.jcajce.JcaPEMKeyConverter
-import org.bouncycastle.util.io.pem.PemReader
+
+/** The KeyMint attestation extension OID (`1.3.6.1.4.1.11129.2.1.17`). */
+const val ATTESTATION_OID = "1.3.6.1.4.1.11129.2.1.17"
 
 object CertificateUtils {
     val certificateFactory: CertificateFactory by lazy {
@@ -91,30 +87,57 @@ object CertificateUtils {
         }
     }
 
-    // Certificate parsing utilities
-    fun parseKeyPair(keyContent: String): Result<PEMKeyPair> = runCatching {
-        PEMParser(StringReader(keyContent.trimLine())).use { parser ->
-            (parser.readObject() as? PEMKeyPair) ?: throw IllegalStateException("Invalid PEM key pair format")
-        }
+    /** A decoded PEM private key: the JCA algorithm name plus the PKCS#8 DER. */
+    data class PemKey(val algorithm: String, val pkcs8: ByteArray)
+
+    // Private key / certificate parsing runs in the native Rust decoder; there is no BouncyCastle
+    // fallback any more.
+    fun decodePemKey(keyContent: String): Result<PemKey> = runCatching {
+        decodePemKeyNative(keyContent)
+            ?: throw IllegalStateException("Native PEM key decoder unavailable")
     }
 
     fun parseCertificate(certContent: String): Result<Certificate> = runCatching {
-        PemReader(StringReader(certContent.trimLine())).use { reader ->
-            val pemObject = reader.readPemObject()
-            certificateFactory.generateCertificate(ByteArrayInputStream(pemObject.content))
+        decodePemCertificateNative(certContent)
+            ?: throw IllegalStateException("Native PEM certificate decoder unavailable")
+    }
+
+    /** Decodes the PEM key with the native Rust reader, returning null when the library is unavailable. */
+    private fun decodePemKeyNative(keyContent: String): PemKey? {
+        if (!NativeCertGen.isAvailable) return null
+        return try {
+            val data = DataInputStream(ByteArrayInputStream(NativeCertGen.nativeDecodePemKey(keyContent)))
+            val algorithm = String(readNativeBlob(data), StandardCharsets.UTF_8)
+            val pkcs8 = readNativeBlob(data)
+            if (data.available() != 0) throw IllegalStateException("Trailing bytes in native PEM key response")
+            PemKey(algorithm, pkcs8)
+        } catch (t: Throwable) {
+            Logger.w("Native PEM key decode failed", t)
+            null
         }
     }
 
-    fun convertPemToKeyPair(pemKeyPair: PEMKeyPair): KeyPair {
-        return JcaPEMKeyConverter().getKeyPair(pemKeyPair)
+    /** Decodes the PEM certificate with the native Rust reader, returning null when it is unavailable. */
+    private fun decodePemCertificateNative(certContent: String): Certificate? {
+        if (!NativeCertGen.isAvailable) return null
+        return try {
+            certificateFactory.generateCertificate(
+                ByteArrayInputStream(NativeCertGen.nativeDecodePemCertificate(certContent))
+            )
+        } catch (t: Throwable) {
+            Logger.w("Native PEM certificate decode failed", t)
+            null
+        }
     }
 
-    @Throws(CertificateParsingException::class)
-    fun getByteArrayFromAsn1(asn1Encodable: ASN1Encodable): ByteArray {
-        return when (asn1Encodable) {
-            is DEROctetString -> asn1Encodable.octets
-            else -> throw CertificateParsingException("Expected DEROctetString, got ${asn1Encodable::class.simpleName}")
+    private fun readNativeBlob(data: DataInputStream): ByteArray {
+        val length = data.readInt()
+        if (length < 0 || length > data.available()) {
+            throw IllegalStateException("Invalid native PEM field length: $length")
         }
+        val bytes = ByteArray(length)
+        data.readFully(bytes)
+        return bytes
     }
 }
 

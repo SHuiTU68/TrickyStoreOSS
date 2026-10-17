@@ -11,8 +11,9 @@ import io.github.beakthoven.TrickyStoreOSS.logging.Logger
  * JNI bridge to the native `libcertgen.so` (Rust `native-certgen` crate).
  *
  * Key generation, the KeyMint attestation extension and certificate-chain building all run
- * natively; callers fall back to the BouncyCastle path whenever [isAvailable] is false or the
- * requested parameters are outside what the native crate supports.
+ * natively. Key generation falls back to the platform provider when [isAvailable] is false or the
+ * requested parameters are outside what the native crate supports; the certificate builders are
+ * native-only and report an error when the library is unavailable.
  */
 object NativeCertGen {
     // Magisk/KernelSU/APatch all mount modules at this fixed path, and the daemon starts from here.
@@ -27,7 +28,7 @@ object NativeCertGen {
             isAvailable = true
             Logger.i("NativeCertGen: loaded $LIBRARY_PATH (version=${nativeVersion()}, selfTest=${selfTest()})")
         } catch (e: UnsatisfiedLinkError) {
-            Logger.e("NativeCertGen: failed to load $LIBRARY_PATH, falling back to BouncyCastle", e)
+            Logger.e("NativeCertGen: failed to load $LIBRARY_PATH", e)
         }
     }
 
@@ -86,4 +87,17 @@ object NativeCertGen {
      * unsupported or the challenge does not match.
      */
     external fun nativeParseAttestation(request: ByteArray): ByteArray
+
+    /**
+     * Decodes one PEM private key block natively and returns it as `[u32 BE algorithmLen][algorithm]
+     * [u32 BE PKCS#8 len][PKCS#8 DER]` (see the Rust `keybox_xml` module), or throws if the label is
+     * unsupported or the key is malformed.
+     */
+    external fun nativeDecodePemKey(pem: String): ByteArray
+
+    /**
+     * Decodes one PEM certificate block natively and returns its DER bytes (see the Rust
+     * `keybox_xml` module), or throws if the label is unsupported or the body is not a certificate.
+     */
+    external fun nativeDecodePemCertificate(pem: String): ByteArray
 }

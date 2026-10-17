@@ -3,7 +3,7 @@
 //! The startup probe has the TEE mint an attested key and then reads the verified-boot data back
 //! out of the returned leaf. This mirrors the Kotlin `AttestUtils.parseAttestationData` path — the
 //! same field positions, the same challenge check and the same "missing extension means no data"
-//! outcome — but reads the DER directly, so the probe no longer needs BouncyCastle's ASN.1 provider.
+//! outcome — but reads the DER directly with no ASN.1 provider dependency.
 
 use crate::error::{CertGenError, Result};
 use crate::tlv::{iter_tlvs, read_tlv, TAG_OCTET_STRING, TAG_SEQUENCE};
@@ -35,8 +35,8 @@ pub struct AttestationData {
 /// byte. Kotlin rebuilds `AttestationData` from it.
 ///
 /// The request is `[u32 certLen][certificate DER][u32 challengeLen][challenge]`; any malformed
-/// input, a certificate without an attestation extension, or a challenge mismatch is an error so
-/// the Kotlin caller falls back to BouncyCastle.
+/// input, a certificate without an attestation extension, or a challenge mismatch is an error that
+/// surfaces to the Kotlin caller.
 pub fn parse_attestation_blob(request: &[u8]) -> Result<Vec<u8>> {
     let mut cursor = Cursor::new(request);
     let certificate_der = cursor.length_prefixed()?;

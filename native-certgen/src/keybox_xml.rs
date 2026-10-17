@@ -3,8 +3,8 @@
 //! The keybox is the `<AndroidAttestation>` XML document the module signs attestation chains with:
 //! one or more `<Key>` entries, each holding a PEM private key and a PEM certificate chain. This
 //! module mirrors the Kotlin `KeyBoxUtils.readFromXml` path — the same element names, nesting and
-//! count consistency checks — but decodes the PEM material without BouncyCastle and hands the
-//! signing key back as PKCS#8 DER.
+//! count consistency checks — and decodes the PEM material natively, handing the signing key back
+//! as PKCS#8 DER.
 //!
 //! Traditional PEM labels (`EC PRIVATE KEY`, `RSA PRIVATE KEY`) are re-wrapped into PKCS#8 here, so
 //! every later native stage always sees one key encoding. Base64 is decoded locally rather than
@@ -523,7 +523,7 @@ fn base64_decode(input: &str) -> Result<Vec<u8>> {
 
 /// Turns a PEM private key into PKCS#8 DER. A `PRIVATE KEY` block is already PKCS#8; the traditional
 /// `EC PRIVATE KEY` (SEC1) and `RSA PRIVATE KEY` (PKCS#1) encodings are wrapped in the matching
-/// `AlgorithmIdentifier`, which is what the Kotlin side gets from BouncyCastle's PEM parser.
+/// `AlgorithmIdentifier` so every later native stage sees a single PKCS#8 encoding.
 fn normalize_private_key(label: &str, der: &[u8]) -> Result<Vec<u8>> {
     match label {
         "PRIVATE KEY" => Ok(der.to_vec()),
@@ -584,7 +584,7 @@ fn wrap_pkcs1_rsa_key(pkcs1: &[u8]) -> Result<Vec<u8>> {
 }
 
 /// The algorithm of a PKCS#8 key, as the name `KeyProperties` uses. Anything other than EC or RSA
-/// is rejected so the Kotlin side falls back to BouncyCastle.
+/// is rejected.
 fn key_algorithm(pkcs8_der: &[u8]) -> Result<String> {
     let info = pkcs8::PrivateKeyInfo::from_der(pkcs8_der)
         .map_err(|e| keybox_error(format!("PKCS#8 parse: {e}")))?;
@@ -604,9 +604,26 @@ fn key_algorithm(pkcs8_der: &[u8]) -> Result<String> {
     }
 }
 
+/// Decodes one PEM private key block into the blob the JNI entry point returns:
+/// `[u32 algorithm][u32 PKCS#8 key]`, all lengths big-endian. Kotlin rebuilds the `KeyPair` from
+/// the algorithm name and the DER.
+pub fn decode_key_blob(pem: &str) -> Result<Vec<u8>> {
+    let (label, der) = pem_blocks(pem)?
+        .into_iter()
+        .next()
+        .ok_or_else(|| keybox_error("private key element has no PEM block"))?;
+    let pkcs8 = normalize_private_key(&label, &der)?;
+    let algorithm = key_algorithm(&pkcs8)?;
+
+    let mut blob = Vec::new();
+    push_blob(&mut blob, algorithm.as_bytes());
+    push_blob(&mut blob, &pkcs8);
+    Ok(blob)
+}
+
 /// Decodes one certificate PEM block and checks it really is a DER certificate, matching the
 /// validation the Kotlin side gets from `CertificateFactory`.
-fn decode_certificate(text: &str) -> Result<Vec<u8>> {
+pub fn decode_certificate(text: &str) -> Result<Vec<u8>> {
     let (label, der) = pem_blocks(text)?
         .into_iter()
         .next()
@@ -835,6 +852,30 @@ mod tests {
         let with_breaks = format!("  {}\n\t{}  ", &encoded[..2], &encoded[2..]);
         assert_eq!(base64_decode(&with_breaks).unwrap(), bytes);
         assert!(base64_decode("!!!!").is_err());
+    }
+
+    #[test]
+    fn decodes_a_standalone_pem_key_block() {
+        let (private_key, scalar, _) = ec_material();
+        let blob = decode_key_blob(&private_key).unwrap();
+
+        let algorithm_len = u32::from_be_bytes([blob[0], blob[1], blob[2], blob[3]]) as usize;
+        assert_eq!(&blob[4..4 + algorithm_len], b"EC");
+        let key_offset = 4 + algorithm_len;
+        let key_len =
+            u32::from_be_bytes([blob[key_offset], blob[key_offset + 1], blob[key_offset + 2], blob[key_offset + 3]])
+                as usize;
+        let pkcs8 = &blob[key_offset + 4..key_offset + 4 + key_len];
+        assert_eq!(key_algorithm(pkcs8).unwrap(), "EC");
+        assert_eq!(sec1_scalar(&pkcs8_inner(pkcs8)), scalar);
+    }
+
+    #[test]
+    fn decodes_a_standalone_pem_certificate_block() {
+        let (_, _, cert) = ec_material();
+        assert_eq!(decode_certificate(&pem("CERTIFICATE", &cert)).unwrap(), cert);
+        // A key block is not a certificate: the label check must reject it.
+        assert!(decode_certificate(&pem("PRIVATE KEY", &cert)).is_err());
     }
 
     #[test]

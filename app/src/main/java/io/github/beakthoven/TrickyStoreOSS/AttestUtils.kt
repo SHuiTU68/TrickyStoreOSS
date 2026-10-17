@@ -31,14 +31,6 @@ import java.security.KeyStore
 import java.security.SecureRandom
 import java.security.cert.X509Certificate
 import java.security.spec.ECGenParameterSpec
-import org.bouncycastle.asn1.ASN1Integer
-import org.bouncycastle.asn1.ASN1ObjectIdentifier
-import org.bouncycastle.asn1.ASN1OctetString
-import org.bouncycastle.asn1.ASN1Sequence
-import org.bouncycastle.asn1.ASN1TaggedObject
-import org.bouncycastle.cert.X509CertificateHolder
-
-val ATTESTATION_OID = ASN1ObjectIdentifier("1.3.6.1.4.1.11129.2.1.17")
 
 object AttestUtils {
     data class AttestationData(
@@ -251,11 +243,10 @@ object AttestUtils {
 
     private fun parseAttestationData(encodedCertificate: ByteArray, expectedChallenge: ByteArray): AttestationData? =
         parseAttestationDataNative(encodedCertificate, expectedChallenge)
-            ?: parseAttestationDataBouncyCastle(encodedCertificate, expectedChallenge)
 
     /**
-     * Parses the attestation extension with the native Rust reader, returning null — so the caller
-     * falls back to BouncyCastle — when the library is unavailable or the certificate is rejected.
+     * Parses the attestation extension with the native Rust reader, returning null when the library
+     * is unavailable or the certificate is rejected, so the probe reports the failure.
      */
     private fun parseAttestationDataNative(
         encodedCertificate: ByteArray,
@@ -273,7 +264,7 @@ object AttestUtils {
             }.toByteArray()
             decodeAttestationData(NativeCertGen.nativeParseAttestation(request))
         } catch (t: Throwable) {
-            Logger.w("Native attestation parse failed; falling back to BouncyCastle", t)
+            Logger.w("Native attestation parse failed", t)
             null
         }
     }
@@ -305,43 +296,4 @@ object AttestUtils {
         data.readFully(bytes)
         return bytes
     }
-
-    private fun parseAttestationDataBouncyCastle(
-        encodedCertificate: ByteArray,
-        expectedChallenge: ByteArray,
-    ): AttestationData? =
-        runCatching {
-            val holder = X509CertificateHolder(encodedCertificate)
-            val extension = holder.getExtension(ATTESTATION_OID) ?: return null
-            val fields = ASN1Sequence.getInstance(extension.extnValue.octets).toArray()
-            require(fields.size >= 8)
-            val challenge = ASN1OctetString.getInstance(fields[4]).octets
-            require(challenge.contentEquals(expectedChallenge))
-            val attestVersion = ASN1Integer.getInstance(fields[0]).value.toInt()
-            val keymasterVersion = ASN1Integer.getInstance(fields[2]).value.toInt()
-            var verifiedBootKey: ByteArray? = null
-            var verifiedBootHash: ByteArray? = null
-            var osVersion: Int? = null
-            var moduleHash: ByteArray? = null
-            ASN1Sequence.getInstance(fields[7]).forEach { item ->
-                val tagged = item as ASN1TaggedObject
-                when (tagged.tagNo) {
-                    704 -> {
-                        val root = ASN1Sequence.getInstance(tagged.baseObject.toASN1Primitive())
-                        if (root.size() >= 4) {
-                            verifiedBootKey = ASN1OctetString.getInstance(root.getObjectAt(0)).octets
-                            verifiedBootHash = ASN1OctetString.getInstance(root.getObjectAt(3)).octets
-                        }
-                    }
-                    705 -> osVersion = ASN1Integer.getInstance(tagged.baseObject.toASN1Primitive()).value.toInt()
-                }
-            }
-            (fields.getOrNull(6) as? ASN1Sequence)?.forEach { item ->
-                val tagged = item as? ASN1TaggedObject ?: return@forEach
-                if (tagged.tagNo == 724) {
-                    moduleHash = ASN1OctetString.getInstance(tagged.baseObject.toASN1Primitive()).octets
-                }
-            }
-            AttestationData(verifiedBootKey, verifiedBootHash, attestVersion, keymasterVersion, osVersion, moduleHash)
-        }.onFailure { Logger.w("Failed to parse probe attestation (${it.javaClass.simpleName})") }.getOrNull()
 }

@@ -21,7 +21,7 @@ impl TryFrom<i32> for Algorithm {
 }
 
 /// Mirrors the KeyMint `EcCurve` constants. Only the curves Rust implements are listed; every
-/// other value is rejected so the caller falls back to BouncyCastle.
+/// other value is rejected.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(i32)]
 pub enum EcCurve {

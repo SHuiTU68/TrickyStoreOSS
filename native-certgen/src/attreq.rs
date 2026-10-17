@@ -4,7 +4,7 @@
 //! into one byte blob and receives the DER `KeyDescription` back. Fields are laid out in the order
 //! the encoder writes them, and every field is bounds-checked before use. Values whose Kotlin
 //! source is nullable are carried as presence-tagged optionals so an unset field maps to the same
-//! "omit this tag" behaviour as the BouncyCastle path.
+//! "omit this tag" behaviour the encoder produces.
 
 use crate::error::Result;
 use crate::types::{Algorithm, CertGenParams, EcCurve};
@@ -260,7 +260,7 @@ mod tests {
     }
 
     /// The decoded request must produce exactly the bytes the in-process builder produces for the
-    /// same parameters — that is what keeps the native path byte-identical to BouncyCastle.
+    /// same parameters — that is what keeps the decode/encode round-trip byte-identical.
     #[test]
     fn decoded_request_matches_direct_build() {
         let params = sample_params();

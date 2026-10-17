@@ -335,8 +335,8 @@ fn signature_algorithm_der(algorithm: Algorithm, digest: Digest) -> Vec<u8> {
 }
 
 /// Signs the TBS with the keybox key, using `digest`. ring couples an EC key's curve to a single
-/// digest and cannot hash from the SHA-1 family, so those combinations throw and the Kotlin caller
-/// falls back to BouncyCastle.
+/// digest and cannot hash from the SHA-1 family, so those combinations throw and surface to the
+/// Kotlin caller as an error.
 fn sign_tbs(tbs_der: &[u8], signing_key_der: &[u8], algorithm: Algorithm, digest: Digest) -> Result<Vec<u8>> {
     match algorithm {
         Algorithm::Ec => {

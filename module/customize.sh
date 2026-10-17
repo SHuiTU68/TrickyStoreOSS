@@ -26,6 +26,11 @@ case "$ARCH" in
   *)     abort "! Unsupported architecture: $ARCH" ;;
 esac
 
+# This build ships a single ABI (arm64-v8a); refuse cleanly on anything else.
+if ! unzip -l "$ZIPFILE" | grep -q "lib/$ABI_DIR/"; then
+  abort "! This build only supports arm64-v8a (device platform: $ARCH)"
+fi
+
 ui_print "- Device platform: $ARCH"
 ui_print "- Using ABI dir: $ABI_DIR"
 

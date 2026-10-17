@@ -47,6 +47,10 @@ android {
         versionCode = gitCommitCount
         versionName = verName
 
+        // The module ships a single ABI: arm64-v8a covers essentially all modern devices and keeps
+        // the packaged native libraries (libcertgen/libinject/libTrickyStoreOSS) to one copy.
+        ndk { abiFilters += "arm64-v8a" }
+
         externalNativeBuild {
             cmake {
                 arguments += "-DANDROID_STL=none"
@@ -89,13 +93,12 @@ android {
 dependencies {
     compileOnly(project(":stub"))
     compileOnly(libs.annotation)
-    implementation(libs.org.bouncycastle.bcpkix.jdk18on)
     implementation(libs.org.lsposed.libcxx.libcxx)
 }
 
 // --- Native cert generation (Rust) ---
-// Builds libcertgen.so for every supported ABI straight into app/src/main/jniLibs, which AGP
-// merges into the APK; the module packaging below then extracts it from the APK.
+// Builds libcertgen.so for arm64-v8a straight into app/src/main/jniLibs, which AGP merges into
+// the APK; the module packaging below then extracts it from the APK.
 //
 // AGP 9 removed `android.ndkDirectory`, so resolve the NDK from the environment and let cargo-ndk
 // fall back to its own discovery when nothing is set.
@@ -109,7 +112,7 @@ val ndkForCargo =
 val buildRustCertgen =
     tasks.register<Exec>("buildRustCertgen") {
         group = "TrickyStoreOSS Native Build"
-        description = "Builds libcertgen.so via cargo-ndk for all supported ABIs."
+        description = "Builds libcertgen.so via cargo-ndk for arm64-v8a."
 
         workingDir = rootProject.projectDir.resolve("native-certgen")
 
@@ -118,12 +121,6 @@ val buildRustCertgen =
             "ndk",
             "-t",
             "arm64-v8a",
-            "-t",
-            "armeabi-v7a",
-            "-t",
-            "x86",
-            "-t",
-            "x86_64",
             "-o",
             rootProject.projectDir.resolve("app/src/main/jniLibs").absolutePath,
             "build",

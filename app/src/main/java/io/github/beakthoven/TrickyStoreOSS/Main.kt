@@ -10,15 +10,11 @@ import io.github.beakthoven.TrickyStoreOSS.config.PkgConfig
 import io.github.beakthoven.TrickyStoreOSS.interceptors.Keystore2Interceptor
 import io.github.beakthoven.TrickyStoreOSS.interceptors.KeystoreInterceptor
 import io.github.beakthoven.TrickyStoreOSS.logging.Logger
-import java.security.Security
-import org.bouncycastle.jce.provider.BouncyCastleProvider
 
 private const val RETRY_DELAY_MS = 1000L
 
 fun main(args: Array<String>) {
     Logger.i("Welcome to TrickyStoreOSS!")
-    Security.removeProvider(BouncyCastleProvider.PROVIDER_NAME)
-    Security.addProvider(BouncyCastleProvider())
 
     try {
         val probe = AttestUtils.probe()

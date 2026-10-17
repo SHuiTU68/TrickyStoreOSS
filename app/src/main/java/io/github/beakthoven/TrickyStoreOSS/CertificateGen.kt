@@ -38,24 +38,6 @@ import java.security.spec.X509EncodedKeySpec
 import java.util.Date
 import javax.crypto.Mac
 import javax.crypto.spec.SecretKeySpec
-import javax.security.auth.x500.X500Principal
-import org.bouncycastle.asn1.ASN1Boolean
-import org.bouncycastle.asn1.ASN1Encodable
-import org.bouncycastle.asn1.ASN1Enumerated
-import org.bouncycastle.asn1.ASN1Integer
-import org.bouncycastle.asn1.DERNull
-import org.bouncycastle.asn1.DEROctetString
-import org.bouncycastle.asn1.DERSequence
-import org.bouncycastle.asn1.DERSet
-import org.bouncycastle.asn1.DERTaggedObject
-import org.bouncycastle.asn1.x500.X500Name
-import org.bouncycastle.asn1.x509.Extension
-import org.bouncycastle.asn1.x509.KeyUsage
-import org.bouncycastle.cert.X509CertificateHolder
-import org.bouncycastle.cert.jcajce.JcaX509CertificateConverter
-import org.bouncycastle.cert.jcajce.JcaX509v3CertificateBuilder
-import org.bouncycastle.jce.provider.BouncyCastleProvider
-import org.bouncycastle.operator.jcajce.JcaContentSignerBuilder
 
 object CertificateGen {
     enum class AuthPolicyProvenance { UNKNOWN, RAW_REQUEST }
@@ -63,13 +45,11 @@ object CertificateGen {
     data class KeyBox(val keyPair: KeyPair, val certificates: List<Certificate>)
 
     /**
-     * The material used to sign a freshly generated leaf: the signing key, the issuer DN taken from
-     * its leaf certificate, and that certificate chain as DER (leaf first). The native builder only
-     * needs the DER form, while the BouncyCastle path uses the key and issuer directly.
+     * The material used to sign a freshly generated leaf: the signing key and its certificate chain
+     * as DER (leaf first). The native builder derives the issuer from that chain itself.
      */
     private class SigningMaterial(
         val keyPair: KeyPair,
-        val issuer: X500Name,
         val certChainDer: ByteArray?,
     )
 
@@ -79,7 +59,7 @@ object CertificateGen {
         var certificateSerial: BigInteger? = null,
         var certificateNotBefore: Date? = null,
         var certificateNotAfter: Date? = null,
-        var certificateSubject: X500Name? = null,
+        var certificateSubject: ByteArray? = null,
         var rsaPublicExponent: BigInteger? = null,
         var ecCurve: Int = 0,
         var ecCurveName: String? = null,
@@ -128,7 +108,7 @@ object CertificateGen {
                             Tag.CERTIFICATE_SERIAL -> certificateSerial = BigInteger(v.blob)
                             Tag.CERTIFICATE_NOT_BEFORE -> certificateNotBefore = Date(v.dateTime)
                             Tag.CERTIFICATE_NOT_AFTER -> certificateNotAfter = Date(v.dateTime)
-                            Tag.CERTIFICATE_SUBJECT -> certificateSubject = X500Name(X500Principal(v.blob).name)
+                            Tag.CERTIFICATE_SUBJECT -> certificateSubject = v.blob
                             Tag.RSA_PUBLIC_EXPONENT -> rsaPublicExponent = BigInteger.valueOf(v.longInteger)
                             Tag.EC_CURVE -> {
                                 ecCurve = v.ecCurve
@@ -198,7 +178,7 @@ object CertificateGen {
 
     private data class EcCurveInfo(val curve: Int, val name: String, val size: Int)
 
-    // Only the sizes the Rust keygen crate accepts; anything else stays on BouncyCastle.
+    // Only the sizes the Rust keygen crate accepts; anything else uses the platform provider.
     private val RSA_NATIVE_KEY_SIZES = setOf(2048, 3072, 4096)
 
     // P_256 before CURVE_25519 so that fallback maps 256 -> secp256r1
@@ -224,14 +204,14 @@ object CertificateGen {
             when (params.algorithm) {
                 Algorithm.EC -> {
                     Logger.d("Generating EC keypair of size ${params.keySize}")
-                    KeyPairGenerator.getInstance("EC", BouncyCastleProvider.PROVIDER_NAME)
+                    KeyPairGenerator.getInstance("EC")
                         .apply { initialize(ECGenParameterSpec(params.ecCurveName ?: "secp256r1")) }
                         .generateKeyPair()
                 }
 
                 Algorithm.RSA -> {
                     Logger.d("Generating RSA keypair of size ${params.keySize}")
-                    KeyPairGenerator.getInstance("RSA", BouncyCastleProvider.PROVIDER_NAME)
+                    KeyPairGenerator.getInstance("RSA")
                         .apply {
                             initialize(
                                 RSAKeyGenParameterSpec(
@@ -253,9 +233,9 @@ object CertificateGen {
     }
 
     /**
-     * Runs key generation in Rust. Returns null — so the caller falls back to BouncyCastle —
-     * whenever the native library is unavailable, the requested algorithm/curve is unsupported
-     * natively, or the native call fails.
+     * Runs key generation in Rust. Returns null — so the caller falls back to the platform
+     * provider — whenever the native library is unavailable, the requested algorithm/curve is
+     * unsupported natively, or the native call fails.
      */
     private fun generateNativeKeyPair(params: KeyGenParameters): KeyPair? {
         if (!NativeCertGen.isAvailable) return null
@@ -295,7 +275,7 @@ object CertificateGen {
                 val buffer = ByteBuffer.wrap(blob)
                 val privateKey = buffer.readLengthPrefixed()
                 val publicKey = buffer.readLengthPrefixed()
-                val factory = KeyFactory.getInstance(factoryAlgorithm, BouncyCastleProvider.PROVIDER_NAME)
+                val factory = KeyFactory.getInstance(factoryAlgorithm)
                 KeyPair(
                     factory.generatePublic(X509EncodedKeySpec(publicKey)),
                     factory.generatePrivate(PKCS8EncodedKeySpec(privateKey)),
@@ -343,7 +323,7 @@ object CertificateGen {
             // whole keybox chain after it.
             val appendSigningChain = attestKeyDescriptor == null
             val chain =
-                buildChain(keyPair, keybox, params, signing, uid, securityLevel, appendSigningChain)
+                buildChain(keyPair, params, signing, uid, securityLevel, appendSigningChain)
             keyPair to chain
         }
         raw.exceptionOrNull()?.let { if (it is ServiceSpecificException) throw it }
@@ -413,7 +393,6 @@ object CertificateGen {
         val signingKey = keyPair!!
         return SigningMaterial(
             keyPair = signingKey,
-            issuer = X509CertificateHolder(certificates.first().encoded).subject,
             certChainDer = CertificateUtils.run { certificates.toByteArray() },
         )
     }
@@ -422,58 +401,8 @@ object CertificateGen {
     private fun keyboxSigningMaterial(keybox: KeyBox): SigningMaterial =
         SigningMaterial(
             keyPair = keybox.keyPair,
-            issuer = X509CertificateHolder(keybox.certificates[0].encoded).subject,
             certChainDer = CertificateUtils.run { keybox.certificates.toByteArray() },
         )
-
-    private fun buildCertificate(
-        keyPair: KeyPair,
-        params: KeyGenParameters,
-        issuer: X500Name,
-        attestationDer: ByteArray,
-        signingKeyPair: KeyPair,
-    ): Certificate {
-        val builder =
-            JcaX509v3CertificateBuilder(
-                issuer,
-                params.certificateSerial ?: BigInteger.ONE,
-                params.certificateNotBefore ?: Date(0),
-                params.certificateNotAfter ?: Date(253402300799000L),
-                params.certificateSubject ?: X500Name("CN=Android Keystore Key"),
-                keyPair.public,
-            )
-        val keyUsageBits =
-            params.purpose.fold(0) { acc, p ->
-                acc or
-                    when (p) {
-                        KeyPurpose.SIGN -> KeyUsage.digitalSignature
-                        KeyPurpose.DECRYPT -> KeyUsage.dataEncipherment
-                        KeyPurpose.WRAP_KEY -> KeyUsage.keyEncipherment
-                        KeyPurpose.AGREE_KEY -> KeyUsage.keyAgreement
-                        KeyPurpose.ATTEST_KEY -> KeyUsage.keyCertSign
-                        else -> 0
-                    }
-            }
-        if (keyUsageBits != 0) builder.addExtension(Extension.keyUsage, true, KeyUsage(keyUsageBits))
-        builder.addExtension(Extension(ATTESTATION_OID, false, DEROctetString(attestationDer)))
-        val signerAlgorithm =
-            when (signingKeyPair.private) {
-                is java.security.interfaces.ECPrivateKey -> "ECDSA"
-                is java.security.interfaces.RSAPrivateKey -> "RSA"
-                else ->
-                    throw UnsupportedOperationException(
-                        "Unsupported attestation signing key algorithm: ${signingKeyPair.private.algorithm}"
-                    )
-            }
-        val digestName = CertificateUtils.digestName(params.digest.firstOrNull { it != 0 } ?: 0, false)
-        val signer =
-            JcaContentSignerBuilder("${digestName}with$signerAlgorithm")
-                .setProvider(BouncyCastleProvider.PROVIDER_NAME)
-                .build(signingKeyPair.private)
-        return JcaX509CertificateConverter()
-            .setProvider(BouncyCastleProvider.PROVIDER_NAME)
-            .getCertificate(builder.build(signer))
-    }
 
     private fun resolveEcCurveName(curve: Int, keySize: Int): String =
         EC_CURVES.firstOrNull { it.curve == curve }?.name
@@ -481,16 +410,14 @@ object CertificateGen {
             ?: "secp256r1"
 
     /**
-     * Builds the leaf certificate and its chain for [keyPair], preferring the native Rust builder
-     * (keybox parsing, leaf signing and chain assembly all run there) and falling back to
-     * BouncyCastle whenever the native library is unavailable or rejects the request.
+     * Builds the leaf certificate and its chain for [keyPair] with the native Rust builder
+     * (keybox parsing, leaf signing and chain assembly all run there).
      *
      * [appendSigningChain] appends the signing certificate chain after the leaf — true for the
      * keybox case, false when a designated attestation key signs a standalone leaf.
      */
     private fun buildChain(
         keyPair: KeyPair,
-        keybox: KeyBox,
         params: KeyGenParameters,
         signing: SigningMaterial,
         uid: Int,
@@ -501,16 +428,11 @@ object CertificateGen {
         val creationTimeMs = params.createdAtMs!!
         val attestationDer = buildAttestationDer(params, uid, securityLevel, creationTimeMs)
 
-        buildNativeChain(keyPair, attestationDer, signing, params, appendSigningChain)?.let { return it }
-
-        val leaf = buildCertificate(keyPair, params, signing.issuer, attestationDer, signing.keyPair)
-        return buildList {
-            add(leaf)
-            if (appendSigningChain) addAll(keybox.certificates)
-        }
+        return buildNativeChain(keyPair, attestationDer, signing, params, appendSigningChain)
+            ?: throw IllegalStateException("Native certificate chain builder unavailable")
     }
 
-    /** Runs the native chain builder, returning null so the caller falls back to BouncyCastle. */
+    /** Runs the native chain builder, throwing when the library is unavailable or rejects the request. */
     private fun buildNativeChain(
         keyPair: KeyPair,
         attestationDer: ByteArray,
@@ -542,7 +464,7 @@ object CertificateGen {
      * Packs the chain-build request for the native builder: leaf key, pre-encoded attestation
      * extension and signing material (see the Rust `chaingen` module for the layout). Absent
      * optional values are encoded as zero-length fields so the native side applies its defaults,
-     * and the validity dates are pre-resolved to match the BouncyCastle defaults exactly.
+     * and the validity dates are pre-resolved to the defaults the native builder expects.
      */
     private fun encodeChainBuildRequest(
         keyPair: KeyPair,
@@ -564,7 +486,7 @@ object CertificateGen {
             data.writeInt(params.purpose.size)
             params.purpose.forEach { data.writeInt(it) }
             data.writeLengthPrefixed(params.certificateSerial?.toByteArray() ?: ByteArray(0))
-            data.writeLengthPrefixed(params.certificateSubject?.encoded ?: ByteArray(0))
+            data.writeLengthPrefixed(params.certificateSubject ?: ByteArray(0))
         }
         return out.toByteArray()
     }
@@ -593,123 +515,27 @@ object CertificateGen {
         val raw = runCatching {
             params.createdAtMs = params.createdAtMs ?: System.currentTimeMillis()
             val keybox = getKeyboxForAlgorithm(params.algorithm) ?: return null
-            buildChain(keyPair, keybox, params, keyboxSigningMaterial(keybox), uid, securityLevel, true)
+            buildChain(keyPair, params, keyboxSigningMaterial(keybox), uid, securityLevel, true)
                 .map { it.encoded }
         }
         return raw.onFailure { Logger.e("Failed to generate certificate chain", it) }.getOrNull()
     }
 
     /**
-     * Encodes the KeyMint `KeyDescription` as DER; the caller wraps it in the certificate's
-     * attestation extension, or hands the same bytes to the native chain builder. Prefers the
-     * native Rust builder (byte-identical to the BouncyCastle path) and falls back to BouncyCastle
-     * whenever the native library is unavailable or rejects the request.
+     * Encodes the KeyMint `KeyDescription` as DER with the native Rust builder; the caller wraps it
+     * in the certificate's attestation extension, or hands the same bytes to the native chain
+     * builder.
      */
     private fun buildAttestationDer(
         params: KeyGenParameters,
         uid: Int,
         securityLevel: Int = 1,
         creationTimeMs: Long,
-    ): ByteArray {
-        buildNativeAttestationDer(params, uid, securityLevel, creationTimeMs)?.let { return it }
+    ): ByteArray =
+        buildNativeAttestationDer(params, uid, securityLevel, creationTimeMs)
+            ?: throw IllegalStateException("Native attestation builder unavailable")
 
-        val versions = AndroidUtils.attestationVersions(securityLevel)
-        val attestationVersion = versions.attestation
-        val keymasterVersion = versions.keymaster
-        val key = AndroidUtils.bootKey
-        val hash = AndroidUtils.getBootHashFromProp()
-        val rootOfTrust =
-            DERSequence(arrayOf(DEROctetString(key), ASN1Boolean.TRUE, ASN1Enumerated(0), DEROctetString(hash)))
-        val osVersion = ASN1Integer(AndroidUtils.osVersion.toLong())
-        val creationDateTime = ASN1Integer(creationTimeMs)
-        val origin = ASN1Integer((params.origin ?: 0).toLong())
-        val moduleHash = DEROctetString(AndroidUtils.moduleHash)
-        val applicationId = if (params.attestationChallenge != null) createApplicationId(uid) else null
-        val uniqueId =
-            if (params.includeUniqueId == true && applicationId != null) {
-                computeUniqueId(creationTimeMs, applicationId.octets)
-            } else {
-                ByteArray(0)
-            }
-
-        val tee = mutableListOf<ASN1Encodable>()
-
-        fun teeTag(tag: Int, v: ASN1Encodable) = tee.add(DERTaggedObject(true, tag, v))
-
-        fun teeSet(tag: Int, vs: List<Int>) =
-            vs.takeIf { it.isNotEmpty() }
-                ?.let { teeTag(tag, DERSet(it.map { ASN1Integer(it.toLong()) }.toTypedArray())) }
-
-        teeSet(1, params.purpose)
-        teeTag(2, ASN1Integer(params.algorithm.toLong()))
-        val effectiveKey = effectiveKeySize(params)
-        if (effectiveKey > 0) teeTag(3, ASN1Integer(effectiveKey.toLong()))
-        teeSet(5, params.digest)
-        params.userSecureIds.takeIf { it.isNotEmpty() }?.let { ids ->
-            teeTag(502, DERSet(ids.map { ASN1Integer(it) }.toTypedArray()))
-        }
-        params.userAuthType?.let { teeTag(504, ASN1Integer(it.toLong())) }
-        params.authTimeout?.let { teeTag(505, ASN1Integer(it.toLong())) }
-        if (params.allowWhileOnBody == true) teeTag(506, DERNull.INSTANCE)
-        if (params.trustedUserPresenceRequired == true) teeTag(507, DERNull.INSTANCE)
-        if (params.trustedConfirmationRequired == true) teeTag(508, DERNull.INSTANCE)
-        if (params.noAuthRequiredIsValid) teeTag(503, DERNull.INSTANCE)
-        if (params.callerNonce == true) teeTag(1005, DERNull.INSTANCE)
-        teeTag(702, origin)
-        teeTag(704, rootOfTrust)
-        teeTag(705, osVersion)
-        val patchLevels = AndroidUtils.resolvePatchLevels(uid)
-        if (patchLevels.os != AndroidUtils.DO_NOT_REPORT)
-            teeTag(706, ASN1Integer(patchLevels.os.toLong()))
-        if (patchLevels.vendor != AndroidUtils.DO_NOT_REPORT) {
-            teeTag(718, ASN1Integer(patchLevels.vendor.toLong()))
-        }
-        if (patchLevels.boot != AndroidUtils.DO_NOT_REPORT) {
-            teeTag(719, ASN1Integer(patchLevels.boot.toLong()))
-        }
-        teeSet(4, params.blockMode)
-        teeSet(6, params.padding)
-        if (attestationVersion >= 100) teeSet(203, params.mgfDigest)
-        if (params.algorithm == Algorithm.EC && params.ecCurve != 0) teeTag(10, ASN1Integer(params.ecCurve.toLong()))
-        if (params.algorithm == Algorithm.RSA && params.rsaPublicExponent != null)
-            teeTag(200, ASN1Integer(params.rsaPublicExponent))
-        params.brand?.let { teeTag(710, DEROctetString(it)) }
-        params.device?.let { teeTag(711, DEROctetString(it)) }
-        params.product?.let { teeTag(712, DEROctetString(it)) }
-        params.manufacturer?.let { teeTag(716, DEROctetString(it)) }
-        params.model?.let { teeTag(717, DEROctetString(it)) }
-        params.serialno?.let { teeTag(713, DEROctetString(it)) }
-        params.imei1?.let { teeTag(714, DEROctetString(it)) }
-        params.meid?.let { teeTag(715, DEROctetString(it)) }
-        if (attestationVersion >= 300) params.imei2?.let { teeTag(723, DEROctetString(it)) }
-        tee.sortBy { (it as DERTaggedObject).tagNo }
-
-        val sw = mutableListOf<ASN1Encodable>(DERTaggedObject(true, 701, creationDateTime))
-        params.activeDateTime?.let { sw.add(DERTaggedObject(true, 400, ASN1Integer(it))) }
-        params.originationExpireDateTime?.let { sw.add(DERTaggedObject(true, 401, ASN1Integer(it))) }
-        params.usageExpireDateTime?.let { sw.add(DERTaggedObject(true, 402, ASN1Integer(it))) }
-        if (params.maxUsesPerBoot > 0) sw.add(DERTaggedObject(true, 404, ASN1Integer(params.maxUsesPerBoot.toLong())))
-        if (params.usageCountLimit > 0) sw.add(DERTaggedObject(true, 405, ASN1Integer(params.usageCountLimit.toLong())))
-        if (params.unlockedDeviceRequired == true) sw.add(DERTaggedObject(true, 509, DERNull.INSTANCE))
-        if (applicationId != null) sw.add(DERTaggedObject(true, 709, applicationId))
-        if (attestationVersion >= 400) sw.add(DERTaggedObject(true, 724, moduleHash))
-        sw.sortBy { (it as DERTaggedObject).tagNo }
-
-        val keyDesc =
-            arrayOf(
-                ASN1Integer(attestationVersion.toLong()),
-                ASN1Enumerated(securityLevel),
-                ASN1Integer(keymasterVersion.toLong()),
-                ASN1Enumerated(securityLevel),
-                DEROctetString(params.attestationChallenge ?: ByteArray(0)),
-                DEROctetString(uniqueId),
-                DERSequence(sw.toTypedArray()),
-                DERSequence(tee.toTypedArray()),
-            )
-        return DERSequence(keyDesc).encoded
-    }
-
-    /** Runs the native attestation builder, returning null so the caller falls back to BouncyCastle. */
+    /** Runs the native attestation builder, throwing when the library is unavailable or rejects the request. */
     private fun buildNativeAttestationDer(
         params: KeyGenParameters,
         uid: Int,
@@ -733,11 +559,10 @@ object CertificateGen {
 
     /**
      * Packs the attestation request for the native builder (see the Rust `attreq` module for the
-     * layout). Every value mirrors what the BouncyCastle path below reads, so the two encoders
-     * stay byte-identical: the native side only re-serialises the same fields. The attestation
-     * application id and unique id are still computed here (they need the PackageManager and the
-     * persisted HMAC key) and handed over already encoded. Nullable optionals are written as
-     * zero-length fields so the native side applies the same "omit this tag" default.
+     * layout). The attestation application id and unique id are computed here (they need the
+     * PackageManager and the persisted HMAC key) and handed over already encoded. Nullable
+     * optionals are written as zero-length fields so the native side applies the same "omit this
+     * tag" default.
      */
     private fun encodeAttestationRequest(
         params: KeyGenParameters,
@@ -750,7 +575,7 @@ object CertificateGen {
         val applicationId = if (params.attestationChallenge != null) createApplicationId(uid) else null
         val uniqueId =
             if (params.includeUniqueId == true && applicationId != null) {
-                computeUniqueId(creationTimeMs, applicationId.octets)
+                computeUniqueId(creationTimeMs, applicationId)
             } else {
                 ByteArray(0)
             }
@@ -772,7 +597,7 @@ object CertificateGen {
             data.writeInt(params.origin ?: 0)
             data.writeLengthPrefixed(params.attestationChallenge ?: ByteArray(0))
             data.writeLengthPrefixed(uniqueId)
-            data.writeLengthPrefixed(applicationId?.octets ?: ByteArray(0))
+            data.writeLengthPrefixed(applicationId ?: ByteArray(0))
             data.writeLengthPrefixed(AndroidUtils.moduleHash)
             data.writeLengthPrefixed(AndroidUtils.bootKey)
             data.writeLengthPrefixed(AndroidUtils.getBootHashFromProp() ?: ByteArray(0))
@@ -831,7 +656,7 @@ object CertificateGen {
     }
 
     @Throws(Throwable::class)
-    private fun createApplicationId(uid: Int): DEROctetString {
+    private fun createApplicationId(uid: Int): ByteArray {
         val pm = PkgConfig.getPm() ?: throw IllegalStateException("PackageManager not found!")
         val packages = pm.getPackagesForUid(uid) ?: throw IllegalStateException("No packages for UID $uid")
         val md = MessageDigest.getInstance("SHA-256")
@@ -859,16 +684,73 @@ object CertificateGen {
                     info
                 }
                 .map { info ->
-                    DERSequence(
-                        arrayOf(
-                            DEROctetString(info.packageName.toByteArray(StandardCharsets.UTF_8)),
-                            ASN1Integer(info.longVersionCode),
-                        )
+                    derSequence(
+                        derOctetString(info.packageName.toByteArray(StandardCharsets.UTF_8)),
+                        derInteger(info.longVersionCode),
                     )
                 }
                 .toTypedArray()
 
-        val sigArray = signatures.values.map { DEROctetString(it) }.toTypedArray()
-        return DEROctetString(DERSequence(arrayOf(DERSet(packageInfoArray), DERSet(sigArray))).encoded)
+        val sigArray = signatures.values.map { derOctetString(it) }.toTypedArray()
+        return derSequence(derSet(packageInfoArray), derSet(sigArray))
+    }
+
+    // --- Minimal DER writer, used only for the attestation application id (RFC 5280 §4.2.1.13) ---
+
+    private fun derSequence(vararg items: ByteArray): ByteArray = derTlv(0x30, items.concat())
+
+    private fun derSet(items: Array<ByteArray>): ByteArray =
+        derTlv(0x31, items.sortedWith(Comparator { a, b -> compareDer(a, b) }).toTypedArray().concat())
+
+    private fun derOctetString(content: ByteArray): ByteArray = derTlv(0x04, content)
+
+    private fun derInteger(value: Long): ByteArray {
+        val raw = ByteArray(8) { (value shr (8 * (7 - it))).toByte() }
+        var start = 0
+        if (value >= 0) {
+            while (start < 7 && raw[start] == 0.toByte()) start++
+            if (raw[start].toInt() and 0x80 != 0) return derTlv(0x02, byteArrayOf(0x00) + raw.copyOfRange(start, 8))
+        } else {
+            while (start < 7 && raw[start] == 0xFF.toByte()) start++
+            if (raw[start].toInt() and 0x80 == 0) return derTlv(0x02, byteArrayOf(0xFF.toByte()) + raw.copyOfRange(start, 8))
+        }
+        return derTlv(0x02, raw.copyOfRange(start, 8))
+    }
+
+    private fun derTlv(tag: Int, content: ByteArray): ByteArray {
+        val length = derLength(content.size)
+        return ByteArray(1 + length.size + content.size).also { out ->
+            out[0] = tag.toByte()
+            length.copyInto(out, 1)
+            content.copyInto(out, 1 + length.size)
+        }
+    }
+
+    private fun derLength(length: Int): ByteArray =
+        when {
+            length < 0x80 -> byteArrayOf(length.toByte())
+            length <= 0xFF -> byteArrayOf(0x81.toByte(), length.toByte())
+            length <= 0xFFFF -> byteArrayOf(0x82.toByte(), (length shr 8).toByte(), length.toByte())
+            else -> byteArrayOf(0x83.toByte(), (length shr 16).toByte(), (length shr 8).toByte(), length.toByte())
+        }
+
+    private fun Array<out ByteArray>.concat(): ByteArray {
+        val out = ByteArray(sumOf { it.size })
+        var offset = 0
+        for (bytes in this) {
+            bytes.copyInto(out, offset)
+            offset += bytes.size
+        }
+        return out
+    }
+
+    /** DER SET OF orders elements by their encoding; compare the raw bytes for that ordering. */
+    private fun compareDer(a: ByteArray, b: ByteArray): Int {
+        val common = minOf(a.size, b.size)
+        for (i in 0 until common) {
+            val diff = (a[i].toInt() and 0xFF) - (b[i].toInt() and 0xFF)
+            if (diff != 0) return diff
+        }
+        return a.size - b.size
     }
 }

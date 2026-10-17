@@ -45,7 +45,7 @@ object KeyBoxUtils {
         }
 
         // The Rust parser performs the same structure checks on the document and returns the
-        // keybox material already decoded; XmlPullParser + BouncyCastle stays as the fallback.
+        // keybox material already decoded; XmlPullParser stays as the fallback.
         val native = nativeKeyboxes(xmlData)
         val parsed = if (native != null) Result.success(native) else runCatching {
             val parser =
@@ -261,7 +261,7 @@ object KeyBoxUtils {
 
     /**
      * Parses the keybox with the native Rust parser, returning null — so the caller falls back to
-     * XmlPullParser + BouncyCastle — when the library is unavailable or the document is rejected.
+     * XmlPullParser — when the library is unavailable or the document is rejected.
      */
     private fun nativeKeyboxes(xmlData: String): Map<String, KeyBox>? {
         if (!NativeCertGen.isAvailable) return null
@@ -353,8 +353,8 @@ object KeyBoxUtils {
         if (privateKeyText.isNullOrBlank() || certTexts.isEmpty()) {
             throw XmlPullParserException("Keybox entry is missing key material")
         }
-        val keyPair = CertificateUtils.convertPemToKeyPair(CertificateUtils.parseKeyPair(privateKeyText).getOrThrow())
-        val derived = keyPair.private.algorithm
+        val key = CertificateUtils.decodePemKey(privateKeyText).getOrThrow()
+        val derived = key.algorithm
         val algorithmName =
             when (derived.uppercase()) {
                 "ECDSA" -> KeyProperties.KEY_ALGORITHM_EC
@@ -372,6 +372,6 @@ object KeyBoxUtils {
             Logger.w("Keybox algorithm attribute disagrees with parsed key; using parsed key")
         }
         val certs = certTexts.map { CertificateUtils.parseCertificate(it).getOrThrow() }
-        return algorithmName to KeyBox(keyPair, Collections.unmodifiableList(certs))
+        return algorithmName to buildKeyBox(algorithmName, key.pkcs8, certs)
     }
 }

@@ -29,11 +29,6 @@
     public static int d(...);
 }
 
-# keep these or bouncycastle will not work
--keep class org.bouncycastle.jcajce.provider.** { *; }
--keep class org.bouncycastle.jce.provider.** { *; }
--dontwarn javax.naming.**
-
 # Keep all interceptor classes and their methods - used via reflection and JNI
 -keep class io.github.beakthoven.TrickyStoreOSS.interceptors.** {
     *;

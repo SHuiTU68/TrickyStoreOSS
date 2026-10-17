@@ -1,8 +1,9 @@
 //! Native certificate/key generation for TrickyStoreOSS.
 //!
 //! Key generation, certificate-chain building and the KeyMint attestation extension all run in
-//! Rust and are exposed over JNI. The app prefers these native paths and falls back to
-//! BouncyCastle whenever the shared object is unavailable or a request is unsupported.
+//! Rust and are exposed over JNI. These are the only implementations: the app ships no
+//! BouncyCastle fallback, so a missing shared object or an unsupported request surfaces as an
+//! error rather than a silent switch to another provider.
 
 #![deny(clippy::unwrap_used, clippy::expect_used)]
 
@@ -72,7 +73,7 @@ pub extern "system" fn Java_io_github_beakthoven_TrickyStoreOSS_NativeCertGen_se
 /// Kotlin rebuilds the `java.security.KeyPair` from the two DER blobs.
 ///
 /// `algorithm`/`ecCurve` mirror the KeyMint `Algorithm`/`EcCurve` constants. Unsupported
-/// combinations throw, so the Kotlin caller falls back to BouncyCastle.
+/// combinations throw and surface to the Kotlin caller as an error.
 #[no_mangle]
 pub extern "system" fn Java_io_github_beakthoven_TrickyStoreOSS_NativeCertGen_nativeGenerateKeyPair(
     mut env: JNIEnv,
@@ -118,7 +119,7 @@ fn encode_key_pair(key_pair: &GeneratedKeyPair) -> Vec<u8> {
 /// [`chaingen`]) and returns the concatenated DER certificates, leaf first. The leaf key, the
 /// Kotlin-built attestation extension and the keybox/signing material are all carried in the blob.
 ///
-/// Any unsupported or malformed input throws, so the Kotlin caller falls back to BouncyCastle.
+/// Any unsupported or malformed input throws and surfaces to the Kotlin caller as an error.
 #[no_mangle]
 pub extern "system" fn Java_io_github_beakthoven_TrickyStoreOSS_NativeCertGen_nativeBuildCertificateChain(
     mut env: JNIEnv,
@@ -136,7 +137,7 @@ pub extern "system" fn Java_io_github_beakthoven_TrickyStoreOSS_NativeCertGen_na
 /// Kotlin layer (they need the PackageManager and the persisted HMAC key) and handed over already
 /// encoded.
 ///
-/// Any unsupported or malformed input throws, so the Kotlin caller falls back to BouncyCastle.
+/// Any unsupported or malformed input throws and surfaces to the Kotlin caller as an error.
 #[no_mangle]
 pub extern "system" fn Java_io_github_beakthoven_TrickyStoreOSS_NativeCertGen_nativeBuildAttestationExtension(
     mut env: JNIEnv,
@@ -152,7 +153,7 @@ pub extern "system" fn Java_io_github_beakthoven_TrickyStoreOSS_NativeCertGen_na
 /// `rootOfTrust` and patching the patch-level fields — then re-signs it with the keybox, from a
 /// packed request blob (see [`hack_leaf`]). Returns the leaf-first concatenated DER chain.
 ///
-/// Any unsupported or malformed input throws, so the Kotlin caller falls back to BouncyCastle.
+/// Any unsupported or malformed input throws and surfaces to the Kotlin caller as an error.
 #[no_mangle]
 pub extern "system" fn Java_io_github_beakthoven_TrickyStoreOSS_NativeCertGen_nativeHackCertificateChain(
     mut env: JNIEnv,
@@ -168,8 +169,7 @@ pub extern "system" fn Java_io_github_beakthoven_TrickyStoreOSS_NativeCertGen_na
 /// [`keybox_xml`]): `[u32 count]{ [u32 algorithm][u32 PKCS#8 key]{ [u32 certCount]{ [u32 cert] }
 /// } }`. Kotlin rebuilds the key pairs and certificates from it.
 ///
-/// Any unsupported or malformed document throws, so the Kotlin caller falls back to XmlPullParser
-/// and BouncyCastle.
+/// Any unsupported or malformed document throws and surfaces to the Kotlin caller as an error.
 #[no_mangle]
 pub extern "system" fn Java_io_github_beakthoven_TrickyStoreOSS_NativeCertGen_nativeParseKeybox(
     mut env: JNIEnv,
@@ -180,13 +180,41 @@ pub extern "system" fn Java_io_github_beakthoven_TrickyStoreOSS_NativeCertGen_na
     byte_array_result(&mut env, result)
 }
 
+/// Decodes one PEM private key block natively (see [`keybox_xml::decode_key_blob`]) into
+/// `[u32 algLen][algorithm][u32 PKCS#8 len][PKCS#8 DER]`. Kotlin rebuilds the `KeyPair` from the
+/// algorithm name and the DER.
+///
+/// An unsupported label or malformed key throws and surfaces to the Kotlin caller as an error.
+#[no_mangle]
+pub extern "system" fn Java_io_github_beakthoven_TrickyStoreOSS_NativeCertGen_nativeDecodePemKey(
+    mut env: JNIEnv,
+    _this: JClass,
+    pem: JString,
+) -> jbyteArray {
+    let result = read_string(&mut env, &pem).and_then(|text| keybox_xml::decode_key_blob(&text));
+    byte_array_result(&mut env, result)
+}
+
+/// Decodes one PEM certificate block natively (see [`keybox_xml::decode_certificate`]) and returns
+/// its DER bytes. A bad label or a non-certificate body throws and surfaces to the Kotlin caller
+/// as an error.
+#[no_mangle]
+pub extern "system" fn Java_io_github_beakthoven_TrickyStoreOSS_NativeCertGen_nativeDecodePemCertificate(
+    mut env: JNIEnv,
+    _this: JClass,
+    pem: JString,
+) -> jbyteArray {
+    let result = read_string(&mut env, &pem).and_then(|text| keybox_xml::decode_certificate(&text));
+    byte_array_result(&mut env, result)
+}
+
 /// Reads the verified-boot fields back out of a probe certificate's KeyMint attestation extension,
 /// from a packed request blob (see [`attest_parse`]): `[u32 certLen][certificate DER][u32
 /// challengeLen][challenge]`. Returns the fields as a length-prefixed blob for Kotlin to rebuild
 /// `AttestUtils.AttestationData`.
 ///
-/// Any malformed input or a challenge mismatch throws, so the Kotlin caller falls back to
-/// BouncyCastle.
+/// Any malformed input or a challenge mismatch throws and surfaces to the Kotlin caller as an
+/// error.
 #[no_mangle]
 pub extern "system" fn Java_io_github_beakthoven_TrickyStoreOSS_NativeCertGen_nativeParseAttestation(
     mut env: JNIEnv,
@@ -230,15 +258,14 @@ fn read_byte_array(env: &mut JNIEnv, array: jbyteArray) -> Result<Vec<u8>> {
         .map_err(|e| CertGenError::InvalidParameter(format!("chain request read failed: {e}")))
 }
 
-/// Copies a JNI string into a `String`, rejecting a null handle so the parser never sees a missing
-/// document.
+/// Copies a JNI string into a `String`, rejecting a null handle so no parser sees a missing input.
 fn read_string(env: &mut JNIEnv, value: &JString) -> Result<String> {
     if value.is_null() {
-        return Err(CertGenError::InvalidParameter("keybox xml was null".into()));
+        return Err(CertGenError::InvalidParameter("string argument was null".into()));
     }
     env.get_string(value)
         .map(String::from)
-        .map_err(|e| CertGenError::InvalidParameter(format!("keybox xml read failed: {e}")))
+        .map_err(|e| CertGenError::InvalidParameter(format!("string argument read failed: {e}")))
 }
 
 // ring::error::Unspecified does not implement std::error::Error, so map each failure to a
