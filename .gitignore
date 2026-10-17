@@ -17,3 +17,5 @@ module/classes.dex
 module/lib/
 module/service.apk
 out/
+native-certgen/target/
+app/src/main/jniLibs/**/*.so

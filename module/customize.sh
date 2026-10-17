@@ -75,6 +75,7 @@ ui_print ""
 ui_print "- Extracting $ARCH libraries"
 install_file "lib/$ABI_DIR/libTrickyStoreOSS.so" "$MODPATH"
 install_file "lib/$ABI_DIR/libinject.so" "$MODPATH"
+install_file "lib/$ABI_DIR/libcertgen.so" "$MODPATH"
 ui_print ""
 
 mv "$MODPATH/libinject.so" "$MODPATH/inject"

@@ -91,6 +91,52 @@ dependencies {
     implementation(libs.org.lsposed.libcxx.libcxx)
 }
 
+// --- Native cert generation (Rust) ---
+// Builds libcertgen.so for every supported ABI straight into app/src/main/jniLibs, which AGP
+// merges into the APK; the module packaging below then extracts it from the APK.
+val buildRustCertgen by
+    tasks.registering(Exec::class) {
+        group = "TrickyStoreOSS Native Build"
+        description = "Builds libcertgen.so via cargo-ndk for all supported ABIs."
+
+        workingDir = rootProject.projectDir.resolve("native-certgen")
+
+        commandLine(
+            "cargo",
+            "ndk",
+            "-t",
+            "arm64-v8a",
+            "-t",
+            "armeabi-v7a",
+            "-t",
+            "x86",
+            "-t",
+            "x86_64",
+            "-o",
+            rootProject.projectDir.resolve("app/src/main/jniLibs").absolutePath,
+            "build",
+            "--release",
+        )
+
+        inputs.dir(rootProject.projectDir.resolve("native-certgen/src"))
+        inputs.file(rootProject.projectDir.resolve("native-certgen/Cargo.toml"))
+        inputs.file(rootProject.projectDir.resolve("native-certgen/Cargo.lock"))
+        outputs.dir(rootProject.projectDir.resolve("app/src/main/jniLibs"))
+
+        environment("ANDROID_NDK_HOME", android.ndkDirectory.absolutePath)
+        environment(
+            "PATH",
+            "${System.getProperty("user.home")}/.cargo/bin:${System.getenv("PATH") ?: ""}",
+        )
+    }
+
+// AGP auto-detects jniLibs/ as an input to mergeJniLibFolders — make it depend on the Rust build.
+tasks.configureEach {
+    if (name.startsWith("merge") && name.endsWith("JniLibFolders")) {
+        dependsOn(buildRustCertgen)
+    }
+}
+
 androidComponents {
     onVariants { variant: ApplicationVariant ->
         val variantName = variant.name
@@ -101,6 +147,7 @@ androidComponents {
 
         tasks.register("prepareModuleFiles${capitalized}") {
             notCompatibleWithConfigurationCache("stages APK contents into the variant module directory")
+            dependsOn(buildRustCertgen)
             inputs.dir(sourceDir)
             inputs.dir(apkFile)
             outputs.dir(tempModuleDir)
@@ -150,7 +197,8 @@ androidComponents {
                     while (entries.hasMoreElements()) {
                         val entry = entries.nextElement()
                         if (!entry.isDirectory && entry.name.startsWith("lib/") &&
-                            entry.name.substringAfterLast('/') in setOf("libinject.so", "libTrickyStoreOSS.so")
+                            entry.name.substringAfterLast('/') in
+                                setOf("libinject.so", "libTrickyStoreOSS.so", "libcertgen.so")
                         ) {
                             val destination = tempDir.resolve(entry.name)
                             destination.parentFile.mkdirs()
