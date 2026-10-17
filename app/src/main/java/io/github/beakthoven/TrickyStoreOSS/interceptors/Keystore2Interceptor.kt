@@ -289,8 +289,9 @@ object Keystore2Interceptor : BaseKeystoreInterceptor() {
                     val response = authorized.info?.response ?: SecurityLevelInterceptor.patchedResponses[authorized.key]
                     if (response != null) return@runCatching safeTypedObjectReply(response, "grant")
                 }
+                val targets = PkgConfig.targetModes(callingUid)
                 when {
-                    PkgConfig.needGenerate(callingUid) -> {
+                    targets.generate -> {
                         // forwarded (non-forged) keys only live in patchedResponses — serve that
                         // cache too, or APP-domain reads diverge from GRANT-domain reads after
                         // updateSubcomponent
@@ -304,7 +305,7 @@ object Keystore2Interceptor : BaseKeystoreInterceptor() {
                             Skip
                         }
                     }
-                    PkgConfig.needHack(callingUid) -> {
+                    targets.leafHack -> {
                         if (SecurityLevelInterceptor.shouldSkipLeafHackFor(callingUid, descriptor)) {
                             Logger.i("skip leaf hack for uid=$callingUid alias=$aliasLabel")
                             val response = SecurityLevelInterceptor.findGeneratedKey(callingUid, descriptor)?.response
@@ -347,7 +348,7 @@ object Keystore2Interceptor : BaseKeystoreInterceptor() {
             listEntriesTransaction >= 0 &&
                 (code == listEntriesTransaction || code == listEntriesBatchedTransaction) &&
                 (SecurityLevelInterceptor.keys.keys.any { it.uid == callingUid } ||
-                    PkgConfig.needGenerate(callingUid) || PkgConfig.needHack(callingUid))
+                    PkgConfig.targetModes(callingUid).let { it.generate || it.leafHack })
         ) {
             return Continue
         }
@@ -415,7 +416,7 @@ object Keystore2Interceptor : BaseKeystoreInterceptor() {
             listEntriesTransaction >= 0 &&
                 (code == listEntriesTransaction || code == listEntriesBatchedTransaction) &&
                 (SecurityLevelInterceptor.keys.keys.any { it.uid == callingUid } ||
-                    PkgConfig.needGenerate(callingUid) || PkgConfig.needHack(callingUid))
+                    PkgConfig.targetModes(callingUid).let { it.generate || it.leafHack })
         ) {
             return mergeListEntries(callingUid, code, data, reply, resultCode)
         }

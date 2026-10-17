@@ -38,9 +38,10 @@ object CertificateHack {
 
     fun patchAuthorizations(authorizations: Array<Authorization>?, uid: Int): Array<Authorization>? {
         if (authorizations == null) return null
-        val os = AndroidUtils.patchLevelOverride(uid)
-        val vendor = AndroidUtils.vendorPatchLevelOverride(uid)
-        val boot = AndroidUtils.bootPatchLevelOverride(uid)
+        val patch = AndroidUtils.resolvePatchLevels(uid)
+        val os = patch.osOverride
+        val vendor = patch.vendorOverride
+        val boot = patch.bootOverride
         return authorizations
             .mapNotNull { auth ->
                 val tag = auth.keyParameter.tag
@@ -202,9 +203,10 @@ object CertificateHack {
             )
         val hackedRootOfTrust = DERSequence(rootOfTrustElements)
 
-        val osPatch = AndroidUtils.patchLevelOverride(uid)
-        val vendorPatch = AndroidUtils.vendorPatchLevelOverride(uid)
-        val bootPatch = AndroidUtils.bootPatchLevelOverride(uid)
+        val patch = AndroidUtils.resolvePatchLevels(uid)
+        val osPatch = patch.osOverride
+        val vendorPatch = patch.vendorOverride
+        val bootPatch = patch.bootOverride
 
         val rebuilt = mutableListOf<ASN1TaggedObject>()
         for (i in 0 until vector.size()) {

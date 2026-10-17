@@ -13,6 +13,7 @@ import android.os.SystemProperties
 import android.security.KeyStore2
 import android.security.keystore.KeyStoreManager
 import io.github.beakthoven.TrickyStoreOSS.AttestUtils.CachedAttestData
+import io.github.beakthoven.TrickyStoreOSS.config.CustomPatchLevel
 import io.github.beakthoven.TrickyStoreOSS.config.PkgConfig
 import io.github.beakthoven.TrickyStoreOSS.logging.Logger
 import java.io.ByteArrayOutputStream
@@ -112,30 +113,57 @@ object AndroidUtils {
 
     private fun randomBytes(): ByteArray = ByteArray(32).also { SecureRandom().nextBytes(it) }
 
-    fun patchLevel(uid: Int): Int =
-        getCustomPatchLevel(uid, "system", false) ?: Build.VERSION.SECURITY_PATCH.convertPatchLevel(false)
+    // Precompiled once: this parse runs on the hot keygen / attestation path.
+    private val patchLevelValueRegex = Regex("\\d{6}|\\d{8}|\\d{4}-\\d{2}|\\d{4}-\\d{2}-\\d{2}")
 
-    fun patchLevelLong(uid: Int): Int =
-        getCustomPatchLevel(uid, "system", true) ?: Build.VERSION.SECURITY_PATCH.convertPatchLevel(true)
+    // Build.VERSION.SECURITY_PATCH is a fixed platform constant, so convert it once instead of
+    // re-parsing the same string on every intercepted transaction.
+    private val platformPatchLevel: Int by lazy { Build.VERSION.SECURITY_PATCH.convertPatchLevel(false) }
+    private val platformPatchLevelLong: Int by lazy { Build.VERSION.SECURITY_PATCH.convertPatchLevel(true) }
 
-    fun vendorPatchLevelLong(uid: Int): Int =
-        getCustomPatchLevel(uid, "vendor", true) ?: Build.VERSION.SECURITY_PATCH.convertPatchLevel(true)
+    /**
+     * All three patch-level components for one UID, resolved in a single pass.
+     *
+     * [osOverride]/[vendorOverride]/[bootOverride] are the raw values used by the leaf-hack path:
+     * null means device_default (keep the original real value) and [DO_NOT_REPORT] means omit the
+     * tag. [os]/[vendor]/[boot] are the concrete values used by the forged path, falling back to
+     * the platform patch level when no override applies.
+     */
+    data class PatchLevelResolution(
+        val osOverride: Int?,
+        val vendorOverride: Int?,
+        val bootOverride: Int?,
+        val os: Int,
+        val vendor: Int,
+        val boot: Int,
+    )
 
-    fun bootPatchLevelLong(uid: Int): Int =
-        getCustomPatchLevel(uid, "boot", true) ?: Build.VERSION.SECURITY_PATCH.convertPatchLevel(true)
-
-    // For patching a real keymaster cert: null = device_default (keep the original real value),
-    // DO_NOT_REPORT = omit, else = the value to inject. Used by the leaf-hack path so a real,
-    // correctly-sourced patch level (e.g. boot from the boot image header) is preserved.
-    fun patchLevelOverride(uid: Int): Int? = getCustomPatchLevel(uid, "system", false)
-
-    fun vendorPatchLevelOverride(uid: Int): Int? = getCustomPatchLevel(uid, "vendor", true)
-
-    fun bootPatchLevelOverride(uid: Int): Int? = getCustomPatchLevel(uid, "boot", true)
-
-    private fun getCustomPatchLevel(uid: Int, component: String, isLong: Boolean): Int? {
+    /**
+     * Resolves every patch-level component for [uid] with a single PackageManager lookup, instead
+     * of one IPC round-trip per component.
+     */
+    fun resolvePatchLevels(uid: Int): PatchLevelResolution {
         val pkg = PkgConfig.packagePatchLevelForUid(uid)
         val global = PkgConfig.globalPatchLevelConfig
+        val os = resolveCustomPatchLevel(pkg, global, "system", false)
+        val vendor = resolveCustomPatchLevel(pkg, global, "vendor", true)
+        val boot = resolveCustomPatchLevel(pkg, global, "boot", true)
+        return PatchLevelResolution(
+            osOverride = os,
+            vendorOverride = vendor,
+            bootOverride = boot,
+            os = os ?: platformPatchLevel,
+            vendor = vendor ?: platformPatchLevelLong,
+            boot = boot ?: platformPatchLevelLong,
+        )
+    }
+
+    private fun resolveCustomPatchLevel(
+        pkg: CustomPatchLevel?,
+        global: CustomPatchLevel?,
+        component: String,
+        isLong: Boolean,
+    ): Int? {
         val value =
             when (component) {
                 "system" -> pkg?.system ?: pkg?.all ?: global?.system ?: global?.all
@@ -146,7 +174,7 @@ object AndroidUtils {
 
         // Unset, or explicit "prop": mirror the system security-patch prop (TrickyStore behavior).
         if (value == null || value.equals("prop", ignoreCase = true))
-            return Build.VERSION.SECURITY_PATCH.convertPatchLevel(isLong)
+            return if (isLong) platformPatchLevelLong else platformPatchLevel
 
         when {
             value.equals("no", ignoreCase = true) -> return DO_NOT_REPORT
@@ -174,7 +202,7 @@ object AndroidUtils {
     private fun parsePatchLevelValue(value: String, component: String, isLong: Boolean): Int? {
         return runCatching {
             val normalized = value.replace("-", "")
-            require(value.matches(Regex("\\d{6}|\\d{8}|\\d{4}-\\d{2}|\\d{4}-\\d{2}-\\d{2}")))
+            require(patchLevelValueRegex.matches(value))
             val year = normalized.substring(0, 4).toInt()
             val month = normalized.substring(4, 6).toInt()
             val yearMonth = YearMonth.of(year, month)

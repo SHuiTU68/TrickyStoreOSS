@@ -353,7 +353,8 @@ class SecurityLevelInterceptor(private val original: IKeystoreSecurityLevel, pri
         data: Parcel,
     ): Result {
         if (code == importKeyTransaction) {
-            return if (PkgConfig.needHack(callingUid) || PkgConfig.needGenerate(callingUid)) Continue else Skip
+            val targets = PkgConfig.targetModes(callingUid)
+            return if (targets.leafHack || targets.generate) Continue else Skip
         }
         if (code == generateKeyTransaction) {
             val startNanos = System.nanoTime()
@@ -365,8 +366,9 @@ class SecurityLevelInterceptor(private val original: IKeystoreSecurityLevel, pri
                 val params = data.createTypedArray(KeyParameter.CREATOR)!!
                 val aFlags = data.readInt()
                 val entropy = data.createByteArray()
-                val hasSoftwareTarget = PkgConfig.needGenerate(callingUid)
-                val hasLeafTarget = PkgConfig.needHack(callingUid)
+                val targets = PkgConfig.targetModes(callingUid)
+                val hasSoftwareTarget = targets.generate
+                val hasLeafTarget = targets.leafHack
                 if (!hasSoftwareTarget && !hasLeafTarget) return Skip
                 if (!softwarePolicySupported(params)) {
                     Logger.i("Forwarding unsupported or incomplete authorization policy uid=$callingUid")
@@ -408,7 +410,7 @@ class SecurityLevelInterceptor(private val original: IKeystoreSecurityLevel, pri
                 if (attestationKeyDescriptor != null) {
                     val designated = resolveAuthorizedKey(callingUid, attestationKeyDescriptor, AccessAction.USE)
                     if (designated?.info == null) {
-                        return if (PkgConfig.needHack(callingUid)) forwardKeygen(keyDescriptor.alias, startNanos) else Skip
+                        return if (hasLeafTarget) forwardKeygen(keyDescriptor.alias, startNanos) else Skip
                     }
                     if (!designated.allowed) return errorReply(ResponseCode.PERMISSION_DENIED, "USE permission not granted")
                     if (designated.info.params.purpose != listOf(KeyPurpose.ATTEST_KEY)) {
@@ -462,11 +464,11 @@ class SecurityLevelInterceptor(private val original: IKeystoreSecurityLevel, pri
                             pair.first,
                             null,
                             pair.second,
-                            PkgConfig.needHack(callingUid),
+                            hasLeafTarget,
                             startNanos,
                         )
                     }
-                    PkgConfig.needHack(callingUid) -> {
+                    hasLeafTarget -> {
                         skipLeafHacks.remove(Key(callingUid, keyDescriptor.alias))
                         Logger.d(
                             "generateKey: forwarding non-attestation key uid=$callingUid alias=${keyDescriptor.alias}"
@@ -706,12 +708,13 @@ class SecurityLevelInterceptor(private val original: IKeystoreSecurityLevel, pri
         tee(Tag.ORIGIN, KeyParameterValue.origin(params.origin ?: 0))
         tee(Tag.OS_VERSION, KeyParameterValue.integer(AndroidUtils.osVersion))
 
-        if (AndroidUtils.patchLevel(callingUid) != AndroidUtils.DO_NOT_REPORT)
-            tee(Tag.OS_PATCHLEVEL, KeyParameterValue.integer(AndroidUtils.patchLevel(callingUid)))
-        if (AndroidUtils.vendorPatchLevelLong(callingUid) != AndroidUtils.DO_NOT_REPORT)
-            tee(Tag.VENDOR_PATCHLEVEL, KeyParameterValue.integer(AndroidUtils.vendorPatchLevelLong(callingUid)))
-        if (AndroidUtils.bootPatchLevelLong(callingUid) != AndroidUtils.DO_NOT_REPORT)
-            tee(Tag.BOOT_PATCHLEVEL, KeyParameterValue.integer(AndroidUtils.bootPatchLevelLong(callingUid)))
+        val patchLevels = AndroidUtils.resolvePatchLevels(callingUid)
+        if (patchLevels.os != AndroidUtils.DO_NOT_REPORT)
+            tee(Tag.OS_PATCHLEVEL, KeyParameterValue.integer(patchLevels.os))
+        if (patchLevels.vendor != AndroidUtils.DO_NOT_REPORT)
+            tee(Tag.VENDOR_PATCHLEVEL, KeyParameterValue.integer(patchLevels.vendor))
+        if (patchLevels.boot != AndroidUtils.DO_NOT_REPORT)
+            tee(Tag.BOOT_PATCHLEVEL, KeyParameterValue.integer(patchLevels.boot))
 
         authorizations.add(auth(Tag.CREATION_DATETIME, KeyParameterValue.dateTime(createdAtMs), SecurityLevel.KEYSTORE))
         params.activeDateTime?.let { sw(Tag.ACTIVE_DATETIME, KeyParameterValue.dateTime(it)) }

@@ -218,30 +218,36 @@ object PkgConfig {
         } ?: false
     }
 
-    private fun checkNeed(callingUid: Int, targetMode: Mode): Boolean {
+    /** Both target-mode flags for a UID, resolved from a single PackageManager lookup. */
+    data class TargetModes(val leafHack: Boolean, val generate: Boolean) {
+        companion object {
+            val NONE = TargetModes(false, false)
+        }
+    }
+
+    fun targetModes(callingUid: Int): TargetModes {
         val raw = runCatching {
-            val ps = packagesForUid(callingUid) ?: return false
-            val result = currentProbe()
-            val autoMode = when (result.status) {
+            val ps = packagesForUid(callingUid) ?: return@runCatching TargetModes.NONE
+            val autoMode = when (currentProbe().status) {
                 ProbeStatus.AVAILABLE -> Mode.LEAF_HACK
                 ProbeStatus.FAILED -> Mode.GENERATE
                 ProbeStatus.UNAVAILABLE -> null
             }
-            ps.any { pkg ->
-                when (packageModes[pkg]) {
-                    targetMode -> true
-                    Mode.AUTO -> autoMode == targetMode
-                    null -> false
-                    else -> false
+            var leafHack = false
+            var generate = false
+            for (pkg in ps) {
+                when (val resolved = packageModes[pkg]?.let { if (it == Mode.AUTO) autoMode else it }) {
+                    Mode.LEAF_HACK -> leafHack = true
+                    Mode.GENERATE -> generate = true
+                    else -> Unit
                 }
             }
+            TargetModes(leafHack, generate)
         }
-        return raw.onFailure { Logger.e("failed to get packages", it) }.getOrNull() ?: false
+        return raw.onFailure { Logger.e("failed to get packages", it) }.getOrDefault(TargetModes.NONE)
     }
 
-    fun needHack(callingUid: Int): Boolean = checkNeed(callingUid, Mode.LEAF_HACK)
-
-    fun needGenerate(callingUid: Int): Boolean = checkNeed(callingUid, Mode.GENERATE)
+    fun needHack(callingUid: Int): Boolean = targetModes(callingUid).leafHack
 
     @Volatile private var globalPatchLevel: CustomPatchLevel? = null
 
