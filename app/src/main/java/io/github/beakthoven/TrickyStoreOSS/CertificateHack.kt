@@ -143,7 +143,7 @@ object CertificateHack {
         val keybox = selectKeybox(leaf.publicKey.algorithm) ?: return null
         return try {
             val hacked = NativeCertGen.nativeHackCertificateChain(buildNativeHackRequest(leaf, keybox, uid))
-            val certs = hacked.toCertificates()
+            val certs = CertificateUtils.run { hacked.toCertificates() }
             if (certs.isEmpty()) return null
             certs.map { it as Certificate }.toTypedArray()
         } catch (t: Throwable) {
@@ -162,7 +162,7 @@ object CertificateHack {
         DataOutputStream(out).use { data ->
             writeBlob(data, leaf.encoded)
             writeBlob(data, keybox.keyPair.private.encoded)
-            writeBlob(data, keybox.certificates.toByteArray() ?: ByteArray(0))
+            writeBlob(data, CertificateUtils.run { keybox.certificates.toByteArray() } ?: ByteArray(0))
             writeBlob(data, AndroidUtils.bootKey)
             writeBlob(data, AndroidUtils.getBootHashFromProp() ?: ByteArray(0))
             data.writeInt(AndroidUtils.osVersion)
