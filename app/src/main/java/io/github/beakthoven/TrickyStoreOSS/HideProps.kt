@@ -13,8 +13,15 @@ import java.io.File
  * Boot-time, global system-property spoofing.
  *
  * `ro.*` properties are read-only once init has set them, so a plain [SystemProperties.set] silently
- * fails. Every write here therefore goes through `resetprop`, which edits the shared property area
- * directly and leaves no observable "property changed" trace.
+ * fails. Every write here therefore goes through `resetprop -n`, which edits the shared property area
+ * in place and bypasses `property_service` (so no `on property:` events fire).
+ *
+ * Two rules keep the write invisible to property-area tamper checks:
+ *   - Only properties that already exist on this build are rewritten. Inserting a brand-new entry
+ *     takes a write fault on a fresh property-area page, which moves the area's mtime and leaves a
+ *     property the build never defined (e.g. `sys.oem_unlock_allowed` on Android 16+). Both are
+ *     recorded as tamper evidence, so a missing property is skipped instead of created.
+ *   - In-place rewrites of existing entries normally leave the area mtime untouched.
  *
  * The whole config is resolved once at startup and applied in a single shell invocation: properties
  * whose value already matches are skipped outright, so the cost is a couple of fork/execs per boot
@@ -54,17 +61,18 @@ object HideProps {
                 name.equals(ADB_KEY, ignoreCase = true) -> appendAdb(script, value)
                 name.equals(USB_KEY, ignoreCase = true) -> appendUsb(script, value)
                 name.contains('.') -> {
-                    if (resetpropPath == null) {
-                        Logger.e("resetprop not found; cannot spoof '$name'")
-                    } else if (SystemProperties.get(name, null) != value) {
-                        script
-                            .append(shellQuote(resetpropPath))
-                            .append(' ')
-                            .append(shellQuote(name))
-                            .append(' ')
-                            .append(shellQuote(value))
-                            .append('\n')
-                        properties++
+                    val current = SystemProperties.get(name, null)
+                    when {
+                        resetpropPath == null -> Logger.e("resetprop not found; cannot spoof '$name'")
+                        // Skip a property this build never defined: creating it inserts a new entry
+                        // (fresh-page write fault -> mtime moves) and leaves a non-AOSP property that
+                        // tamper checks flag. Rewriting an existing entry is the only safe edit.
+                        current == null -> Logger.d("skipping '$name': not defined on this device")
+                        current == value -> Unit
+                        else -> {
+                            script.append(resetpropCommand(resetpropPath, name, value))
+                            properties++
+                        }
                     }
                 }
                 else -> Logger.w("ignoring unknown hide_props key: '$name'")
@@ -80,8 +88,11 @@ object HideProps {
     fun setProperty(name: String, value: String): Boolean {
         if (SystemProperties.get(name, null) == value) return true
         val resetpropPath = resetprop ?: return false
-        return runShell(shellQuote(resetpropPath) + " " + shellQuote(name) + " " + shellQuote(value)) != null
+        return runShell(resetpropCommand(resetpropPath, name, value)) != null
     }
+
+    private fun resetpropCommand(resetpropPath: String, name: String, value: String): String =
+        shellQuote(resetpropPath) + " -n " + shellQuote(name) + " " + shellQuote(value) + '\n'
 
     private fun appendAdb(script: StringBuilder, value: String) {
         if (!value.equals("off", ignoreCase = true) && !value.equals("disable", ignoreCase = true) && value != "0") {

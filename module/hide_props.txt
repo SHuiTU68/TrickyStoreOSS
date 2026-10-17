@@ -4,6 +4,9 @@
 #     device sees the spoofed value. This is applied at boot only; edit and reboot to change it.
 #   - Lines starting with `#` are comments and blank lines are ignored.
 #   - Properties whose value already matches are skipped, so nothing is written unnecessarily.
+#   - Properties this build never defined are never created: inserting a new property entry both
+#     moves the property-area mtime and leaves a non-AOSP property behind, which tamper checks flag
+#     (e.g. `sys.oem_unlock_allowed` is only defined up to Android 15). Such lines are no-ops.
 #   - Remove a line to stop spoofing that property (the original value returns on the next boot).
 #
 # Behaviour switches (keys without a dot):
