@@ -67,6 +67,24 @@ impl<'a> Cursor<'a> {
         let len = self.u32()? as usize;
         Ok(self.take(len)?.to_vec())
     }
+    /// Bytes left after the cursor. Used to reject an impossible element count before any
+    /// allocation happens.
+    pub fn remaining(&self) -> usize {
+        self.data.len().saturating_sub(self.pos)
+    }
+    /// Rejects a count that cannot possibly be backed by the remaining bytes.
+    ///
+    /// The count comes straight off the wire, so it must never reach `Vec::with_capacity`
+    /// unchecked: a hostile blob could otherwise ask for a 4 Gi-element vector, and a failed
+    /// allocation aborts the process (`panic = "abort"`), taking the daemon down with it.
+    fn bounded_count(&self, count: u32, width: usize) -> Result<usize> {
+        let count = count as usize;
+        let limit = self.remaining() / width;
+        if count > limit {
+            return Err(malformed("element count exceeds the remaining request"));
+        }
+        Ok(count)
+    }
 
     /// Reads a length-prefixed field, mapping the empty case to `None` so the caller can model an
     /// absent optional value on the wire.
@@ -76,7 +94,8 @@ impl<'a> Cursor<'a> {
     }
 
     pub fn i32_vec(&mut self) -> Result<Vec<i32>> {
-        let count = self.u32()? as usize;
+        let raw_count = self.u32()?;
+        let count = self.bounded_count(raw_count, 4)?;
         let mut values = Vec::with_capacity(count);
         for _ in 0..count {
             values.push(self.i32()?);
@@ -85,7 +104,8 @@ impl<'a> Cursor<'a> {
     }
 
     pub fn i64_vec(&mut self) -> Result<Vec<i64>> {
-        let count = self.u32()? as usize;
+        let raw_count = self.u32()?;
+        let count = self.bounded_count(raw_count, 8)?;
         let mut values = Vec::with_capacity(count);
         for _ in 0..count {
             values.push(self.i64()?);
@@ -101,4 +121,39 @@ impl<'a> Cursor<'a> {
 /// The shared error for a truncated or over-long request blob.
 pub fn malformed(msg: &str) -> CertGenError {
     CertGenError::InvalidParameter(format!("malformed request: {msg}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn i32_vec_rejects_an_impossible_count() {
+        // The count field claims 4 Gi entries while only four payload bytes follow.
+        let blob = [0xffu8, 0xff, 0xff, 0xff, 0, 0, 0, 1];
+        let mut cursor = Cursor::new(&blob);
+        assert!(cursor.i32_vec().is_err());
+    }
+
+    #[test]
+    fn i32_vec_accepts_a_supported_count() {
+        let blob = [0u8, 0, 0, 2, 0, 0, 0, 5, 0, 0, 0, 6];
+        let mut cursor = Cursor::new(&blob);
+        assert_eq!(cursor.i32_vec().ok(), Some(vec![5, 6]));
+        assert!(cursor.is_at_end());
+    }
+
+    #[test]
+    fn i64_vec_rejects_an_impossible_count() {
+        let blob = [0u8, 0, 0, 3, 0, 0, 0, 0, 0, 0, 0, 1];
+        let mut cursor = Cursor::new(&blob);
+        assert!(cursor.i64_vec().is_err());
+    }
+
+    #[test]
+    fn length_prefixed_rejects_a_truncated_field() {
+        let blob = [0u8, 0, 0, 8, 1, 2];
+        let mut cursor = Cursor::new(&blob);
+        assert!(cursor.length_prefixed().is_err());
+    }
 }

@@ -126,7 +126,7 @@ pub extern "system" fn Java_io_github_beakthoven_TrickyStoreOSS_NativeCertGen_na
     _this: JClass,
     request: jbyteArray,
 ) -> jbyteArray {
-    let result = read_byte_array(&mut env, request)
+    let result = read_byte_array(&mut env, request, "certificate chain request")
         .and_then(|bytes| chaingen::build_certificate_chain_blob(&bytes));
     byte_array_result(&mut env, result)
 }
@@ -144,7 +144,7 @@ pub extern "system" fn Java_io_github_beakthoven_TrickyStoreOSS_NativeCertGen_na
     _this: JClass,
     request: jbyteArray,
 ) -> jbyteArray {
-    let result = read_byte_array(&mut env, request)
+    let result = read_byte_array(&mut env, request, "attestation extension request")
         .and_then(|bytes| attreq::build_attestation_extension_blob(&bytes));
     byte_array_result(&mut env, result)
 }
@@ -160,7 +160,7 @@ pub extern "system" fn Java_io_github_beakthoven_TrickyStoreOSS_NativeCertGen_na
     _this: JClass,
     request: jbyteArray,
 ) -> jbyteArray {
-    let result = read_byte_array(&mut env, request)
+    let result = read_byte_array(&mut env, request, "hacked chain request")
         .and_then(|bytes| hack_leaf::hack_certificate_chain_blob(&bytes));
     byte_array_result(&mut env, result)
 }
@@ -176,7 +176,8 @@ pub extern "system" fn Java_io_github_beakthoven_TrickyStoreOSS_NativeCertGen_na
     _this: JClass,
     xml: JString,
 ) -> jbyteArray {
-    let result = read_string(&mut env, &xml).and_then(|text| keybox_xml::parse_keybox_blob(&text));
+    let result = read_string(&mut env, &xml, "keybox xml")
+        .and_then(|text| keybox_xml::parse_keybox_blob(&text));
     byte_array_result(&mut env, result)
 }
 
@@ -191,7 +192,8 @@ pub extern "system" fn Java_io_github_beakthoven_TrickyStoreOSS_NativeCertGen_na
     _this: JClass,
     pem: JString,
 ) -> jbyteArray {
-    let result = read_string(&mut env, &pem).and_then(|text| keybox_xml::decode_key_blob(&text));
+    let result = read_string(&mut env, &pem, "PEM key")
+        .and_then(|text| keybox_xml::decode_key_blob(&text));
     byte_array_result(&mut env, result)
 }
 
@@ -204,7 +206,8 @@ pub extern "system" fn Java_io_github_beakthoven_TrickyStoreOSS_NativeCertGen_na
     _this: JClass,
     pem: JString,
 ) -> jbyteArray {
-    let result = read_string(&mut env, &pem).and_then(|text| keybox_xml::decode_certificate(&text));
+    let result = read_string(&mut env, &pem, "PEM certificate")
+        .and_then(|text| keybox_xml::decode_certificate(&text));
     byte_array_result(&mut env, result)
 }
 
@@ -221,7 +224,7 @@ pub extern "system" fn Java_io_github_beakthoven_TrickyStoreOSS_NativeCertGen_na
     _this: JClass,
     request: jbyteArray,
 ) -> jbyteArray {
-    let result = read_byte_array(&mut env, request)
+    let result = read_byte_array(&mut env, request, "attestation parse request")
         .and_then(|bytes| attest_parse::parse_attestation_blob(&bytes));
     byte_array_result(&mut env, result)
 }
@@ -247,25 +250,63 @@ fn byte_array_result(env: &mut JNIEnv, result: Result<Vec<u8>>) -> jbyteArray {
     }
 }
 
+/// Upper bound for a request blob crossing the JNI boundary. A certificate-chain request carries a
+/// leaf key, a signing key, a full signing chain and an attestation extension, so it is the largest
+/// thing the Kotlin side ever hands over; 16 MiB is well above any real keybox and small enough that
+/// a corrupt or hostile caller cannot make the native heap grow without bound.
+const MAX_REQUEST_BYTES: usize = 16 * 1024 * 1024;
+/// Upper bound for a text argument (a keybox XML document or one PEM block). Real keyboxes are a
+/// few tens of kilobytes; 8 MiB still leaves room for a generously padded document while capping
+/// the UTF-8 copy that `get_string` performs.
+const MAX_TEXT_BYTES: usize = 8 * 1024 * 1024;
+/// Validates a JNI-reported length before any copy happens, so an oversized input is rejected while
+/// it is still just a length and never materialised as a native allocation.
+fn checked_length(len: i64, limit: usize, what: &str) -> Result<usize> {
+    if len < 0 {
+        return Err(CertGenError::InvalidParameter(format!(
+            "{what} reported a negative length ({len})"
+        )));
+    }
+    let len = len as usize;
+    if len > limit {
+        return Err(CertGenError::InvalidParameter(format!(
+            "{what} is {len} elements, the accepted limit is {limit}"
+        )));
+    }
+    Ok(len)
+}
 /// Copies a JNI byte array into a `Vec`, rejecting a null handle so the builder never sees a
-/// missing request.
-fn read_byte_array(env: &mut JNIEnv, array: jbyteArray) -> Result<Vec<u8>> {
+/// missing request. `what` names the buffer in the error, so a failure says which entry point was
+/// called with bad input.
+fn read_byte_array(env: &mut JNIEnv, array: jbyteArray, what: &str) -> Result<Vec<u8>> {
     if array.is_null() {
-        return Err(CertGenError::InvalidParameter("chain request was null".into()));
+        return Err(CertGenError::InvalidParameter(format!("{what} was null")));
     }
     let array = unsafe { JByteArray::from_raw(array) };
+    // Check the length before copying: the array is still owned by the Java heap here, so an
+    // oversized request costs the native side nothing.
+    let len = env
+        .get_array_length(&array)
+        .map_err(|e| CertGenError::InvalidParameter(format!("{what} length read failed: {e}")))?;
+    checked_length(len as i64, MAX_REQUEST_BYTES, what)?;
     env.convert_byte_array(&array)
-        .map_err(|e| CertGenError::InvalidParameter(format!("chain request read failed: {e}")))
+        .map_err(|e| CertGenError::InvalidParameter(format!("{what} read failed: {e}")))
 }
-
 /// Copies a JNI string into a `String`, rejecting a null handle so no parser sees a missing input.
-fn read_string(env: &mut JNIEnv, value: &JString) -> Result<String> {
+///
+/// `jni` 0.21 exposes no string-length accessor, so the UTF-16 length cannot be inspected before
+/// the copy. The cap is therefore enforced on the materialised UTF-8 bytes, which is the form the
+/// parsers actually walk; the input is still rejected before any XML/PEM decoding starts.
+fn read_string(env: &mut JNIEnv, value: &JString, what: &str) -> Result<String> {
     if value.is_null() {
-        return Err(CertGenError::InvalidParameter("string argument was null".into()));
+        return Err(CertGenError::InvalidParameter(format!("{what} was null")));
     }
-    env.get_string(value)
+    let text: String = env
+        .get_string(value)
         .map(String::from)
-        .map_err(|e| CertGenError::InvalidParameter(format!("string argument read failed: {e}")))
+        .map_err(|e| CertGenError::InvalidParameter(format!("{what} read failed: {e}")))?;
+    checked_length(text.len() as i64, MAX_TEXT_BYTES, what)?;
+    Ok(text)
 }
 
 // ring::error::Unspecified does not implement std::error::Error, so map each failure to a
@@ -282,4 +323,27 @@ fn self_test() -> std::result::Result<(), &'static str> {
         .verify(message, signature.as_ref())
         .map_err(|_| "ecdsa verify failed")?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn checked_length_accepts_the_limit() {
+        assert_eq!(
+            checked_length(MAX_REQUEST_BYTES as i64, MAX_REQUEST_BYTES, "blob").ok(),
+            Some(MAX_REQUEST_BYTES)
+        );
+    }
+
+    #[test]
+    fn checked_length_rejects_an_oversized_input() {
+        assert!(checked_length(MAX_REQUEST_BYTES as i64 + 1, MAX_REQUEST_BYTES, "blob").is_err());
+    }
+
+    #[test]
+    fn checked_length_rejects_a_negative_length() {
+        assert!(checked_length(-1, MAX_REQUEST_BYTES, "blob").is_err());
+    }
 }
