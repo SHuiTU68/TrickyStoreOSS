@@ -15,47 +15,35 @@ use crate::wire::{malformed, Cursor};
 /// Decodes the request blob, builds the chain, and returns the concatenated DER certificates
 /// (leaf first). An empty `attestation_ext_der` means the leaf carries no attestation extension.
 pub fn build_certificate_chain_blob(request: &[u8]) -> Result<Vec<u8>> {
-    let ChainBuildRequest {
-        algorithm,
-        cert_not_before,
-        cert_not_after,
-        append_signing_chain,
-        leaf_private_key_pkcs8,
-        attestation_ext_der,
-        signing_private_key_pkcs8,
-        signing_chain_der,
-        purposes,
-        cert_serial,
-        cert_subject,
-    } = ChainBuildRequest::decode(request)?;
-
-    let keybox = parse_keybox(&signing_chain_der, &signing_private_key_pkcs8)?;
-
+    // The request owns two copies of private key material, so it is kept alive (rather than
+    // destructured) until this function returns: its `Drop` wipes whatever the builder did not take,
+    // including on the early `?` returns above and below.
+    let mut request = ChainBuildRequest::decode(request)?;
+    let keybox = parse_keybox(&request.signing_chain_der, &request.signing_private_key_pkcs8)?;
     // The chain builder only reads the private key (it derives the SPKI itself), so the public
-    // half stays empty.
+    // half stays empty. `mem::take` moves the key out and leaves an empty vector behind, which
+    // `Drop` then finds nothing to wipe in.
     let leaf_key = GeneratedKeyPair {
-        private_key_pkcs8: leaf_private_key_pkcs8,
+        private_key_pkcs8: std::mem::take(&mut request.leaf_private_key_pkcs8),
         public_key_spki: Vec::new(),
     };
-
     let params = CertGenParams {
-        algorithm,
-        purposes,
-        cert_serial,
-        cert_subject,
-        cert_not_before,
-        cert_not_after,
+        algorithm: request.algorithm,
+        purposes: std::mem::take(&mut request.purposes),
+        cert_serial: request.cert_serial.take(),
+        cert_subject: request.cert_subject.take(),
+        cert_not_before: request.cert_not_before,
+        cert_not_after: request.cert_not_after,
         ..Default::default()
     };
-
-    let attestation = if attestation_ext_der.is_empty() {
+    let attestation = if request.attestation_ext_der.is_empty() {
         None
     } else {
-        Some(attestation_ext_der.as_slice())
+        Some(request.attestation_ext_der.as_slice())
     };
 
     let mut chain = build_certificate_chain(&leaf_key, attestation, &keybox, &params)?;
-    if !append_signing_chain {
+    if !request.append_signing_chain {
         // The designated-attestation-key path returns only the freshly minted leaf.
         chain.truncate(1);
     }
@@ -86,6 +74,19 @@ struct ChainBuildRequest {
     purposes: Vec<i32>,
     cert_serial: Option<Vec<u8>>,
     cert_subject: Option<Vec<u8>>,
+}
+
+impl Drop for ChainBuildRequest {
+    /// Wipes the two private keys the request blob carried.
+    ///
+    /// The blob arrives from Kotlin and holds both the leaf key and the keybox signing key, so the
+    /// decoded copies would otherwise outlive the call in freed heap memory. Wiping here covers the
+    /// success path and every early `?` return alike.
+    fn drop(&mut self) {
+        use zeroize::Zeroize;
+        self.leaf_private_key_pkcs8.zeroize();
+        self.signing_private_key_pkcs8.zeroize();
+    }
 }
 
 impl ChainBuildRequest {

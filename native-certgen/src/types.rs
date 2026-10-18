@@ -188,3 +188,16 @@ pub struct GeneratedKeyPair {
     pub private_key_pkcs8: Vec<u8>,
     pub public_key_spki: Vec<u8>,
 }
+
+impl Drop for GeneratedKeyPair {
+    /// Wipes the private key half before the allocation is freed.
+    ///
+    /// The PKCS#8 blob is the only copy of a key that never existed anywhere else, and the release
+    /// profile builds with `panic = "abort"`, so a dropped-but-unwiped buffer would simply stay in
+    /// freed heap memory until something reuses it. Zeroing here bounds that exposure to the lifetime
+    /// of the value; [`zeroize`] uses a volatile write so the compiler cannot optimise the wipe away.
+    fn drop(&mut self) {
+        use zeroize::Zeroize;
+        self.private_key_pkcs8.zeroize();
+    }
+}

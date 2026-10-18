@@ -405,6 +405,18 @@ struct HackRequest {
     boot_patch_override: Option<i32>,
 }
 
+impl Drop for HackRequest {
+    /// Wipes the signing key that arrived in the request blob.
+    ///
+    /// Same reasoning as `ChainBuildRequest`: the decoded copy is a private key that would otherwise
+    /// stay readable in freed heap memory, and the release profile aborts on panic instead of
+    /// unwinding, so nothing else can be relied on to clean it up.
+    fn drop(&mut self) {
+        use zeroize::Zeroize;
+        self.signing_private_key_pkcs8.zeroize();
+    }
+}
+
 impl HackRequest {
     /// Decodes the blob, rejecting a truncated field or trailing bytes so a malformed request can
     /// never be partially interpreted.

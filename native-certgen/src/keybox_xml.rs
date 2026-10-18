@@ -47,6 +47,17 @@ pub struct NativeKeybox {
     pub certificates: Vec<Vec<u8>>,
 }
 
+impl Drop for NativeKeybox {
+    /// Wipes the decoded private key when the entry is discarded.
+    ///
+    /// `parse_keybox_blob` copies the key into the response blob and then drops the entries, so this
+    /// is the moment the intermediate DER copy would otherwise be left behind in the heap.
+    fn drop(&mut self) {
+        use zeroize::Zeroize;
+        self.private_key_pkcs8.zeroize();
+    }
+}
+
 /// Parses a keybox document into one entry per `<Key>`, in document order.
 pub fn parse_keybox_xml(xml: &str) -> Result<Vec<NativeKeybox>> {
     let events = tokenize(xml)?;
@@ -423,7 +434,11 @@ impl<'a> Walker<'a> {
             }
         }
 
-        if expected.is_some_and(|expected| expected != (certificates.len() - first) as u32) {
+        // `first` is `certificates.len()` sampled before this chain block, so the subtraction is safe
+        // by construction; `saturating_sub` keeps it total even if that invariant is ever broken.
+        if expected.is_some_and(|expected| {
+            expected != (certificates.len().saturating_sub(first)) as u32
+        }) {
             return Err(keybox_error("incomplete certificate chain"));
         }
         Ok(())
