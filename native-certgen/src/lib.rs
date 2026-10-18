@@ -6,6 +6,9 @@
 //! error rather than a silent switch to another provider.
 
 #![deny(clippy::unwrap_used, clippy::expect_used)]
+// Every `unsafe` block has to justify its invariants; there is exactly one, in
+// `read_byte_array`, and the reason it is sound is written above it.
+#![deny(clippy::undocumented_unsafe_blocks)]
 
 mod error;
 // Parses the keybox ahead of the certbuilder that consumes it.
@@ -40,6 +43,7 @@ use ring::signature::{
     EcdsaKeyPair, KeyPair, UnparsedPublicKey, ECDSA_P256_SHA256_ASN1, ECDSA_P256_SHA256_ASN1_SIGNING,
 };
 
+use zeroize::Zeroizing;
 use crate::error::{CertGenError, Result};
 use crate::types::{Algorithm, EcCurve, GeneratedKeyPair};
 
@@ -102,17 +106,25 @@ fn generate_key_pair_blob(
     };
     let key_pair =
         keygen::generate_key_pair(algorithm, key_size as u32, ec_curve, rsa_public_exponent as u64)?;
-    Ok(encode_key_pair(&key_pair))
+    Ok(encode_key_pair(&key_pair)?)
 }
 
-fn encode_key_pair(key_pair: &GeneratedKeyPair) -> Vec<u8> {
-    let mut blob =
-        Vec::with_capacity(8 + key_pair.private_key_pkcs8.len() + key_pair.public_key_spki.len());
+/// Encodes a generated key pair as the blob Kotlin decodes into a `KeyPair`:
+/// `[u32 pkcs8Len][PKCS#8][u32 spkiLen][SPKI]`, both lengths big-endian.
+fn encode_key_pair(key_pair: &GeneratedKeyPair) -> Result<Vec<u8>> {
+    // Both lengths are bounded by `MAX_REQUEST_BYTES` on the way out, so this cannot overflow in
+    // practice; the checked arithmetic keeps the encoder honest about that and reports a bogus
+    // length instead of wrapping (a wrapped capacity would then be too small and silently truncate).
+    let capacity = 8usize
+        .checked_add(key_pair.private_key_pkcs8.len())
+        .and_then(|size| size.checked_add(key_pair.public_key_spki.len()))
+        .ok_or_else(|| CertGenError::SerializationFailed("key pair blob length overflows".into()))?;
+    let mut blob = Vec::with_capacity(capacity);
     blob.extend_from_slice(&(key_pair.private_key_pkcs8.len() as u32).to_be_bytes());
     blob.extend_from_slice(&key_pair.private_key_pkcs8);
     blob.extend_from_slice(&(key_pair.public_key_spki.len() as u32).to_be_bytes());
     blob.extend_from_slice(&key_pair.public_key_spki);
-    blob
+    Ok(blob)
 }
 
 /// Builds an attestation certificate chain natively from a packed request blob (see
@@ -275,13 +287,24 @@ fn checked_length(len: i64, limit: usize, what: &str) -> Result<usize> {
     }
     Ok(len)
 }
-/// Copies a JNI byte array into a `Vec`, rejecting a null handle so the builder never sees a
-/// missing request. `what` names the buffer in the error, so a failure says which entry point was
-/// called with bad input.
-fn read_byte_array(env: &mut JNIEnv, array: jbyteArray, what: &str) -> Result<Vec<u8>> {
+/// Copies a JNI byte array into a [`Zeroizing<Vec<u8>>`], rejecting a null handle so the builder
+/// never sees a missing request. `what` names the buffer in the error, so a failure says which
+/// entry point was called with bad input.
+///
+/// The buffer is zeroized on drop because every request blob can carry private key material (the
+/// chain and hack requests embed PKCS#8 keys). The decode step copies what it needs into its own
+/// `Zeroize`-implementing struct, but the raw transport buffer would otherwise survive in freed
+/// heap memory after the call.
+fn read_byte_array(env: &mut JNIEnv, array: jbyteArray, what: &str) -> Result<Zeroizing<Vec<u8>>> {
     if array.is_null() {
         return Err(CertGenError::InvalidParameter(format!("{what} was null")));
     }
+    // SAFETY: a null handle was rejected above, so `array` points at a live `jbyteArray` that is
+    // owned by the calling Java frame for the whole call. `JByteArray` is a transparent wrapper
+    // around the raw pointer with no destructor (see `jni 0.21`: only `AutoLocal` issues
+    // `DeleteLocalRef`), so `from_raw` cannot double-free, and the returned value never escapes
+    // this function. Local references created by the caller are released by the VM when the JNI
+    // call returns; no loop here accumulates them.
     let array = unsafe { JByteArray::from_raw(array) };
     // Check the length before copying: the array is still owned by the Java heap here, so an
     // oversized request costs the native side nothing.
@@ -290,14 +313,19 @@ fn read_byte_array(env: &mut JNIEnv, array: jbyteArray, what: &str) -> Result<Ve
         .map_err(|e| CertGenError::InvalidParameter(format!("{what} length read failed: {e}")))?;
     checked_length(len as i64, MAX_REQUEST_BYTES, what)?;
     env.convert_byte_array(&array)
+        .map(Zeroizing::new)
         .map_err(|e| CertGenError::InvalidParameter(format!("{what} read failed: {e}")))
 }
-/// Copies a JNI string into a `String`, rejecting a null handle so no parser sees a missing input.
+/// Copies a JNI string into a [`Zeroizing<String>`], rejecting a null handle so no parser sees a
+/// missing input.
 ///
 /// `jni` 0.21 exposes no string-length accessor, so the UTF-16 length cannot be inspected before
 /// the copy. The cap is therefore enforced on the materialised UTF-8 bytes, which is the form the
 /// parsers actually walk; the input is still rejected before any XML/PEM decoding starts.
-fn read_string(env: &mut JNIEnv, value: &JString, what: &str) -> Result<String> {
+///
+/// The string is zeroized on drop: a keybox document or a PEM private key block carries the key
+/// itself, and the decoded copies are wiped by their own `Drop` implementations.
+fn read_string(env: &mut JNIEnv, value: &JString, what: &str) -> Result<Zeroizing<String>> {
     if value.is_null() {
         return Err(CertGenError::InvalidParameter(format!("{what} was null")));
     }
@@ -306,7 +334,7 @@ fn read_string(env: &mut JNIEnv, value: &JString, what: &str) -> Result<String> 
         .map(String::from)
         .map_err(|e| CertGenError::InvalidParameter(format!("{what} read failed: {e}")))?;
     checked_length(text.len() as i64, MAX_TEXT_BYTES, what)?;
-    Ok(text)
+    Ok(Zeroizing::new(text))
 }
 
 // ring::error::Unspecified does not implement std::error::Error, so map each failure to a

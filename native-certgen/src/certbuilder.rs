@@ -559,9 +559,10 @@ fn encode_der_integer(value: &[u8]) -> Vec<u8> {
         return encode_der_tag_length_value(0x02, &[0x00]);
     }
 
-    // Strip leading zeros (but keep at least one byte)
+    // Strip leading zeros (but keep at least one byte). `saturating_sub` keeps the bound exact for
+    // the empty-input case too, so the loop condition can never underflow.
     let mut start = 0;
-    while start < value.len() - 1 && value[start] == 0 {
+    while start < value.len().saturating_sub(1) && value[start] == 0 {
         start += 1;
     }
     let trimmed = &value[start..];
@@ -627,8 +628,10 @@ fn encode_oid_subidentifier(buf: &mut Vec<u8>, mut value: u64) {
     }
     bytes.reverse();
 
-    // Set the high bit on all but the last byte
-    for i in 0..bytes.len() - 1 {
+    // Set the high bit on all but the last byte. `saturating_sub` makes an empty `bytes` (which
+    // means `value == 0`, already handled by the caller) yield an empty range instead of a
+    // subtract-with-overflow panic.
+    for i in 0..bytes.len().saturating_sub(1) {
         bytes[i] |= 0x80;
     }
 
