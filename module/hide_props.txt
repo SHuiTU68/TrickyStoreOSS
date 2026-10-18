@@ -17,6 +17,7 @@
 # Behaviour switches (keys without a dot):
 #   adb=off    disable USB debugging at boot (Settings.Global.adb_enabled = 0)
 #   usb=mtp    rewrite the USB configuration properties without notifying property_service
+#   fp=on      rebuild every `ro.*.build.fingerprint` from the properties set in this file
 
 # --- Verified boot / bootloader lock state ---
 ro.boot.verifiedbootstate=green
@@ -41,6 +42,17 @@ ro.debuggable=0
 ro.build.type=user
 ro.build.tags=release-keys
 ro.boot.selinux=enforcing
+
+# --- Fingerprint chain ---
+# A fingerprint is structured, not free-form: `brand/product/device:release/id/incremental:type/tags`.
+# Every segment is cross-checkable against the `ro.product.<partition>.*` and `ro.build.*` properties
+# it claims to describe, so hard-coding some other device's string would *create* the mismatch it is
+# supposed to hide. `fp=on` therefore composes the value at boot from the properties this file sets,
+# which makes the chain self-consistent by construction, and rewrites only the fingerprints this build
+# already defines (`ro.build`, `ro.system.build`, `ro.system_ext.build`, `ro.vendor.build`,
+# `ro.odm.build`, `ro.product.build`, `ro.bootimage.build`). When the composition matches what the
+# device already reports nothing is written, so this stays a no-op unless the identity above changes.
+fp=on
 
 # --- Boot hardening ---
 adb=off

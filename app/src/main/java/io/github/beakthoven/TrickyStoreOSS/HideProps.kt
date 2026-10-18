@@ -39,9 +39,25 @@ object HideProps {
     // Keys without a dot are behaviour switches, not properties.
     private const val ADB_KEY = "adb"
     private const val USB_KEY = "usb"
+    private const val FINGERPRINT_KEY = "fp"
     private const val SHELL = "/system/bin/sh"
     private const val SETTINGS = "/system/bin/settings"
     private val USB_PROPERTIES = listOf("sys.usb.config", "persist.sys.usb.config", "sys.usb.state")
+
+    /**
+     * Every build fingerprint a device can expose, paired with the property prefix that holds that
+     * partition's own product identity. `ro.build.fingerprint` belongs to the system partition.
+     */
+    private val FINGERPRINT_PROPERTIES =
+        listOf(
+            "ro.build.fingerprint" to "ro.product",
+            "ro.system.build.fingerprint" to "ro.product.system",
+            "ro.system_ext.build.fingerprint" to "ro.product.system_ext",
+            "ro.vendor.build.fingerprint" to "ro.product.vendor",
+            "ro.odm.build.fingerprint" to "ro.product.odm",
+            "ro.product.build.fingerprint" to "ro.product.product",
+            "ro.bootimage.build.fingerprint" to "ro.product.bootimage",
+        )
 
     /** One `hide_props.txt` line: a non-null [value] assigns, a null [value] removes the key. */
     private data class HideEntry(val name: String, val value: String?)
@@ -63,6 +79,10 @@ object HideProps {
 
         val resetpropPath = resetprop
         val script = StringBuilder()
+        // The assignments the config is about to make, so the fingerprint chain can be composed from
+        // the values the device will report *after* this run rather than the ones it reports now.
+        val configured = HashMap<String, String>()
+        var spoofFingerprint = false
         var properties = 0
         var removals = 0
         for (entry in entries) {
@@ -75,6 +95,9 @@ object HideProps {
             when {
                 name.equals(ADB_KEY, ignoreCase = true) -> appendAdb(script, value)
                 name.equals(USB_KEY, ignoreCase = true) -> appendUsb(script, value, resetpropPath)
+                name.equals(FINGERPRINT_KEY, ignoreCase = true) -> {
+                    spoofFingerprint = parseSwitch(value, FINGERPRINT_KEY)
+                }
                 name.contains('.') -> {
                     val current = SystemProperties.get(name, null)
                     when {
@@ -83,15 +106,25 @@ object HideProps {
                         // (fresh-page write fault -> mtime moves) and leaves a non-AOSP property that
                         // tamper checks flag. Rewriting an existing entry is the only safe edit.
                         current == null -> Logger.d("skipping '$name': not defined on this device")
-                        current == value -> Unit
                         else -> {
-                            script.append(resetpropCommand(resetpropPath, name, value))
-                            properties++
+                            // Record only what this build can actually report: a skipped assignment
+                            // must not leak into the fingerprint chain, or the composed fingerprint
+                            // would advertise an identity the device never had.
+                            configured[name] = value
+                            if (current != value) {
+                                script.append(resetpropCommand(resetpropPath, name, value))
+                                properties++
+                            }
                         }
                     }
                 }
                 else -> Logger.w("ignoring unknown hide_props key: '$name'")
             }
+        }
+        // Composed last: every fingerprint is derived from the product identity this run is about to
+        // install, so the chain describes the device the rest of the config just built.
+        if (spoofFingerprint && resetpropPath != null) {
+            properties += appendFingerprints(script, configured, resetpropPath)
         }
         if (script.isNotEmpty()) {
             Logger.i("Applying boot property spoofing ($properties properties changed, $removals removed)")
@@ -164,6 +197,84 @@ object HideProps {
         script.append(shellQuote(resetprop)).append(" --delete ").append(shellQuote(name)).append('\n')
         return 1
     }
+
+    /**
+     * Rebuilds every `ro.*.build.fingerprint` from the device's own product identity.
+     *
+     * A fingerprint is not a free-form string: it is
+     * `brand/product/device:release/id/incremental:type/tags`, and a detector can cross-check each
+     * segment against the `ro.product.*` properties it claims to describe. Hard-coding some other
+     * device's fingerprint therefore *creates* the inconsistency it was meant to hide, so the value
+     * is composed here instead — from the very properties this run just installed. The result is by
+     * construction self-consistent, and it only differs from what the build shipped when the config
+     * actually changed the product identity.
+     *
+     * @return the number of fingerprint properties rewritten.
+     */
+    private fun appendFingerprints(
+        script: StringBuilder,
+        configured: Map<String, String>,
+        resetpropPath: String,
+    ): Int {
+        // The build identity half of the fingerprint is shared by every partition.
+        val release = effective(configured, "ro.build.version.release")
+        val id = effective(configured, "ro.build.id")
+        val incremental = effective(configured, "ro.build.version.incremental")
+        val type = effective(configured, "ro.build.type")
+        val tags = effective(configured, "ro.build.tags")
+        if (release == null || id == null || incremental == null || type == null || tags == null) {
+            Logger.w("skipping fingerprint chain: the build identity properties are incomplete")
+            return 0
+        }
+
+        var rewritten = 0
+        for ((fingerprintProperty, productPrefix) in FINGERPRINT_PROPERTIES) {
+            val brand = effective(configured, "$productPrefix.brand")
+            val product = effective(configured, "$productPrefix.name")
+            val device = effective(configured, "$productPrefix.device")
+            if (brand == null || product == null || device == null) {
+                Logger.d("skipping '$fingerprintProperty': '$productPrefix.*' is incomplete")
+                continue
+            }
+            val current = SystemProperties.get(fingerprintProperty, null)
+            val composed = "$brand/$product/$device:$release/$id/$incremental:$type/$tags"
+            when {
+                // Same rule as every other key in this file: never create an entry the build did not
+                // define, and never rewrite one that already holds the right value.
+                current == null ->
+                    Logger.d("skipping '$fingerprintProperty': not defined on this device")
+                current == composed -> Unit
+                else -> {
+                    script.append(resetpropCommand(resetpropPath, fingerprintProperty, composed))
+                    rewritten++
+                }
+            }
+        }
+        return rewritten
+    }
+
+    /**
+     * Reads the value a property will hold after this run: a pending assignment from the config
+     * wins over the live value, because the live one is what is being replaced.
+     */
+    private fun effective(
+        configured: Map<String, String>,
+        name: String,
+    ): String? = configured[name] ?: SystemProperties.get(name, null)?.takeIf { it.isNotEmpty() }
+
+    /** Parses the on/off style behaviour switches (`adb`, `usb`, `fp`). */
+    private fun parseSwitch(
+        value: String,
+        key: String,
+    ): Boolean =
+        when (value.lowercase()) {
+            "on", "true", "1", "yes", "enable", "enabled" -> true
+            "off", "false", "0", "no", "disable", "disabled" -> false
+            else -> {
+                Logger.w("hide_props: unsupported $key value '$value' (expected 'on' or 'off')")
+                false
+            }
+        }
 
     private fun parseConfig(file: File): List<HideEntry> {
         if (!file.exists()) return emptyList()
