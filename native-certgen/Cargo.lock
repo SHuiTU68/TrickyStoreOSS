@@ -61,6 +61,7 @@ dependencies = [
  "spki",
  "time",
  "x509-cert",
+ "zeroize",
 ]
 
 [[package]]
