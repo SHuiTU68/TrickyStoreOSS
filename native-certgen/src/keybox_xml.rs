@@ -13,10 +13,9 @@
 use crate::attestation::{enc_integer, enc_octet_string, enc_sequence};
 use crate::certbuilder::encode_der_oid;
 use crate::error::{CertGenError, Result};
-use crate::tlv::{iter_tlvs, read_tlv, TAG_OID, TAG_SEQUENCE};
+use crate::tlv::{iter_tlvs, read_tlv, TAG_BIT_STRING, TAG_INTEGER, TAG_OID, TAG_SEQUENCE};
 
 use der::Decode;
-use x509_cert::Certificate;
 
 /// `id-ecPublicKey`, the PKCS#8 algorithm OID for an EC key.
 const OID_EC_PUBLIC_KEY: &[u64] = &[1, 2, 840, 10045, 2, 1];
@@ -25,6 +24,18 @@ const OID_RSA_ENCRYPTION: &[u64] = &[1, 2, 840, 113549, 1, 1, 1];
 
 /// The DER tag of a context-0 constructed element (`[0]`), used to spot the SEC1 curve parameters.
 const CONTEXT_0_CONSTRUCTED: u8 = 0xA0;
+
+/// `id-ecPublicKey` as an OID, parsed once at compile time instead of on every key.
+const EC_ALGORITHM_OID: const_oid::ObjectIdentifier = match const_oid::ObjectIdentifier::new("1.2.840.10045.2.1") {
+    Ok(oid) => oid,
+    Err(_) => panic!("id-ecPublicKey is a valid OID"),
+};
+
+/// `rsaEncryption` as an OID, parsed once at compile time instead of on every key.
+const RSA_ALGORITHM_OID: const_oid::ObjectIdentifier = match const_oid::ObjectIdentifier::new("1.2.840.113549.1.1.1") {
+    Ok(oid) => oid,
+    Err(_) => panic!("rsaEncryption is a valid OID"),
+};
 
 /// One parsed keybox entry: the signing key plus the certificate chain it was issued with.
 pub struct NativeKeybox {
@@ -455,9 +466,7 @@ fn parse_count(text: &str, kind: &str) -> Result<u32> {
 
 /// Decodes one `<Key>`'s PEM material into its native form.
 fn build_entry(private_key_text: &str, certificate_texts: &[String]) -> Result<NativeKeybox> {
-    let (label, der) = pem_blocks(private_key_text)?
-        .into_iter()
-        .next()
+    let (label, der) = first_pem_block(private_key_text)?
         .ok_or_else(|| keybox_error("private key element has no PEM block"))?;
     let private_key_pkcs8 = normalize_private_key(&label, &der)?;
     let algorithm = key_algorithm(&private_key_pkcs8)?;
@@ -470,44 +479,69 @@ fn build_entry(private_key_text: &str, certificate_texts: &[String]) -> Result<N
     Ok(NativeKeybox { algorithm, private_key_pkcs8, certificates })
 }
 
-/// Decodes every `-----BEGIN <label>-----` block in the text. The keybox material carries one key
-/// block per element and one certificate block per `<Certificate>`, so only the first is used.
-fn pem_blocks(text: &str) -> Result<Vec<(String, Vec<u8>)>> {
-    let lines: Vec<&str> = text.lines().collect();
-    let mut blocks = Vec::new();
-    let mut index = 0usize;
-    while index < lines.len() {
-        let line = lines[index].trim();
-        index += 1;
-        let Some(label) = line.strip_prefix("-----BEGIN ").and_then(|rest| rest.strip_suffix("-----"))
-        else {
-            continue;
-        };
+/// Decodes the first `-----BEGIN <label>-----` block in the text.
+///
+/// Every caller wants exactly one block — the keybox carries one key block per element and one
+/// certificate block per `<Certificate>` — so the scan stops at the first one. The body is decoded
+/// straight out of the source string: neither a line vector nor a joined-up copy of the base64 text
+/// is built, and [`base64_decode`] skips the line breaks on its own.
+fn first_pem_block(text: &str) -> Result<Option<(&str, Vec<u8>)>> {
+    const BEGIN: &str = "-----BEGIN ";
+    const DASHES: &str = "-----";
 
-        let end_marker = format!("-----END {label}-----");
-        let mut body = String::new();
-        let mut closed = false;
-        while index < lines.len() {
-            let body_line = lines[index].trim();
-            index += 1;
-            if body_line == end_marker {
-                closed = true;
-                break;
-            }
-            if body_line.starts_with("-----") {
-                return Err(keybox_error("unterminated PEM block"));
-            }
-            body.push_str(body_line);
-        }
-        if !closed {
-            return Err(keybox_error("unterminated PEM block"));
-        }
-        blocks.push((label.to_string(), base64_decode(&body)?));
+    let Some(open) = text.find(BEGIN) else { return Ok(None) };
+    let header_start = open + BEGIN.len();
+    let Some(label_len) = text[header_start..].find(DASHES) else {
+        return Err(keybox_error("unterminated PEM block"));
+    };
+    let label = &text[header_start..header_start + label_len];
+    let body_start = header_start + label_len + DASHES.len();
+    // A label spanning lines means the opening marker was never terminated on its own line.
+    if label.is_empty() || label.contains('\n') {
+        return Err(keybox_error("unterminated PEM block"));
     }
-    Ok(blocks)
+
+    let body_and_end = &text[body_start..];
+    let Some(end) = body_and_end.find("-----END ") else {
+        return Err(keybox_error("unterminated PEM block"));
+    };
+    let closing_label = &body_and_end[end + "-----END ".len()..];
+    let Some(closing_len) = closing_label.find(DASHES) else {
+        return Err(keybox_error("unterminated PEM block"));
+    };
+    if closing_label[..closing_len].trim() != label {
+        return Err(keybox_error("unterminated PEM block"));
+    }
+
+    let body = &body_and_end[..end];
+    // A second marker inside the body is an unterminated block, not base64 data.
+    if body.contains(DASHES) {
+        return Err(keybox_error("unterminated PEM block"));
+    }
+    Ok(Some((label, base64_decode(body)?)))
 }
 
+/// The base64 alphabet, in six-bit value order. Encoding is only needed by the tests, but the decode
+/// table is built from the same string so the two can never disagree.
 const BASE64_ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+/// Value of a byte that is not base64 data. Every byte is looked up in [`BASE64_DECODE`] once, so
+/// decoding is one indexed read per character instead of a scan of the 64-character alphabet.
+const BASE64_INVALID: u8 = 0xFF;
+
+/// Builds the decode table: `0..=63` are the six-bit values, `0xFF` marks anything that is not part
+/// of the alphabet. Whitespace and `=` are handled before the lookup, so they stay invalid here.
+const fn base64_decode_table() -> [u8; 256] {
+    let mut table = [BASE64_INVALID; 256];
+    let mut index = 0usize;
+    while index < BASE64_ALPHABET.len() {
+        table[BASE64_ALPHABET[index] as usize] = index as u8;
+        index += 1;
+    }
+    table
+}
+
+const BASE64_DECODE: [u8; 256] = base64_decode_table();
 
 /// Decodes standard base64, ignoring line breaks and any other whitespace.
 fn base64_decode(input: &str) -> Result<Vec<u8>> {
@@ -516,22 +550,28 @@ fn base64_decode(input: &str) -> Result<Vec<u8>> {
     let mut bits: u32 = 0;
     let mut padded = false;
 
-    for ch in input.chars() {
-        if ch.is_ascii_whitespace() {
+    for (index, byte) in input.as_bytes().iter().copied().enumerate() {
+        if byte.is_ascii_whitespace() {
             continue;
         }
-        if ch == '=' {
+        if byte == b'=' {
             padded = true;
             continue;
         }
         if padded {
             return Err(keybox_error("base64 data after padding"));
         }
-        let value = BASE64_ALPHABET
-            .iter()
-            .position(|candidate| *candidate as char == ch)
-            .ok_or_else(|| keybox_error(format!("invalid base64 character {ch:?}")))? as u32;
-        accumulator = (accumulator << 6) | value;
+        let value = BASE64_DECODE[byte as usize];
+        if value == BASE64_INVALID {
+            // Report the character as it appears in the source, not as a byte.
+            let ch = if byte.is_ascii() {
+                char::from(byte)
+            } else {
+                input[index..].chars().next().unwrap_or(char::REPLACEMENT_CHARACTER)
+            };
+            return Err(keybox_error(format!("invalid base64 character {ch:?}")));
+        }
+        accumulator = (accumulator << 6) | value as u32;
         bits += 6;
         if bits >= 8 {
             bits -= 8;
@@ -613,16 +653,10 @@ fn wrap_pkcs1_rsa_key(pkcs1: &[u8]) -> Result<Vec<u8>> {
 fn key_algorithm(pkcs8_der: &[u8]) -> Result<String> {
     let info = pkcs8::PrivateKeyInfo::from_der(pkcs8_der)
         .map_err(|e| keybox_error(format!("PKCS#8 parse: {e}")))?;
-    let ec_oid: const_oid::ObjectIdentifier = "1.2.840.10045.2.1"
-        .parse()
-        .map_err(|_| keybox_error("EC algorithm OID parse"))?;
-    let rsa_oid: const_oid::ObjectIdentifier = "1.2.840.113549.1.1.1"
-        .parse()
-        .map_err(|_| keybox_error("RSA algorithm OID parse"))?;
 
-    if info.algorithm.oid == ec_oid {
+    if info.algorithm.oid == EC_ALGORITHM_OID {
         Ok("EC".to_string())
-    } else if info.algorithm.oid == rsa_oid {
+    } else if info.algorithm.oid == RSA_ALGORITHM_OID {
         Ok("RSA".to_string())
     } else {
         Err(keybox_error(format!("unsupported private key algorithm: {}", info.algorithm.oid)))
@@ -633,9 +667,7 @@ fn key_algorithm(pkcs8_der: &[u8]) -> Result<String> {
 /// `[u32 algorithm][u32 PKCS#8 key]`, all lengths big-endian. Kotlin rebuilds the `KeyPair` from
 /// the algorithm name and the DER.
 pub fn decode_key_blob(pem: &str) -> Result<Vec<u8>> {
-    let (label, der) = pem_blocks(pem)?
-        .into_iter()
-        .next()
+    let (label, der) = first_pem_block(pem)?
         .ok_or_else(|| keybox_error("private key element has no PEM block"))?;
     let pkcs8 = normalize_private_key(&label, &der)?;
     let algorithm = key_algorithm(&pkcs8)?;
@@ -646,17 +678,80 @@ pub fn decode_key_blob(pem: &str) -> Result<Vec<u8>> {
     Ok(blob)
 }
 
-/// Decodes one certificate PEM block and checks it really is a DER certificate, matching the
-/// validation the Kotlin side gets from `CertificateFactory`.
+/// Decodes one certificate PEM block and checks it really is a DER certificate.
+///
+/// The full `Certificate::from_der` decode is deliberately avoided: the Kotlin side feeds every
+/// certificate to `CertificateFactory.generateCertificate`, which is the authoritative parse and
+/// rejects anything malformed (`decodeNativeKeyboxes` hands the same bytes over unchanged). A second
+/// complete decode here only repeats that work, and it dominates the keybox load: the ASN.1 walk
+/// allocates a `Vec` for every nested name, extension and integer in the chain.
+///
+/// What is checked instead is the framing, which is what can be verified without allocating: the
+/// outer `Certificate` sequence and its three fields, the signature algorithm OID, the bit-string
+/// signature, and the mandatory leading fields of `tbsCertificate`. Truncated or mistyped input is
+/// still rejected before it reaches Java; the fine details are left to the parser that has to accept
+/// the certificate anyway.
+fn validate_certificate_der(der: &[u8]) -> Result<()> {
+    let (tag, content, total) = read_tlv(der)?;
+    if tag != TAG_SEQUENCE || total != der.len() {
+        return Err(keybox_error("certificate is not a DER sequence"));
+    }
+
+    let mut offset = 0usize;
+    let (tbs_tag, tbs_content) = next_tlv(content, &mut offset)?;
+    if tbs_tag != TAG_SEQUENCE {
+        return Err(keybox_error("certificate tbsCertificate is not a sequence"));
+    }
+    let (algorithm_tag, algorithm_content) = next_tlv(content, &mut offset)?;
+    if algorithm_tag != TAG_SEQUENCE {
+        return Err(keybox_error("certificate signatureAlgorithm is not a sequence"));
+    }
+    let (signature_tag, signature_content) = next_tlv(content, &mut offset)?;
+    if offset != content.len() {
+        return Err(keybox_error("certificate has trailing fields"));
+    }
+    if signature_tag != TAG_BIT_STRING || signature_content.len() < 2 || signature_content[0] != 0 {
+        return Err(keybox_error("certificate signature is not an octet-aligned bit string"));
+    }
+    let (oid_tag, _) = next_tlv(algorithm_content, &mut 0usize)?;
+    if oid_tag != TAG_OID {
+        return Err(keybox_error("certificate signature algorithm has no OID"));
+    }
+
+    // tbsCertificate: [0] version? then serialNumber, signature, issuer, validity, subject and
+    // subjectPublicKeyInfo, all of them mandatory.
+    let mut offset = 0usize;
+    if tbs_content.first() == Some(&CONTEXT_0_CONSTRUCTED) {
+        next_tlv(tbs_content, &mut offset)?;
+    }
+    for expected in [TAG_INTEGER, TAG_SEQUENCE, TAG_SEQUENCE, TAG_SEQUENCE, TAG_SEQUENCE, TAG_SEQUENCE]
+    {
+        let (tag, _) = next_tlv(tbs_content, &mut offset)?;
+        if tag != expected {
+            return Err(keybox_error("certificate tbsCertificate is malformed"));
+        }
+    }
+    Ok(())
+}
+
+/// Reads the next TLV of `data` and advances `offset` past it.
+fn next_tlv<'a>(data: &'a [u8], offset: &mut usize) -> Result<(u32, &'a [u8])> {
+    if *offset >= data.len() {
+        return Err(keybox_error("certificate field is missing"));
+    }
+    let (tag, content, total) = read_tlv(&data[*offset..])?;
+    *offset += total;
+    Ok((tag, content))
+}
+
+/// Decodes one certificate PEM block into DER, rejecting anything that is not certificate shaped.
 pub fn decode_certificate(text: &str) -> Result<Vec<u8>> {
-    let (label, der) = pem_blocks(text)?
-        .into_iter()
-        .next()
-        .ok_or_else(|| keybox_error("certificate element has no PEM block"))?;
+    let (label, der) =
+        first_pem_block(text)?.ok_or_else(|| keybox_error("certificate element has no PEM block"))?;
     if label != "CERTIFICATE" {
         return Err(keybox_error(format!("unsupported PEM certificate label: {label}")));
     }
-    Certificate::from_der(&der).map_err(|e| keybox_error(format!("certificate parse: {e}")))?;
+    validate_certificate_der(&der)?;
     Ok(der)
 }
 
@@ -672,6 +767,7 @@ mod tests {
     use crate::certbuilder::{build_self_signed_cert, encode_der_oid};
     use crate::keygen::generate_key_pair;
     use crate::types::{Algorithm, CertGenParams, EcCurve};
+    use x509_cert::Certificate;
 
     /// The named-curve OIDs the test fixtures are built with.
     const CURVE_P256: &[u64] = &[1, 2, 840, 10045, 3, 1, 7];

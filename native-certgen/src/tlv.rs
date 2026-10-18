@@ -7,9 +7,11 @@
 use crate::error::{CertGenError, Result};
 
 /// Universal-class tag numbers compared against after the class and constructed bits are stripped.
-pub const TAG_SEQUENCE: u32 = 0x10;
+pub const TAG_INTEGER: u32 = 0x02;
+pub const TAG_BIT_STRING: u32 = 0x03;
 pub const TAG_OCTET_STRING: u32 = 0x04;
 pub const TAG_OID: u32 = 0x06;
+pub const TAG_SEQUENCE: u32 = 0x10;
 
 /// Reads one DER TLV, returning `(tag_number, content, total_length)`. The tag number is the raw
 /// low-tag/high-tag value with the class and constructed bits stripped, which is all the parsers
