@@ -23,6 +23,12 @@ import java.io.File
  *     recorded as tamper evidence, so a missing property is skipped instead of created.
  *   - In-place rewrites of existing entries normally leave the area mtime untouched.
  *
+ * A line with no `=` is a removal directive instead of an assignment: the property is deleted from
+ * the area altogether. Some keys cannot be spoofed at all because the only safe state is "absent" —
+ * `sys.oem_unlock_allowed` is one of them. `frameworks/base` stopped writing it in Android 16, so
+ * a build that still exposes it was written by something outside the platform, and detectors treat
+ * any non-empty value as evidence of tampering rather than checking the value itself.
+ *
  * The whole config is resolved once at startup and applied in a single shell invocation: properties
  * whose value already matches are skipped outright, so the cost is a couple of fork/execs per boot
  * and the keystore hot path stays untouched.
@@ -36,6 +42,9 @@ object HideProps {
     private const val SHELL = "/system/bin/sh"
     private const val SETTINGS = "/system/bin/settings"
     private val USB_PROPERTIES = listOf("sys.usb.config", "persist.sys.usb.config", "sys.usb.state")
+
+    /** One `hide_props.txt` line: a non-null [value] assigns, a null [value] removes the key. */
+    private data class HideEntry(val name: String, val value: String?)
 
     private val RESETPROP_CANDIDATES =
         listOf(
@@ -55,7 +64,14 @@ object HideProps {
         val resetpropPath = resetprop
         val script = StringBuilder()
         var properties = 0
-        for ((name, value) in entries) {
+        var removals = 0
+        for (entry in entries) {
+            val name = entry.name
+            val value = entry.value
+            if (value == null) {
+                removals += appendRemove(script, name, resetpropPath)
+                continue
+            }
             when {
                 name.equals(ADB_KEY, ignoreCase = true) -> appendAdb(script, value)
                 name.equals(USB_KEY, ignoreCase = true) -> appendUsb(script, value, resetpropPath)
@@ -78,7 +94,7 @@ object HideProps {
             }
         }
         if (script.isNotEmpty()) {
-            Logger.i("Applying boot property spoofing ($properties properties changed)")
+            Logger.i("Applying boot property spoofing ($properties properties changed, $removals removed)")
             runShell(script.toString())
         }
     }
@@ -123,20 +139,51 @@ object HideProps {
         }
     }
 
-    private fun parseConfig(file: File): List<Pair<String, String>> {
+    /**
+     * Deletes a property from the area entirely (`hide_props.txt` line without `=`).
+     *
+     * Used for keys whose only safe state is non-existence: rewriting the value cannot help because
+     * the check is "does this property exist", not "what does it hold". An absent key is skipped, so
+     * a second boot on an already-clean device is a no-op and cannot move the area mtime.
+     *
+     * @return 1 when a delete command was emitted, 0 when the key was already absent.
+     */
+    private fun appendRemove(
+        script: StringBuilder,
+        name: String,
+        resetpropPath: String?,
+    ): Int {
+        if (!name.contains('.')) {
+            Logger.w("hide_props: '$name' has no value and is not a property name; ignoring")
+            return 0
+        }
+        val resetprop = resetpropPath ?: return 0.also {
+            Logger.e("resetprop not found; cannot remove '$name'")
+        }
+        if (SystemProperties.get(name, null) == null) return 0
+        script.append(shellQuote(resetprop)).append(" --delete ").append(shellQuote(name)).append('\n')
+        return 1
+    }
+
+    private fun parseConfig(file: File): List<HideEntry> {
         if (!file.exists()) return emptyList()
         return runCatching {
                 file.readLines().mapNotNull { line ->
                     val entry = line.substringBefore('#').trim()
                     if (entry.isEmpty()) return@mapNotNull null
                     val separator = entry.indexOf('=')
-                    if (separator <= 0) {
+                    // A name with no `=` is a removal directive: delete the property, do not set it.
+                    if (separator < 0) {
+                        val name = entry.trim()
+                        return@mapNotNull name.ifEmpty { null }?.let { HideEntry(it, null) }
+                    }
+                    if (separator == 0) {
                         Logger.w("ignoring malformed hide_props line: $line")
                         return@mapNotNull null
                     }
                     val name = entry.substring(0, separator).trim()
                     val value = entry.substring(separator + 1).trim()
-                    name.ifEmpty { null }?.let { it to value }
+                    name.ifEmpty { null }?.let { HideEntry(it, value) }
                 }
             }
             .onFailure { Logger.e("failed to read $CONFIG_FILE", it) }

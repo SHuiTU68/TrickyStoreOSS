@@ -1,17 +1,22 @@
 # Global system-property spoofing, applied once at boot through `resetprop`.
 #
-#   - `name=value` sets the system property `name` to `value` globally, so every process on the
-#     device sees the spoofed value. This is applied at boot only; edit and reboot to change it.
+# Two forms:
+#   name=value   rewrite an existing property in place
+#   name         delete the property from the area entirely
+#
+# Rules the applier follows:
+#   - `name=value` sets the property globally, so every process sees the spoofed value. Applied at
+#     boot only; edit and reboot to change it.
 #   - Lines starting with `#` are comments and blank lines are ignored.
 #   - Properties whose value already matches are skipped, so nothing is written unnecessarily.
 #   - Properties this build never defined are never created: inserting a new property entry both
-#     moves the property-area mtime and leaves a non-AOSP property behind, which tamper checks flag
-#     (e.g. `sys.oem_unlock_allowed` is only defined up to Android 15). Such lines are no-ops.
+#     moves the property-area mtime and leaves a non-AOSP property behind, which tamper checks flag.
+#     Such lines are no-ops.
 #   - Remove a line to stop spoofing that property (the original value returns on the next boot).
 #
 # Behaviour switches (keys without a dot):
 #   adb=off    disable USB debugging at boot (Settings.Global.adb_enabled = 0)
-#   usb=none   set the USB configuration to `none`, i.e. no data functions (MTP/ADB/…)
+#   usb=mtp    rewrite the USB configuration properties without notifying property_service
 
 # --- Verified boot / bootloader lock state ---
 ro.boot.verifiedbootstate=green
@@ -24,6 +29,12 @@ ro.vendor.boot.warranty_bit=0
 ro.vendor.warranty_bit=0
 ro.oem_unlock_supported=0
 
+# Android 16 (SDK 36) dropped the platform write path for this key, so a build that still exposes it
+# was written by something outside the platform. Detection therefore keys off *existence*, not value:
+# any non-empty value is treated as tampering, and `0` is not a safe answer. Deleting it is the only
+# state that cannot be flagged, and it also drops the key from the observed-rule count.
+sys.oem_unlock_allowed
+
 # --- Build / debug state ---
 ro.secure=1
 ro.debuggable=0
@@ -32,6 +43,8 @@ ro.build.tags=release-keys
 ro.boot.selinux=enforcing
 
 # --- Boot hardening ---
-# USB data stays off: the `none` configuration exposes no data functions (MTP/ADB/…).
 adb=off
-usb=none
+# Left commented out on purpose: rewriting sys.usb.config while the gadget keeps its real
+# configuration makes the reported state disagree with the bound functions, which is itself a signal.
+# Enable only if you also want USB data off for real.
+# usb=mtp
