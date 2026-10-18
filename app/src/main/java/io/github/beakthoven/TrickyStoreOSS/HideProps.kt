@@ -33,10 +33,9 @@ object HideProps {
     // Keys without a dot are behaviour switches, not properties.
     private const val ADB_KEY = "adb"
     private const val USB_KEY = "usb"
-
     private const val SHELL = "/system/bin/sh"
-    private const val SETPROP = "/system/bin/setprop"
     private const val SETTINGS = "/system/bin/settings"
+    private val USB_PROPERTIES = listOf("sys.usb.config", "persist.sys.usb.config", "sys.usb.state")
 
     private val RESETPROP_CANDIDATES =
         listOf(
@@ -59,7 +58,7 @@ object HideProps {
         for ((name, value) in entries) {
             when {
                 name.equals(ADB_KEY, ignoreCase = true) -> appendAdb(script, value)
-                name.equals(USB_KEY, ignoreCase = true) -> appendUsb(script, value)
+                name.equals(USB_KEY, ignoreCase = true) -> appendUsb(script, value, resetpropPath)
                 name.contains('.') -> {
                     val current = SystemProperties.get(name, null)
                     when {
@@ -102,10 +101,26 @@ object HideProps {
         script.append(SETTINGS).append(" put global adb_enabled 0\n")
     }
 
-    private fun appendUsb(script: StringBuilder, value: String) {
+    private fun appendUsb(
+        script: StringBuilder,
+        value: String,
+        resetpropPath: String?,
+    ) {
         if (value.isEmpty()) return
-        script.append(SETPROP).append(" sys.usb.config ").append(shellQuote(value)).append('\n')
-        script.append(SETPROP).append(" persist.sys.usb.config ").append(shellQuote(value)).append('\n')
+        val resetprop = resetpropPath ?: return Logger.e("resetprop not found; cannot spoof usb config")
+        // `setprop` is unusable here: `sys.usb.config` is owned by init's `on property:` triggers, so
+        // writing it notifies property_service, fires those triggers and reconfigures the gadget —
+        // exactly the transition a detector watches for. `resetprop -n` edits the property area in
+        // place without notifying property_service, which is how every other key in this file is
+        // spoofed. Entries this build never defined are skipped for the mtime/fresh-page reason
+        // documented above; `sys.usb.state` only exists once a gadget function is bound.
+        for (name in USB_PROPERTIES) {
+            when {
+                SystemProperties.get(name, null) == null ->
+                    Logger.d("skipping '$name': not defined on this device")
+                else -> script.append(resetpropCommand(resetprop, name, value))
+            }
+        }
     }
 
     private fun parseConfig(file: File): List<Pair<String, String>> {

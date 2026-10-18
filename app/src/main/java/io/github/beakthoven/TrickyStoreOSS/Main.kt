@@ -17,11 +17,14 @@ fun main(args: Array<String>) {
     Logger.i("Welcome to TrickyStoreOSS!")
 
     try {
+        // Load the native certificate generator before anything can call into it. The startup probe
+        // below parses attestation extensions exclusively through the Rust reader, so probing first
+        // reports UNAVAILABLE on every boot even when libcertgen.so would have loaded fine.
+        NativeCertGen.initialize()
         val probe = AttestUtils.probe()
         Logger.i("Startup attestation probe: ${probe.status} (${probe.failureCategory ?: "none"})")
         AndroidUtils.setupBootHash()
         HideProps.apply()
-        NativeCertGen.initialize()
         initializeInterceptors()
         maintainService()
     } catch (e: Exception) {

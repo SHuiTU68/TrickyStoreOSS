@@ -6,6 +6,7 @@
 package io.github.beakthoven.TrickyStoreOSS
 
 import io.github.beakthoven.TrickyStoreOSS.logging.Logger
+import java.io.File
 
 /**
  * JNI bridge to the native `libcertgen.so` (Rust `native-certgen` crate).
@@ -18,18 +19,56 @@ import io.github.beakthoven.TrickyStoreOSS.logging.Logger
 object NativeCertGen {
     // Magisk/KernelSU/APatch all mount modules at this fixed path, and the daemon starts from here.
     private const val LIBRARY_PATH = "/data/adb/modules/tricky_store/libcertgen.so"
-
+    // Staged copy that exists while an update is pending, before the module directory is swapped in.
+    private const val UPDATE_LIBRARY_PATH = "/data/adb/modules_update/tricky_store/libcertgen.so"
     @Volatile var isAvailable: Boolean = false
         private set
-
+    /**
+     * Loads `libcertgen.so`, trying the mounted module directory first, then the pending-update
+     * directory, and finally the copy AGP unpacked into the APK's own `jniLibs`.
+     *
+     * Idempotent and synchronized: the daemon calls this once at startup, but tests and tooling may
+     * call it again, and a second `System.load` of the same path would raise an error.
+     */
+    @Synchronized
     fun initialize() {
-        try {
-            System.load(LIBRARY_PATH)
-            isAvailable = true
-            Logger.i("NativeCertGen: loaded $LIBRARY_PATH (version=${nativeVersion()}, selfTest=${selfTest()})")
-        } catch (e: UnsatisfiedLinkError) {
-            Logger.e("NativeCertGen: failed to load $LIBRARY_PATH", e)
+        if (isAvailable) return
+        for (path in listOf(LIBRARY_PATH, UPDATE_LIBRARY_PATH)) {
+            if (!File(path).isFile) continue
+            if (load(path)) return
         }
+        // The module directory is not mounted in this process (first boot after install, or the
+        // daemon started from the APK); the APK's own copy is the same object file.
+        if (loadLibrary("certgen")) return
+        Logger.e("NativeCertGen: libcertgen.so unavailable; native certificate generation is disabled")
+    }
+    /** Loads one absolute path and records success; logs and returns false when the load fails. */
+    private fun load(path: String): Boolean =
+        try {
+            System.load(path)
+            markLoaded(path)
+            true
+        } catch (e: UnsatisfiedLinkError) {
+            Logger.e("NativeCertGen: failed to load $path", e)
+            false
+        }
+    /** Loads the copy resolved from the APK's `jniLibs` (`libcertgen.so`). */
+    private fun loadLibrary(name: String): Boolean =
+        try {
+            System.loadLibrary(name)
+            markLoaded("lib$name.so (APK jniLibs)")
+            true
+        } catch (e: UnsatisfiedLinkError) {
+            Logger.d("NativeCertGen: no $name in the APK jniLibs")
+            false
+        }
+    /**
+     * Flips [isAvailable] and logs the version/self-test result, which is the only positive proof
+     * that JNI is wired up and the linked crypto stack actually runs on this device.
+     */
+    private fun markLoaded(source: String) {
+        isAvailable = true
+        Logger.i("NativeCertGen: loaded $source (version=${nativeVersion()}, selfTest=${selfTest()})")
     }
 
     external fun nativeVersion(): String
