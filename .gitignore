@@ -19,3 +19,6 @@ module/service.apk
 out/
 native-certgen/target/
 app/src/main/jniLibs/**/*.so
+
+# local scan/report artifacts uploaded from the device
+.uploads/
