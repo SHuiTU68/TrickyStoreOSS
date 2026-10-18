@@ -48,7 +48,9 @@ pub fn parse_keybox_xml(xml: &str) -> Result<Vec<NativeKeybox>> {
 /// big-endian. Kotlin rebuilds the key pairs and certificates from it.
 pub fn parse_keybox_blob(xml: &str) -> Result<Vec<u8>> {
     let keyboxes = parse_keybox_xml(xml)?;
-    let mut blob = Vec::new();
+    // Size the response once, up front: every DER body is already in hand, so the exact length is
+    // known and the buffer never has to grow (which would copy the certificates a second time).
+    let mut blob = Vec::with_capacity(blob_len(&keyboxes));
     blob.extend_from_slice(&(keyboxes.len() as u32).to_be_bytes());
     for keybox in &keyboxes {
         push_blob(&mut blob, keybox.algorithm.as_bytes());
@@ -59,6 +61,21 @@ pub fn parse_keybox_blob(xml: &str) -> Result<Vec<u8>> {
         }
     }
     Ok(blob)
+}
+
+/// The exact byte length [`parse_keybox_blob`] is about to produce, so the response buffer can be
+/// allocated once at its final size.
+fn blob_len(keyboxes: &[NativeKeybox]) -> usize {
+    let mut len = 4;
+    for keybox in keyboxes {
+        len += 4 + keybox.algorithm.len();
+        len += 4 + keybox.private_key_pkcs8.len();
+        len += 4;
+        for certificate in &keybox.certificates {
+            len += 4 + certificate.len();
+        }
+    }
+    len
 }
 
 fn push_blob(out: &mut Vec<u8>, bytes: &[u8]) {
@@ -72,9 +89,14 @@ fn push_blob(out: &mut Vec<u8>, bytes: &[u8]) {
 
 /// A token from the keybox document. A self-closing tag yields a `Start` followed by its `End`, so
 /// the walker never has to special-case empty elements.
-#[derive(Clone)]
+///
+/// Attribute values are validated while tokenising but never stored: no element of the keybox
+/// schema carries a meaningful one. Keeping them would cost one `Vec` per start tag plus a clone on
+/// every `peek`, which is pure overhead on a document that is re-read on each keybox reload.
+/// Dropping them also makes the event `Copy`, so `peek` returns by value without allocating.
+#[derive(Clone, Copy)]
 enum XmlEvent<'a> {
-    Start { name: &'a str, attrs: Vec<(&'a str, &'a str)> },
+    Start { name: &'a str },
     End { name: &'a str },
     Text(&'a str),
 }
@@ -84,7 +106,10 @@ enum XmlEvent<'a> {
 /// dropped, the same way an XML pull parser reports it as ignorable whitespace: only the text
 /// between an element's tags is ever meaningful here.
 fn tokenize(xml: &str) -> Result<Vec<XmlEvent<'_>>> {
-    let mut events = Vec::new();
+    // One event per tag/text run, and tags average well over 32 bytes of source, so this estimate
+    // usually avoids every reallocation. It is capped so a huge document cannot turn the guess into
+    // a large speculative allocation.
+    let mut events = Vec::with_capacity((xml.len() / 32).min(4096));
     let mut cursor = 0usize;
     while cursor < xml.len() {
         let rest = &xml[cursor..];
@@ -118,8 +143,8 @@ fn tokenize(xml: &str) -> Result<Vec<XmlEvent<'_>>> {
                 Some(trimmed) => (trimmed, true),
                 None => (body, false),
             };
-            let (name, attrs) = parse_tag(body)?;
-            events.push(XmlEvent::Start { name, attrs });
+            let name = parse_tag(body)?;
+            events.push(XmlEvent::Start { name });
             if self_closing {
                 events.push(XmlEvent::End { name });
             }
@@ -158,14 +183,13 @@ fn find_tag_end(tag: &str) -> Result<usize> {
 
 /// Splits a start tag body into its element name and attributes. Namespace prefixes are kept, as
 /// the Kotlin parser disables namespace processing too.
-fn parse_tag(body: &str) -> Result<(&str, Vec<(&str, &str)>)> {
+fn parse_tag(body: &str) -> Result<&str> {
     let name_end = body.find(char::is_whitespace).unwrap_or(body.len());
     let name = &body[..name_end];
     if name.is_empty() {
         return Err(keybox_error("empty element name"));
     }
 
-    let mut attrs = Vec::new();
     let mut rest = &body[name_end..];
     loop {
         rest = rest.trim_start();
@@ -189,10 +213,11 @@ fn parse_tag(body: &str) -> Result<(&str, Vec<(&str, &str)>)> {
         let end = value_rest
             .find(quote)
             .ok_or_else(|| keybox_error("unterminated attribute value"))?;
-        attrs.push((attr_name, &value_rest[..end]));
+        // The value is only checked for well-formedness; nothing reads it back.
+        let _ = &value_rest[..end];
         rest = &value_rest[end + 1..];
     }
-    Ok((name, attrs))
+    Ok(name)
 }
 
 // ---------------------------------------------------------------------------
@@ -208,16 +233,16 @@ impl<'a> Walker<'a> {
     fn peek(&self) -> Result<XmlEvent<'a>> {
         self.events
             .get(self.pos)
-            .cloned()
+            .copied()
             .ok_or_else(|| keybox_error("unexpected end of keybox document"))
     }
 
-    /// Consumes a start tag, returning its name and attributes.
-    fn expect_start(&mut self) -> Result<(&'a str, Vec<(&'a str, &'a str)>)> {
+    /// Consumes a start tag, returning its name.
+    fn expect_start(&mut self) -> Result<&'a str> {
         match self.peek()? {
-            XmlEvent::Start { name, attrs } => {
+            XmlEvent::Start { name } => {
                 self.pos += 1;
-                Ok((name, attrs))
+                Ok(name)
             }
             _ => Err(keybox_error("expected an element")),
         }
@@ -226,7 +251,7 @@ impl<'a> Walker<'a> {
     /// Builds the entry list, enforcing the document shape: one `AndroidAttestation` root holding
     /// an optional keybox count and one or more `Keybox` blocks.
     fn parse_document(&mut self) -> Result<Vec<NativeKeybox>> {
-        let (name, _) = self.expect_start()?;
+        let name = self.expect_start()?;
         if name != "AndroidAttestation" {
             return Err(keybox_error("invalid keybox document root"));
         }
@@ -241,14 +266,14 @@ impl<'a> Walker<'a> {
                     self.pos += 1;
                     break;
                 }
-                XmlEvent::Start { name, .. } if name == "NumberOfKeyboxes" => {
+                XmlEvent::Start { name } if name == "NumberOfKeyboxes" => {
                     if expected_keyboxes.is_some() {
                         return Err(keybox_error("duplicate keybox count"));
                     }
                     self.pos += 1;
                     expected_keyboxes = Some(parse_count(&self.leaf_text("NumberOfKeyboxes")?, "keybox")?);
                 }
-                XmlEvent::Start { name, .. } if name == "Keybox" => {
+                XmlEvent::Start { name } if name == "Keybox" => {
                     keybox_blocks += 1;
                     self.parse_keybox(&mut keyboxes)?;
                 }
@@ -271,7 +296,7 @@ impl<'a> Walker<'a> {
     }
 
     fn parse_keybox(&mut self, keyboxes: &mut Vec<NativeKeybox>) -> Result<()> {
-        let (name, _) = self.expect_start()?;
+        let name = self.expect_start()?;
         if name != "Keybox" {
             return Err(keybox_error("invalid keybox element"));
         }
@@ -283,7 +308,7 @@ impl<'a> Walker<'a> {
                     self.pos += 1;
                     break;
                 }
-                XmlEvent::Start { name, .. } if name == "Key" => {
+                XmlEvent::Start { name } if name == "Key" => {
                     let keybox = self.parse_key()?;
                     // A later entry for the same algorithm replaces the earlier one, mirroring the
                     // Kotlin map put, and keeps the earlier entry's position.
@@ -318,21 +343,21 @@ impl<'a> Walker<'a> {
                     self.pos += 1;
                     break;
                 }
-                XmlEvent::Start { name, .. } if name == "PrivateKey" => {
+                XmlEvent::Start { name } if name == "PrivateKey" => {
                     if private_key_text.is_some() {
                         return Err(keybox_error("duplicate private key element"));
                     }
                     self.pos += 1;
                     private_key_text = Some(self.leaf_text("PrivateKey")?);
                 }
-                XmlEvent::Start { name, .. } if name == "CertificateChain" => {
+                XmlEvent::Start { name } if name == "CertificateChain" => {
                     if chain_seen {
                         return Err(keybox_error("duplicate certificate chain"));
                     }
                     chain_seen = true;
                     self.parse_certificate_chain(&mut certificate_texts)?;
                 }
-                XmlEvent::Start { name, .. } if name == "Certificate" => {
+                XmlEvent::Start { name } if name == "Certificate" => {
                     if chain_seen {
                         return Err(keybox_error("unexpected certificate element"));
                     }
@@ -355,7 +380,7 @@ impl<'a> Walker<'a> {
     }
 
     fn parse_certificate_chain(&mut self, certificates: &mut Vec<String>) -> Result<()> {
-        let (name, _) = self.expect_start()?;
+        let name = self.expect_start()?;
         if name != "CertificateChain" {
             return Err(keybox_error("unexpected certificate chain entry"));
         }
@@ -368,7 +393,7 @@ impl<'a> Walker<'a> {
                     self.pos += 1;
                     break;
                 }
-                XmlEvent::Start { name, .. } if name == "NumberOfCertificates" => {
+                XmlEvent::Start { name } if name == "NumberOfCertificates" => {
                     if expected.is_some() {
                         return Err(keybox_error("duplicate certificate count"));
                     }
@@ -376,7 +401,7 @@ impl<'a> Walker<'a> {
                     expected =
                         Some(parse_count(&self.leaf_text("NumberOfCertificates")?, "certificate")?);
                 }
-                XmlEvent::Start { name, .. } if name == "Certificate" => {
+                XmlEvent::Start { name } if name == "Certificate" => {
                     self.pos += 1;
                     let text = self.leaf_text("Certificate")?;
                     if !text.trim().is_empty() {
@@ -886,5 +911,28 @@ mod tests {
         assert_eq!(u32::from_be_bytes([blob[0], blob[1], blob[2], blob[3]]), 1);
         let algorithm_len = u32::from_be_bytes([blob[4], blob[5], blob[6], blob[7]]) as usize;
         assert_eq!(&blob[8..8 + algorithm_len], b"EC");
+    }
+    #[test]
+    fn attributes_are_validated_but_never_needed() {
+        // The document helper writes `DeviceID`, `algorithm` and `format` attributes; parsing must
+        // succeed without ever reading them back.
+        let (private_key, _, cert) = ec_material();
+        let xml = document(&private_key, &[&cert], Some(1));
+        assert!(xml.contains("DeviceID=\"sw\""));
+        assert_eq!(parse_keybox_xml(&xml).unwrap().len(), 1);
+        // A malformed attribute is still rejected, so dropping the values does not weaken the check.
+        let broken = xml.replace("DeviceID=\"sw\"", "DeviceID=sw");
+        assert!(parse_keybox_xml(&broken).is_err());
+    }
+
+    #[test]
+    fn blob_is_allocated_at_its_exact_final_size() {
+        let (private_key, _, cert) = ec_material();
+        let xml = document(&private_key, &[&cert], Some(1));
+        let keyboxes = parse_keybox_xml(&xml).unwrap();
+        let blob = parse_keybox_blob(&xml).unwrap();
+        // `blob_len` is what the response buffer is reserved with, so it must match byte for byte.
+        assert_eq!(blob.len(), blob_len(&keyboxes));
+        assert_eq!(blob.capacity(), blob_len(&keyboxes));
     }
 }
