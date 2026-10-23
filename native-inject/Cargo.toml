@@ -1,0 +1,18 @@
+[package]
+name = "tricky-inject-native"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+name = "rustinject"
+crate-type = ["staticlib"]
+
+# Mirrors native-certgen: the library is linked into a shared object that is injected into
+# system_server, so an unwinding panic would be worse than a crash on the spot.
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = "symbols"
+panic = "abort"
