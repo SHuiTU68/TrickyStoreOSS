@@ -19,6 +19,7 @@
 pub mod ffi;
 pub mod magic;
 pub mod maps;
+pub mod remote;
 pub mod selinux;
 pub mod status;
 pub mod sys;

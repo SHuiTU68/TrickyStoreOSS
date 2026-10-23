@@ -430,39 +430,41 @@ std::optional<uintptr_t> remote_post_call(int pid, struct user_regs_struct &regs
         LOGV("Remote function stopped with signal: %s(%d) at address %p", sigabbrev_np(stop_signal), stop_signal,
              reinterpret_cast<void *>(regs.REG_IP));
 
-        if (stop_signal == SIGSEGV) {
-            if (static_cast<uintptr_t>(regs.REG_IP) != expected_return_addr) {
-                LOGE("Function returned to unexpected address %p (expected %p)", reinterpret_cast<void *>(regs.REG_IP),
-                     reinterpret_cast<void *>(expected_return_addr));
-                siginfo_t crash_info;
-                if (ptrace(PTRACE_GETSIGINFO, pid, 0, &crash_info) == 0) {
-                    LOGE("Crash details: si_code=%d si_addr=%p", crash_info.si_code, crash_info.si_addr);
-                } else {
-                    PLOGE("Failed to get crash signal info");
-                }
-                if (pending_signal)
-                    *pending_signal = stop_signal;
-                return std::nullopt;
-            }
-
+        switch (ts_classify_stop(stop_signal, static_cast<uint64_t>(regs.REG_IP), expected_return_addr)) {
+        case TS_CALL_COMPLETED: {
             uintptr_t return_value = regs.REG_RET;
             LOGV("Remote function completed with return value: %p", reinterpret_cast<void *>(return_value));
             return return_value;
         }
-
-        if (stop_signal != SIGCHLD) {
+        case TS_CALL_CRASHED: {
+            LOGE("Function returned to unexpected address %p (expected %p)", reinterpret_cast<void *>(regs.REG_IP),
+                 reinterpret_cast<void *>(expected_return_addr));
+            siginfo_t crash_info;
+            if (ptrace(PTRACE_GETSIGINFO, pid, 0, &crash_info) == 0) {
+                LOGE("Crash details: si_code=%d si_addr=%p", crash_info.si_code, crash_info.si_addr);
+            } else {
+                PLOGE("Failed to get crash signal info");
+            }
+            if (pending_signal)
+                *pending_signal = stop_signal;
+            return std::nullopt;
+        }
+        case TS_CALL_SUPPRESS: {
+            LOGV("Suppressing benign %s(%d) during remote call", sigabbrev_np(stop_signal), stop_signal);
+            if (ptrace(PTRACE_CONT, pid, 0, 0) == -1) {
+                PLOGE("Failed to continue after signal %s(%d)", sigabbrev_np(stop_signal), stop_signal);
+                if (pending_signal)
+                    *pending_signal = stop_signal;
+                return std::nullopt;
+            }
+            continue;
+        }
+        default: {
             LOGE("Unexpected signal stop during remote call: %s(%d)", sigabbrev_np(stop_signal), stop_signal);
             if (pending_signal)
                 *pending_signal = stop_signal;
             return std::nullopt;
         }
-
-        LOGV("Suppressing benign %s(%d) during remote call", sigabbrev_np(stop_signal), stop_signal);
-        if (ptrace(PTRACE_CONT, pid, 0, 0) == -1) {
-            PLOGE("Failed to continue after signal %s(%d)", sigabbrev_np(stop_signal), stop_signal);
-            if (pending_signal)
-                *pending_signal = stop_signal;
-            return std::nullopt;
         }
     }
 }

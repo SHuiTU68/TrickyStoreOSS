@@ -10,6 +10,7 @@
 use core::ffi::{c_char, c_int};
 
 use crate::maps;
+use crate::remote;
 use crate::selinux;
 use crate::status;
 use crate::sys;
@@ -297,6 +298,17 @@ pub unsafe extern "C" fn ts_ptrace_event(status: c_int) -> *const c_char {
         _ => 0,
     };
     NAMES[index].as_ptr().cast()
+}
+
+/// Classifies a stop seen while a remote call is in flight.
+///
+/// Returns `TS_CALL_COMPLETED` (0) when the tracee faulted exactly at the planted return
+/// address, `TS_CALL_CRASHED` (1) when it faulted elsewhere, `TS_CALL_SUPPRESS` (2) for a
+/// benign `SIGCHLD` that should be swallowed, and `TS_CALL_UNEXPECTED` (3) otherwise. The
+/// raw `ptrace`/`waitpid` calls stay in C++.
+#[no_mangle]
+pub extern "C" fn ts_classify_stop(stop_signal: c_int, reg_ip: u64, expected_return_addr: u64) -> c_int {
+    remote::classify_stop(stop_signal, reg_ip, expected_return_addr).code()
 }
 
 #[cfg(test)]
