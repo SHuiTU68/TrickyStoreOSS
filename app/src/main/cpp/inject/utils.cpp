@@ -279,15 +279,15 @@ void setup_x86_64_args(struct user_regs_struct &regs, const std::vector<uintptr_
 constexpr size_t kMaxRegisterArgs = 0;
 #elif defined(__aarch64__)
 constexpr size_t kMaxRegisterArgs = 8;
-void setup_aarch64_args(struct user_regs_struct &regs, const std::vector<uintptr_t> &args) {
-    for (size_t i = 0; i < std::min(args.size(), kMaxRegisterArgs); i++) {
+void setup_aarch64_args(struct user_regs_struct &regs, const std::vector<uintptr_t> &args, size_t count) {
+    for (size_t i = 0; i < count; i++) {
         regs.regs[i] = args[i];
     }
 }
 #elif defined(__arm__)
 constexpr size_t kMaxRegisterArgs = 4;
-void setup_arm_args(struct user_regs_struct &regs, const std::vector<uintptr_t> &args) {
-    for (size_t i = 0; i < std::min(args.size(), kMaxRegisterArgs); i++) {
+void setup_arm_args(struct user_regs_struct &regs, const std::vector<uintptr_t> &args, size_t count) {
+    for (size_t i = 0; i < count; i++) {
         regs.uregs[i] = args[i];
     }
 }
@@ -303,15 +303,16 @@ bool remote_pre_call(int pid, struct user_regs_struct &regs, uintptr_t func_addr
         LOGV("  arg[%zu] = %p", i, reinterpret_cast<void *>(args[i]));
     }
 
+    const auto layout = ts_stack_args_layout(args.size(), kMaxRegisterArgs, sizeof(uintptr_t));
+
 #if defined(__x86_64__)
     setup_x86_64_args(regs, args);
 
-    if (args.size() > kMaxRegisterArgs) {
-        size_t stack_args_size = (args.size() - kMaxRegisterArgs) * sizeof(uintptr_t);
-        align_stack(regs, stack_args_size);
+    if (layout.stack_args_size > 0) {
+        align_stack(regs, layout.stack_args_size);
 
-        if (write_proc(pid, static_cast<uintptr_t>(regs.REG_SP), args.data() + kMaxRegisterArgs, stack_args_size) !=
-            static_cast<ssize_t>(stack_args_size)) {
+        if (write_proc(pid, static_cast<uintptr_t>(regs.REG_SP), args.data() + layout.first_stack_index,
+                       layout.stack_args_size) != static_cast<ssize_t>(layout.stack_args_size)) {
             LOGE("Failed to push stack arguments for x86_64");
             return false;
         }
@@ -326,12 +327,11 @@ bool remote_pre_call(int pid, struct user_regs_struct &regs, uintptr_t func_addr
     regs.REG_IP = func_addr;
 
 #elif defined(__i386__)
-    if (args.size() > 0) {
-        size_t stack_args_size = args.size() * sizeof(uintptr_t);
-        align_stack(regs, stack_args_size);
+    if (layout.stack_args_size > 0) {
+        align_stack(regs, layout.stack_args_size);
 
-        if (write_proc(pid, static_cast<uintptr_t>(regs.REG_SP), args.data(), stack_args_size) !=
-            static_cast<ssize_t>(stack_args_size)) {
+        if (write_proc(pid, static_cast<uintptr_t>(regs.REG_SP), args.data() + layout.first_stack_index,
+                       layout.stack_args_size) != static_cast<ssize_t>(layout.stack_args_size)) {
             LOGE("Failed to push arguments for i386");
             return false;
         }
@@ -346,14 +346,13 @@ bool remote_pre_call(int pid, struct user_regs_struct &regs, uintptr_t func_addr
     regs.REG_IP = func_addr;
 
 #elif defined(__aarch64__)
-    setup_aarch64_args(regs, args);
+    setup_aarch64_args(regs, args, layout.register_args);
 
-    if (args.size() > kMaxRegisterArgs) {
-        size_t stack_args_size = (args.size() - kMaxRegisterArgs) * sizeof(uintptr_t);
-        align_stack(regs, stack_args_size);
+    if (layout.stack_args_size > 0) {
+        align_stack(regs, layout.stack_args_size);
 
-        if (write_proc(pid, static_cast<uintptr_t>(regs.REG_SP), args.data() + kMaxRegisterArgs, stack_args_size) !=
-            static_cast<ssize_t>(stack_args_size)) {
+        if (write_proc(pid, static_cast<uintptr_t>(regs.REG_SP), args.data() + layout.first_stack_index,
+                       layout.stack_args_size) != static_cast<ssize_t>(layout.stack_args_size)) {
             LOGE("Failed to push stack arguments for aarch64");
             return false;
         }
@@ -363,14 +362,13 @@ bool remote_pre_call(int pid, struct user_regs_struct &regs, uintptr_t func_addr
     regs.REG_IP = func_addr;
 
 #elif defined(__arm__)
-    setup_arm_args(regs, args);
+    setup_arm_args(regs, args, layout.register_args);
 
-    if (args.size() > kMaxRegisterArgs) {
-        size_t stack_args_size = (args.size() - kMaxRegisterArgs) * sizeof(uintptr_t);
-        align_stack(regs, stack_args_size);
+    if (layout.stack_args_size > 0) {
+        align_stack(regs, layout.stack_args_size);
 
-        if (write_proc(pid, static_cast<uintptr_t>(regs.REG_SP), args.data() + kMaxRegisterArgs, stack_args_size) !=
-            static_cast<ssize_t>(stack_args_size)) {
+        if (write_proc(pid, static_cast<uintptr_t>(regs.REG_SP), args.data() + layout.first_stack_index,
+                       layout.stack_args_size) != static_cast<ssize_t>(layout.stack_args_size)) {
             LOGE("Failed to push stack arguments for ARM");
             return false;
         }

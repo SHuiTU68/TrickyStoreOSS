@@ -27,6 +27,14 @@ struct TsMapEntry {
 
 // Opaque owner of the entry array and of the storage the `path` pointers point into.
 struct TsMapList;
+// Register/stack split of one call's argument list. Field order and widths mirror the
+// `#[repr(C)]` `StackArgsLayout` in `native-inject/src/remote.rs`.
+struct TsStackArgsLayout {
+    size_t register_args;     // leading arguments the ABI passes in registers
+    size_t stack_args;        // trailing arguments that go on the stack
+    size_t stack_args_size;   // bytes those arguments occupy
+    size_t first_stack_index; // index of the first stack argument inside the vector
+};
 
 // Verdicts returned by ts_classify_stop(). Kept in sync with `CallStep::code()` in
 // `native-inject/src/remote.rs`.
@@ -65,6 +73,10 @@ uintptr_t ts_translate_remote_symbol(uintptr_t local_base, uintptr_t remote_base
 // every Android ABI needs before a call. The subtraction wraps, like the unsigned arithmetic
 // it replaces in align_stack().
 uintptr_t ts_reserve_stack(uintptr_t sp, size_t bytes);
+// Splits `argc` arguments into the register and stack halves of the ABI that owns
+// `register_args` argument registers, given the width of one stack slot. Pure arithmetic: the
+// caller still does the register and stack writes.
+struct TsStackArgsLayout ts_stack_args_layout(size_t argc, size_t register_args, size_t word_size);
 
 // snprintf-style renderers: they return the length the text needs, excluding the terminator, so
 // a return value >= capacity means the output was truncated. A null buffer or a zero capacity

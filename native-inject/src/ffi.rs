@@ -233,6 +233,20 @@ pub extern "C" fn ts_translate_remote_symbol(
 pub extern "C" fn ts_reserve_stack(sp: usize, bytes: usize) -> usize {
     remote::reserve_stack(sp, bytes)
 }
+/// Splits `argc` arguments into the register and stack halves of the ABI that owns
+/// `register_args` argument registers.
+///
+/// Returns the same `StackArgsLayout` the C++ caller declares as `TsStackArgsLayout`, so the
+/// register/stack split and the byte count are decided once instead of in each of the four
+/// `remote_pre_call` branches.
+#[no_mangle]
+pub extern "C" fn ts_stack_args_layout(
+    argc: usize,
+    register_args: usize,
+    word_size: usize,
+) -> remote::StackArgsLayout {
+    remote::stack_args_layout(argc, register_args, word_size)
+}
 
 /// Copies `text` into a caller buffer with `snprintf` semantics, returning the full length.
 ///
