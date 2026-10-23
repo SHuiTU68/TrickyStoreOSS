@@ -26,22 +26,19 @@
 #include <cstdlib>
 #include <cstring>
 #include <optional>
-#include <random>
 #include <string>
 #include <string_view>
 #include <vector>
 
 #include "logging.hpp"
+#include "native_rust.h"
 
 namespace {
 constexpr size_t kMaxPathLength = 256;
 constexpr size_t kMsgBufferSize = 64;
-constexpr size_t kStatusBufferSize = 128;
 constexpr int kInvalidFd = -1;
 constexpr uintptr_t kStackAlignment = 0xf;
 constexpr int kMaxArguments = 8;
-
-constexpr std::string_view kRandomChars = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
 } // namespace
 
 ssize_t write_proc(int pid, uintptr_t remote_addr, const void *buf, size_t len, bool use_proc_mem) {
@@ -508,22 +505,14 @@ bool wait_for_trace(int pid, int *status, int flags) {
 }
 
 std::string parse_status(int status) {
-    char status_buf[kStatusBufferSize];
-
-    if (WIFEXITED(status)) {
-        snprintf(status_buf, sizeof(status_buf), "0x%x exited with code %d", status, WEXITSTATUS(status));
-    } else if (WIFSIGNALED(status)) {
-        snprintf(status_buf, sizeof(status_buf), "0x%x terminated by signal %s(%d)", status, sigabbrev_np(WTERMSIG(status)),
-                 WTERMSIG(status));
-    } else if (WIFSTOPPED(status)) {
-        int stop_signal = WSTOPSIG(status);
-        snprintf(status_buf, sizeof(status_buf), "0x%x stopped by signal=%s(%d), event=%s", status, sigabbrev_np(stop_signal),
-                 stop_signal, parse_ptrace_event(status));
-    } else {
-        snprintf(status_buf, sizeof(status_buf), "0x%x unknown status", status);
-    }
-
-    return std::string(status_buf);
+    // Render through Rust so the string is no longer capped by a 128-byte stack buffer.
+    // The first call gives the required length, which also covers the (unlikely) case of a
+    // status the formatter cannot classify.
+    const size_t needed = ts_describe_status(status, nullptr, 0);
+    std::string result(needed, '\0');
+    if (needed == 0) return result;
+    ts_describe_status(status, result.data(), needed + 1);
+    return result;
 }
 
 void *find_module_return_addr(const std::vector<ts::MapInfo> &map_info, std::string_view module_suffix) {
@@ -544,17 +533,10 @@ std::string generateMagic(size_t length) {
         LOGW("Zero length requested for magic string");
         return "";
     }
-
-    std::mt19937 random_generator{std::random_device{}()};
-    std::uniform_int_distribution<size_t> char_distribution(0, kRandomChars.length() - 1);
-
-    std::string magic_string;
-    magic_string.reserve(length);
-
-    for (size_t i = 0; i < length; i++) {
-        magic_string += kRandomChars[char_distribution(random_generator)];
-    }
-
+    // The alphabet and the rejection sampling live in Rust (native-inject/src/magic.rs). The
+    // buffer is sized exactly, so a capacity of length + 1 always fits the whole string.
+    std::string magic_string(length, '\0');
+    ts_generate_magic(length, magic_string.data(), length + 1);
     LOGV("Generated magic string of length %zu", length);
     return magic_string;
 }
@@ -564,16 +546,14 @@ int setfilecon(const char *file_path, const char *security_context) {
         LOGE("Invalid parameters for setfilecon: path=%p, context=%p", file_path, security_context);
         return -1;
     }
-
-    size_t context_len = strlen(security_context) + 1;
-    int result = syscall(__NR_setxattr, file_path, XATTR_NAME_SELINUX, security_context, context_len, 0);
-
+    // The xattr write itself is in Rust (native-inject/src/selinux.rs), which reports failures
+    // through errno exactly like the raw syscall did.
+    const int result = ts_setfilecon(file_path, security_context);
     if (result == 0) {
         LOGV("Successfully set SELinux context '%s' for file '%s'", security_context, file_path);
     } else {
         PLOGE("Failed to set SELinux context '%s' for file '%s'", security_context, file_path);
     }
-
     return result;
 }
 
@@ -582,25 +562,11 @@ bool set_sockcreate_con(const char *security_context) {
         LOGE("Null security context passed to set_sockcreate_con");
         return false;
     }
-
-    size_t context_size = strlen(security_context) + 1;
-
-    UniqueFd sockcreate_fd = open("/proc/thread-self/attr/sockcreate", O_WRONLY | O_CLOEXEC);
-    if (sockcreate_fd != kInvalidFd && write(sockcreate_fd, security_context, context_size) == static_cast<ssize_t>(context_size)) {
-        LOGV("Successfully set socket creation context via thread-self: '%s'", security_context);
+    // Rust tries /proc/thread-self first and falls back to /proc/<tid>, same order as before.
+    if (ts_set_sockcreate_con(security_context) == 0) {
+        LOGV("Successfully set socket creation context: '%s'", security_context);
         return true;
     }
-
-    LOGV("Thread-self sockcreate failed, trying process-specific fallback");
-    char process_path[kMaxPathLength];
-    snprintf(process_path, sizeof(process_path), "/proc/%d/attr/sockcreate", gettid());
-
-    sockcreate_fd = open(process_path, O_WRONLY | O_CLOEXEC);
-    if (sockcreate_fd == kInvalidFd || write(sockcreate_fd, security_context, context_size) != static_cast<ssize_t>(context_size)) {
-        PLOGE("Failed to set socket creation context via fallback path '%s'", process_path);
-        return false;
-    }
-
-    LOGV("Successfully set socket creation context via fallback: '%s'", security_context);
-    return true;
+    PLOGE("Failed to set socket creation context '%s'", security_context);
+    return false;
 }

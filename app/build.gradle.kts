@@ -139,6 +139,43 @@ val buildRustCertgen =
         )
     }
 
+// --- Native injection helpers (Rust static archive) ---
+// native-inject owns the pure-logic half of the injector: /proc/<pid>/maps parsing, wait-status
+// and PTRACE_EVENT rendering, magic-string generation and the SELinux knob writers. It builds to
+// a static archive that CMake links into libinject.so, so nothing new lands in jniLibs.
+val rustInjectOutDir = layout.buildDirectory.dir("rust/inject").get().asFile
+val buildRustInject =
+    tasks.register<Exec>("buildRustInject") {
+        group = "TrickyStoreOSS Native Build"
+        description = "Builds librustinject.a via cargo-ndk for arm64-v8a."
+        workingDir = rootProject.projectDir.resolve("native-inject")
+        commandLine(
+            "cargo",
+            "ndk",
+            "-t",
+            "arm64-v8a",
+            "-o",
+            rustInjectOutDir.absolutePath,
+            "build",
+            "--release",
+        )
+
+        inputs.dir(rootProject.projectDir.resolve("native-inject/src"))
+        inputs.file(rootProject.projectDir.resolve("native-inject/Cargo.toml"))
+        inputs.file(rootProject.projectDir.resolve("native-inject/Cargo.lock"))
+        outputs.dir(rustInjectOutDir)
+        ndkForCargo?.let { environment("ANDROID_NDK_HOME", it) }
+        environment(
+            "PATH",
+            "${System.getProperty("user.home")}/.cargo/bin:${System.getenv("PATH") ?: ""}",
+        )
+    }
+// CMakeLists.txt consumes the archive by path, so it has to exist before every configure step.
+tasks.configureEach {
+    if (name.startsWith("configureCMake") || name.startsWith("buildCMake")) {
+        dependsOn(buildRustInject)
+    }
+}
 // AGP auto-detects jniLibs/ as an input to mergeJniLibFolders — make it depend on the Rust build.
 tasks.configureEach {
     if (name.startsWith("merge") && name.endsWith("JniLibFolders")) {

@@ -13,6 +13,7 @@ target_link_libraries(my_logging log)
 # Maps parser (used by injector)
 add_library(ts_maps STATIC maps/maps.cpp)
 target_include_directories(ts_maps PUBLIC maps/include)
+target_include_directories(ts_maps PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 
 # PLTI (PLT hooking library)
 add_subdirectory(external/PLTI)
@@ -26,8 +27,28 @@ add_library(binder SHARED stub/stub_binder.cpp)
 target_include_directories(binder PUBLIC external/AOSP/include)
 target_link_libraries(binder PRIVATE utils)
 
+# Rust payload helpers (native-inject)
+# The pure-logic half of the injector -- maps parsing, wait-status and PTRACE_EVENT rendering,
+# magic-string generation and the SELinux knobs -- lives in Rust and is compiled by Gradle's
+# `buildRustInject` task into a static archive. Only the thin C++ wrappers stay here; see
+# native_rust.h for the ABI.
+set(RUSTINJECT_LIB
+    "${CMAKE_CURRENT_SOURCE_DIR}/../../../build/rust/inject/${ANDROID_ABI}/librustinject.a"
+    CACHE FILEPATH "native-inject static archive linked into libinject.so")
+if(NOT EXISTS "${RUSTINJECT_LIB}")
+    message(
+        FATAL_ERROR
+            "Missing ${RUSTINJECT_LIB}. Build it with `cargo ndk -t arm64-v8a -o app/build/rust/inject build --release` from native-inject/ (Gradle's buildRustInject task does this automatically), or point -DRUSTINJECT_LIB at an existing archive."
+    )
+endif()
+add_library(rustinject STATIC IMPORTED)
+set_target_properties(rustinject PROPERTIES IMPORTED_LOCATION "${RUSTINJECT_LIB}")
+# std's runtime borrows from libdl/libm; `log` comes along for the bindings that log errors.
+target_link_libraries(rustinject INTERFACE dl log m)
+
 add_executable(libinject.so inject/main.cpp inject/utils.cpp)
-target_link_libraries(libinject.so PRIVATE ts_maps my_logging)
+target_include_directories(libinject.so PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(libinject.so PRIVATE ts_maps my_logging rustinject)
 
 add_library(${CMAKE_PROJECT_NAME} SHARED binder_interceptor.cpp)
 target_include_directories(${CMAKE_PROJECT_NAME} PUBLIC external/linux-kernel/include)

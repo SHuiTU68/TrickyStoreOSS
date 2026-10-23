@@ -1,64 +1,41 @@
 // Copyright 2026 Dakkshesh <beakthoven@gmail.com>
 // SPDX-License-Identifier: GPL-3.0-or-later
-
 #include "maps.hpp"
 
-#include <cctype>
-#include <cstdio>
-#include <inttypes.h>
-#include <sys/mman.h>
-#include <sys/sysmacros.h>
-#include <unistd.h>
+#include <string>
+
+#include "native_rust.h"
 
 namespace ts {
-
+// The parsing now lives in Rust (native-inject/src/maps.rs, reached through ts_maps_scan); this
+// wrapper only keeps the C++-friendly `MapInfo` shape so the injector's call sites stay
+// untouched.
 std::vector<MapInfo> MapInfo::Scan(std::string_view pid) {
     std::vector<MapInfo> infos;
-
-    std::string path = "/proc/" + std::string{pid} + "/maps";
-    auto *fp = fopen(path.c_str(), "r");
-    if (!fp) return infos;
-
-    char *line = nullptr;
-    size_t len = 0;
-    ssize_t read;
-
-    while ((read = getline(&line, &len, fp)) > 0) {
-        line[read - 1] = '\0';
-
-        uintptr_t start = 0, end = 0, off = 0;
-        ino_t inode = 0;
-        unsigned int dev_major = 0, dev_minor = 0;
-        char perm[5] = {0};
-        int path_off = 0;
-
-        if (sscanf(line, "%" SCNxPTR "-%" SCNxPTR " %4s %" SCNxPTR " %x:%x %lu %n",
-                   &start, &end, perm, &off, &dev_major, &dev_minor, &inode,
-                   &path_off) != 7) {
-            continue;
-        }
-
-        while (path_off < read && isspace(static_cast<unsigned char>(line[path_off])))
-            path_off++;
-
+    // `pid` is a view and carries no terminator, so the parser gets a copy it can treat as a C
+    // string.
+    const std::string pid_str{pid};
+    TsMapList *list = ts_maps_scan(pid_str.c_str());
+    if (list == nullptr) return infos;
+    const size_t count = ts_maps_len(list);
+    infos.reserve(count);
+    for (size_t i = 0; i < count; i++) {
+        const TsMapEntry *entry = ts_maps_entry(list, i);
+        if (entry == nullptr) continue;
         auto &info = infos.emplace_back();
-        info.start = start;
-        info.end = end;
-        info.is_private = perm[3] == 'p';
-        info.offset = off;
-        info.dev = static_cast<dev_t>(makedev(dev_major, dev_minor));
-        info.inode = inode;
-        info.path = line + path_off;
-
-        if (perm[0] == 'r') info.perms |= PROT_READ;
-        if (perm[1] == 'w') info.perms |= PROT_WRITE;
-        if (perm[2] == 'x') info.perms |= PROT_EXEC;
+        info.start = entry->start;
+        info.end = entry->end;
+        info.perms = entry->perms;
+        info.is_private = entry->is_private != 0;
+        info.offset = entry->offset;
+        info.dev = static_cast<dev_t>(entry->dev);
+        info.inode = static_cast<ino_t>(entry->inode);
+        // The path is copied while the list is still alive; `path_len` is authoritative, the
+        // terminator is only there for convenience.
+        info.path.assign(entry->path, entry->path_len);
     }
-
-    free(line);
-    fclose(fp);
+    ts_maps_free(list);
     infos.shrink_to_fit();
     return infos;
 }
-
 } // namespace ts

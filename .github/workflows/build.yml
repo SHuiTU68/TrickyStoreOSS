@@ -57,7 +57,8 @@ jobs:
             ~/.cargo/git
             ~/.cargo/bin/cargo-ndk
             native-certgen/target
-          key: rust-${{ runner.os }}-${{ hashFiles('native-certgen/Cargo.lock') }}
+            native-inject/target
+          key: rust-${{ runner.os }}-${{ hashFiles('native-certgen/Cargo.lock', 'native-inject/Cargo.lock') }}
           restore-keys: rust-${{ runner.os }}-
 
       - name: Install cargo-ndk
@@ -77,6 +78,12 @@ jobs:
       # developer machine. They are host-only and need no NDK.
       - name: Test Rust crate
         working-directory: native-certgen
+        run: cargo test --locked
+      # The injector's pure-logic half (maps parsing, wait-status/PTRACE_EVENT rendering, magic
+      # generation, SELinux knobs) lives in native-inject and is linked into libinject.so, so its
+      # tests gate the build too.
+      - name: Test Rust injection helpers
+        working-directory: native-inject
         run: cargo test --locked
 
       - name: Setup Gradle

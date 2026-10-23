@@ -11,6 +11,7 @@
 #include <vector>
 
 #include "maps.hpp"
+#include "native_rust.h"
 
 #define LOG_TAG "TrickyStoreOSS"
 
@@ -101,24 +102,11 @@ private:
 
 bool set_sockcreate_con(const char *security_context);
 
-#define WPTEVENT(x) (x >> 16)
-#define CASE_CONST_RETURN(x) \
-    case x:                  \
-        return #x;
+// The PTRACE_EVENT_* name table lives in Rust (native-inject/src/status.rs); this stays a thin
+// forwarder so every C++ call site keeps the same signature. Both sides take the raw wait status
+// and shift the event number out of its high half themselves.
 inline const char *parse_ptrace_event(int status) {
-    status = status >> 16;
-    switch (status) {
-        CASE_CONST_RETURN(PTRACE_EVENT_FORK)
-        CASE_CONST_RETURN(PTRACE_EVENT_VFORK)
-        CASE_CONST_RETURN(PTRACE_EVENT_CLONE)
-        CASE_CONST_RETURN(PTRACE_EVENT_EXEC)
-        CASE_CONST_RETURN(PTRACE_EVENT_VFORK_DONE)
-        CASE_CONST_RETURN(PTRACE_EVENT_EXIT)
-        CASE_CONST_RETURN(PTRACE_EVENT_SECCOMP)
-        CASE_CONST_RETURN(PTRACE_EVENT_STOP)
-    default:
-        return "(no event)";
-    }
+    return ts_ptrace_event(status);
 }
 inline const char *sigabbrev_np(int sig) {
     if (sig > 0 && sig < NSIG)
