@@ -52,9 +52,12 @@ ssize_t read_proc(int pid, uintptr_t remote_addr, void *buf, size_t len);
 bool get_regs(int pid, struct user_regs_struct &regs);
 bool set_regs(int pid, struct user_regs_struct &regs);
 
-void *find_module_base(const std::vector<ts::MapInfo> &map_info, std::string_view module_suffix);
-void *find_func_addr(const std::vector<ts::MapInfo> &local_map_info, const std::vector<ts::MapInfo> &remote_map_info,
-                     std::string_view module_name, std::string_view function_name);
+// The three lookups below walk a snapshot rather than a bare vector: the Rust side answers them
+// from the list the snapshot still owns (ts_maps_find_module / ts_translate_remote_symbol), so
+// no second parse is needed.
+void *find_module_base(const ts::MapScan &map_scan, std::string_view module_suffix);
+void *find_func_addr(const ts::MapScan &local_map, const ts::MapScan &remote_map, std::string_view module_name,
+                     std::string_view function_name);
 void align_stack(struct user_regs_struct &regs, uintptr_t preserve_bytes = 0);
 uintptr_t push_memory(int pid, struct user_regs_struct &regs, const void *data, size_t length);
 uintptr_t push_string(int pid, struct user_regs_struct &regs, const char *str);
@@ -67,7 +70,7 @@ std::optional<uintptr_t> remote_post_call(int pid, struct user_regs_struct &regs
 
 bool wait_for_trace(int pid, int *status, int flags);
 std::string parse_status(int status);
-void *find_module_return_addr(const std::vector<ts::MapInfo> &map_info, std::string_view module_suffix);
+void *find_module_return_addr(const ts::MapScan &map_scan, std::string_view module_suffix);
 
 constexpr size_t kMainMagicLength = 16;
 std::string generateMagic(size_t length);

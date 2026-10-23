@@ -36,6 +36,47 @@ impl MapEntry {
     }
 }
 
+/// Which mapping of a module a lookup is after.
+///
+/// Two call sites need this. `find_module_base` wants the mapping that starts at the module's
+/// file offset zero, i.e. the load bias; `find_module_return_addr` wants a mapping of the same
+/// file that carries no execute permission, i.e. a page inside the module that can host the
+/// return trampoline.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModuleMatch {
+    /// The mapping at file offset zero.
+    Base,
+    /// A mapping without `PROT_EXEC`.
+    NonExecutable,
+}
+
+/// Whether one mapping satisfies `mode` for a module whose path ends with `suffix`.
+///
+/// Kept apart from the walks below so the predicate has a single definition:
+/// [`find_module_start`] walks [`MapEntry`]s, while the FFI layer walks its C-facing twin and
+/// calls this per entry.
+pub fn matches_module(path: &[u8], offset: usize, perms: u8, suffix: &[u8], mode: ModuleMatch) -> bool {
+    let suffix_ok = path.len() >= suffix.len() && path[path.len() - suffix.len()..] == *suffix;
+    if !suffix_ok {
+        return false;
+    }
+    match mode {
+        ModuleMatch::Base => offset == 0,
+        ModuleMatch::NonExecutable => perms & PROT_EXEC == 0,
+    }
+}
+
+/// Start address of the first entry matching `mode`, or `None` when no entry does.
+///
+/// First match wins, which is what both C++ loops did: a module's mappings appear in ascending
+/// address order, so its offset-zero mapping always precedes the rest.
+pub fn find_module_start(entries: &[MapEntry], suffix: &[u8], mode: ModuleMatch) -> Option<usize> {
+    entries
+        .iter()
+        .find(|entry| matches_module(&entry.path, entry.offset, entry.perms, suffix, mode))
+        .map(|entry| entry.start)
+}
+
 /// Parses a whole maps document.
 ///
 /// Lines that do not carry the seven standard fields are skipped, which is what the `sscanf`
@@ -269,6 +310,49 @@ mod tests {
         let entry = parse_line(b"7f00-7f10 0 00000000 fd:01 42 /lib.so").unwrap();
         assert_eq!(entry.perms, 0);
         assert!(!entry.is_private);
+    }
+
+    /// A module mapped three times, the way a real loader lays out a shared object.
+    const MODULE_DOCUMENT: &[u8] = b"\
+7f00-7f10 r--p 00000000 fd:01 42 /apex/com.android.runtime/lib64/bionic/libc.so
+7f10-7f20 r-xp 00001000 fd:01 42 /apex/com.android.runtime/lib64/bionic/libc.so
+7f20-7f30 rw-p 00002000 fd:01 42 /apex/com.android.runtime/lib64/bionic/libc.so
+";
+
+    #[test]
+    fn finds_the_offset_zero_mapping_as_the_base() {
+        let entries = parse(MODULE_DOCUMENT);
+        assert_eq!(find_module_start(&entries, b"libc.so", ModuleMatch::Base), Some(0x7f00));
+    }
+
+    #[test]
+    fn base_lookup_ignores_mappings_with_a_nonzero_offset() {
+        // Only a non-zero-offset mapping of `libc.so` exists, so there is no base to report.
+        let entries = parse(b"7f10-7f20 r-xp 00001000 fd:01 42 /lib/libc.so\n");
+        assert_eq!(find_module_start(&entries, b"libc.so", ModuleMatch::Base), None);
+    }
+
+    #[test]
+    fn return_region_lookup_wants_a_mapping_without_exec() {
+        let entries = parse(MODULE_DOCUMENT);
+        assert_eq!(find_module_start(&entries, b"libc.so", ModuleMatch::NonExecutable), Some(0x7f00));
+        // Every mapping of the module is executable here, so nothing qualifies.
+        let entries = parse(b"7f10-7f20 r-xp 00001000 fd:01 42 /lib/libc.so\n");
+        assert_eq!(find_module_start(&entries, b"libc.so", ModuleMatch::NonExecutable), None);
+    }
+
+    #[test]
+    fn lookups_need_the_whole_suffix_to_match() {
+        let entries = parse(MODULE_DOCUMENT);
+        assert_eq!(find_module_start(&entries, b"libc", ModuleMatch::Base), None);
+        assert_eq!(find_module_start(&entries, b"bionic/libc.so", ModuleMatch::Base), Some(0x7f00));
+        assert_eq!(find_module_start(&entries, b"/libc.so/", ModuleMatch::Base), None);
+    }
+
+    #[test]
+    fn lookups_on_an_empty_document_find_nothing() {
+        assert_eq!(find_module_start(&[], b"libc.so", ModuleMatch::Base), None);
+        assert_eq!(find_module_start(&[], b"libc.so", ModuleMatch::NonExecutable), None);
     }
 
     #[test]

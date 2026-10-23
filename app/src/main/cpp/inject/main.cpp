@@ -117,7 +117,7 @@ private:
 };
 
 static std::optional<int> transfer_fd_to_remote(int pid, const char *lib_path, struct user_regs_struct &regs,
-                                                const std::vector<ts::MapInfo> &local_map, const std::vector<ts::MapInfo> &remote_map,
+                                                const ts::MapScan &local_map, const ts::MapScan &remote_map,
                                                 int *pending_signal) {
     if (!set_sockcreate_con(constants::kSystemFileContext)) {
         LOGE("Failed to set socket creation context");
@@ -280,8 +280,8 @@ static std::optional<int> transfer_fd_to_remote(int pid, const char *lib_path, s
     return transferred_fd_guard.release();
 }
 
-static std::string get_remote_dlerror(int pid, struct user_regs_struct &regs, const std::vector<ts::MapInfo> &local_map,
-                                      const std::vector<ts::MapInfo> &remote_map, uintptr_t libc_return_addr, int *pending_signal) {
+static std::string get_remote_dlerror(int pid, struct user_regs_struct &regs, const ts::MapScan &local_map,
+                                      const ts::MapScan &remote_map, uintptr_t libc_return_addr, int *pending_signal) {
     auto dlerror_addr = find_func_addr(local_map, remote_map, constants::kLibdlModule, "dlerror");
     if (!dlerror_addr) {
         return "Failed to find dlerror function";
@@ -312,8 +312,8 @@ static std::string get_remote_dlerror(int pid, struct user_regs_struct &regs, co
     return err;
 }
 
-static std::optional<uintptr_t> remote_dlopen(int pid, struct user_regs_struct &regs, const std::vector<ts::MapInfo> &local_map,
-                                              const std::vector<ts::MapInfo> &remote_map, int lib_fd, const char *lib_path,
+static std::optional<uintptr_t> remote_dlopen(int pid, struct user_regs_struct &regs, const ts::MapScan &local_map,
+                                              const ts::MapScan &remote_map, int lib_fd, const char *lib_path,
                                               uintptr_t libc_return_addr, int *pending_signal) {
     auto dlopen_addr = find_func_addr(local_map, remote_map, constants::kLibdlModule, "android_dlopen_ext");
     if (!dlopen_addr) {
@@ -346,8 +346,8 @@ static std::optional<uintptr_t> remote_dlopen(int pid, struct user_regs_struct &
     return *remote_handle;
 }
 
-static std::optional<uintptr_t> remote_find_entry(int pid, struct user_regs_struct &regs, const std::vector<ts::MapInfo> &local_map,
-                                                  const std::vector<ts::MapInfo> &remote_map, uintptr_t remote_handle,
+static std::optional<uintptr_t> remote_find_entry(int pid, struct user_regs_struct &regs, const ts::MapScan &local_map,
+                                                  const ts::MapScan &remote_map, uintptr_t remote_handle,
                                                   const char *entry_name, uintptr_t libc_return_addr, int *pending_signal) {
     auto dlsym_addr = find_func_addr(local_map, remote_map, constants::kLibdlModule, "dlsym");
     if (!dlsym_addr) {
@@ -473,8 +473,10 @@ bool inject_library(int pid, const char *lib_path, const char *entry_name) {
     SavedRegistersGuard registers_guard(pid, backup_regs, detach_allowed);
     LOGD("Process stopped and registers backed up");
 
-    auto remote_map = ts::MapInfo::Scan(std::to_string(pid));
-    auto local_map = ts::MapInfo::Scan();
+    // One snapshot each: the parsed rows are what the helpers below walk, and the snapshot keeps
+    // the Rust list alive so the module lookups do not have to re-read /proc.
+    ts::MapScan remote_map(std::to_string(pid));
+    ts::MapScan local_map;
 
     auto libc_return_addr = find_module_return_addr(remote_map, constants::kLibcModule);
     if (!libc_return_addr) {

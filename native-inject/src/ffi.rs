@@ -164,6 +164,67 @@ pub unsafe extern "C" fn ts_maps_free(list: *mut TsMapList) {
     drop(unsafe { Box::from_raw(list) });
 }
 
+/// `TS_MODULE_*` selector: the mapping at file offset zero.
+///
+/// Only the tests spell this selector out; the exported function treats every value other than
+/// [`TS_MODULE_NON_EXEC`] as the base, so the constant would otherwise be dead in a normal build.
+#[cfg(test)]
+const TS_MODULE_BASE: c_int = 0;
+/// `TS_MODULE_*` selector: a mapping without `PROT_EXEC`.
+const TS_MODULE_NON_EXEC: c_int = 1;
+/// Start address of the first module mapping selected by `mode`, or 0 when nothing matches.
+///
+/// A mapping never starts at address zero, so 0 doubles as the "not found" answer without
+/// needing an out-parameter. `mode` is a `TS_MODULE_*` constant; any other value falls back to
+/// `TS_MODULE_BASE`, the selector most call sites want.
+///
+/// # Safety
+///
+/// `list` must be null or a live pointer from [`ts_maps_scan`]. `suffix` must be valid for
+/// `suffix_len` bytes; unlike the path fields it does not need a terminator.
+#[no_mangle]
+pub unsafe extern "C" fn ts_maps_find_module(
+    list: *const TsMapList,
+    suffix: *const c_char,
+    suffix_len: usize,
+    mode: c_int,
+) -> usize {
+    if list.is_null() || suffix.is_null() {
+        return 0;
+    }
+    let mode = if mode == TS_MODULE_NON_EXEC {
+        maps::ModuleMatch::NonExecutable
+    } else {
+        maps::ModuleMatch::Base
+    };
+    // SAFETY: the caller guarantees `suffix_len` readable bytes at `suffix`.
+    let suffix = unsafe { core::slice::from_raw_parts(suffix.cast::<u8>(), suffix_len) };
+    // SAFETY: the caller keeps `list` alive for the duration of the call.
+    let list = unsafe { &*list };
+    for entry in &list.entries {
+        // SAFETY: the list owns NUL-terminated paths and `path_len` bounds the slice inside
+        // that storage.
+        let path = unsafe { core::slice::from_raw_parts(entry.path.cast::<u8>(), entry.path_len) };
+        if maps::matches_module(path, entry.offset, entry.perms, suffix, mode) {
+            return entry.start;
+        }
+    }
+    0
+}
+/// Translates a symbol address resolved in our own process into the tracee's address space.
+///
+/// Both processes map the same file, so the symbol keeps its distance from the module base.
+/// Both steps wrap, matching the `ptrdiff_t` arithmetic this replaces when `symbol_addr` happens
+/// to sit below `local_base` (an ordering the C++ code tolerated by accident).
+#[no_mangle]
+pub extern "C" fn ts_translate_remote_symbol(
+    local_base: usize,
+    remote_base: usize,
+    symbol_addr: usize,
+) -> usize {
+    remote_base.wrapping_add(symbol_addr.wrapping_sub(local_base))
+}
+
 /// Copies `text` into a caller buffer with `snprintf` semantics, returning the full length.
 ///
 /// The return value is the number of bytes the text needs *excluding* the terminator, so a
@@ -405,6 +466,45 @@ mod tests {
         assert_eq!(written, 16);
         assert_eq!(buffer[16], 0);
         assert!(buffer[..16].iter().all(|byte| crate::magic::ALPHABET.contains(byte)));
+    }
+
+    #[test]
+    fn maps_find_module_selects_by_mode() {
+        // Built straight from a document, the way `ts_maps_scan` builds it after reading the
+        // file, so the lookup can be exercised without depending on this process's own maps.
+        let document = b"\
+7f00-7f10 r--p 00000000 fd:01 42 /apex/libc.so
+7f10-7f20 r-xp 00001000 fd:01 42 /apex/libc.so
+";
+        let list = Box::into_raw(Box::new(TsMapList::build(maps::parse(document))));
+        let suffix = b"libc.so";
+        // SAFETY: `list` is a live, owned list and `suffix` is a readable slice.
+        let base = unsafe { ts_maps_find_module(list, suffix.as_ptr().cast(), suffix.len(), TS_MODULE_BASE) };
+        assert_eq!(base, 0x7f00, "the offset-zero mapping is the base");
+        // SAFETY: same live list and suffix, different selector.
+        let region = unsafe { ts_maps_find_module(list, suffix.as_ptr().cast(), suffix.len(), TS_MODULE_NON_EXEC) };
+        assert_eq!(region, 0x7f00, "the r--p mapping is the only one without PROT_EXEC");
+        let missing = b"libm.so";
+        // SAFETY: same live list; the suffix simply matches nothing.
+        let not_found = unsafe { ts_maps_find_module(list, missing.as_ptr().cast(), missing.len(), TS_MODULE_BASE) };
+        assert_eq!(not_found, 0);
+        // SAFETY: ownership goes back exactly once.
+        unsafe { ts_maps_free(list) };
+    }
+
+    #[test]
+    fn maps_find_module_tolerates_null() {
+        // SAFETY: both pointers are null, which the function checks before reading anything.
+        assert_eq!(unsafe { ts_maps_find_module(core::ptr::null(), core::ptr::null(), 0, TS_MODULE_BASE) }, 0);
+    }
+
+    #[test]
+    fn translate_remote_symbol_keeps_the_offset() {
+        assert_eq!(ts_translate_remote_symbol(0x1000, 0x8000, 0x1234), 0x8234);
+        // A symbol below the base wraps exactly like the `ptrdiff_t` subtraction it replaces.
+        assert_eq!(ts_translate_remote_symbol(0x2000, 0x8000, 0x1000), 0x7000);
+        // Zero bases are a no-op, which is what an unresolved module would produce.
+        assert_eq!(ts_translate_remote_symbol(0, 0, 0x5555), 0x5555);
     }
 
     #[test]

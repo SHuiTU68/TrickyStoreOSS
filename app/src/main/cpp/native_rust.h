@@ -37,6 +37,15 @@ enum {
     TS_CALL_UNEXPECTED = 3,
 };
 
+// Mapping selectors for ts_maps_find_module(). Kept in sync with `ModuleMatch` in
+// `native-inject/src/maps.rs`.
+enum {
+    // The mapping at the module's file offset zero, i.e. the load bias.
+    TS_MODULE_BASE = 0,
+    // A mapping of the module without PROT_EXEC, i.e. a page that can host the return trampoline.
+    TS_MODULE_NON_EXEC = 1,
+};
+
 extern "C" {
 // Parses /proc/<pid>/maps; a null `pid` means the calling process. Returns null when the file
 // cannot be read, and must be released with ts_maps_free().
@@ -44,6 +53,14 @@ struct TsMapList *ts_maps_scan(const char *pid);
 size_t ts_maps_len(const struct TsMapList *list);
 const struct TsMapEntry *ts_maps_entry(const struct TsMapList *list, size_t index);
 void ts_maps_free(struct TsMapList *list);
+
+// Start address of the first mapping selected by `mode` (a TS_MODULE_* value) whose path ends
+// with the `suffix_len`-byte suffix, or 0 when nothing matches. The suffix needs no terminator.
+uintptr_t ts_maps_find_module(const struct TsMapList *list, const char *suffix, size_t suffix_len, int mode);
+
+// Maps a symbol address resolved in our own process onto the tracee's module base, keeping the
+// distance it has from `local_base`. Both steps wrap, like the ptrdiff_t arithmetic it replaces.
+uintptr_t ts_translate_remote_symbol(uintptr_t local_base, uintptr_t remote_base, uintptr_t symbol_addr);
 
 // snprintf-style renderers: they return the length the text needs, excluding the terminator, so
 // a return value >= capacity means the output was truncated. A null buffer or a zero capacity

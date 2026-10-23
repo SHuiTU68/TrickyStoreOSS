@@ -149,21 +149,21 @@ bool set_regs(int pid, struct user_regs_struct &regs) {
     return true;
 }
 
-void *find_module_base(const std::vector<ts::MapInfo> &map_info, std::string_view module_suffix) {
-    for (const auto &map : map_info) {
-        if (map.offset == 0 && map.path.ends_with(module_suffix)) {
-            LOGV("Found module base for '%.*s' at %p", static_cast<int>(module_suffix.length()), module_suffix.data(),
-                 reinterpret_cast<void *>(map.start));
-            return reinterpret_cast<void *>(map.start);
-        }
+void *find_module_base(const ts::MapScan &map_scan, std::string_view module_suffix) {
+    // The walk itself lives in Rust (native-inject/src/maps.rs) and runs over the very list this
+    // snapshot owns. Zero doubles as "not found" because a mapping never starts at address zero.
+    const uintptr_t start =
+        ts_maps_find_module(map_scan.list(), module_suffix.data(), module_suffix.length(), TS_MODULE_BASE);
+    if (start == 0) {
+        LOGV("Module base not found for suffix '%.*s'", static_cast<int>(module_suffix.length()), module_suffix.data());
+        return nullptr;
     }
-
-    LOGV("Module base not found for suffix '%.*s'", static_cast<int>(module_suffix.length()), module_suffix.data());
-    return nullptr;
+    LOGV("Found module base for '%.*s' at %p", static_cast<int>(module_suffix.length()), module_suffix.data(),
+         reinterpret_cast<void *>(start));
+    return reinterpret_cast<void *>(start);
 }
-
-void *find_func_addr(const std::vector<ts::MapInfo> &local_map_info, const std::vector<ts::MapInfo> &remote_map_info,
-                     std::string_view module_name, std::string_view function_name) {
+void *find_func_addr(const ts::MapScan &local_map, const ts::MapScan &remote_map, std::string_view module_name,
+                     std::string_view function_name) {
     LOGV("Resolving function '%.*s' in module '%.*s'", static_cast<int>(function_name.length()), function_name.data(),
          static_cast<int>(module_name.length()), module_name.data());
 
@@ -188,26 +188,28 @@ void *find_func_addr(const std::vector<ts::MapInfo> &local_map_info, const std::
     LOGV("Found symbol '%.*s' at local address %p", static_cast<int>(function_name.length()), function_name.data(), symbol_addr);
     lib_closer();
 
-    auto *local_base = reinterpret_cast<uint8_t *>(find_module_base(local_map_info, module_name));
+    auto *local_base = reinterpret_cast<uint8_t *>(find_module_base(local_map, module_name));
     if (!local_base) {
         LOGE("Failed to find local base address for module '%.*s'", static_cast<int>(module_name.length()), module_name.data());
         return nullptr;
     }
 
-    auto *remote_base = reinterpret_cast<uint8_t *>(find_module_base(remote_map_info, module_name));
+    auto *remote_base = reinterpret_cast<uint8_t *>(find_module_base(remote_map, module_name));
     if (!remote_base) {
         LOGE("Failed to find remote base address for module '%.*s'", static_cast<int>(module_name.length()), module_name.data());
         return nullptr;
     }
 
-    ptrdiff_t symbol_offset = symbol_addr - local_base;
-    auto *remote_symbol_addr = remote_base + symbol_offset;
+    // Both the subtraction and the addition live in Rust; a symbol that sits below its own module
+    // base wraps exactly like the ptrdiff_t arithmetic this replaces.
+    const uintptr_t remote_symbol_addr =
+        ts_translate_remote_symbol(reinterpret_cast<uintptr_t>(local_base), reinterpret_cast<uintptr_t>(remote_base),
+                                   reinterpret_cast<uintptr_t>(symbol_addr));
 
-    LOGV("Address translation: local_base=%p remote_base=%p offset=%td -> "
-         "remote_addr=%p",
-         local_base, remote_base, symbol_offset, remote_symbol_addr);
+    LOGV("Address translation: local_base=%p remote_base=%p local_symbol=%p -> remote_addr=%p", local_base, remote_base,
+         symbol_addr, reinterpret_cast<void *>(remote_symbol_addr));
 
-    return remote_symbol_addr;
+    return reinterpret_cast<void *>(remote_symbol_addr);
 }
 
 void align_stack(struct user_regs_struct &regs, uintptr_t preserve_bytes) {
@@ -517,17 +519,18 @@ std::string parse_status(int status) {
     return result;
 }
 
-void *find_module_return_addr(const std::vector<ts::MapInfo> &map_info, std::string_view module_suffix) {
-    for (const auto &map : map_info) {
-        if ((map.perms & PROT_EXEC) == 0 && map.path.ends_with(module_suffix)) {
-            LOGV("Found return address region for '%.*s' at %p", static_cast<int>(module_suffix.length()), module_suffix.data(),
-                 reinterpret_cast<void *>(map.start));
-            return reinterpret_cast<void *>(map.start);
-        }
+void *find_module_return_addr(const ts::MapScan &map_scan, std::string_view module_suffix) {
+    // Same Rust-side walk as find_module_base(), but selecting a mapping without PROT_EXEC.
+    const uintptr_t start =
+        ts_maps_find_module(map_scan.list(), module_suffix.data(), module_suffix.length(), TS_MODULE_NON_EXEC);
+    if (start == 0) {
+        LOGV("No return address region found for module suffix '%.*s'", static_cast<int>(module_suffix.length()),
+             module_suffix.data());
+        return nullptr;
     }
-
-    LOGV("No return address region found for module suffix '%.*s'", static_cast<int>(module_suffix.length()), module_suffix.data());
-    return nullptr;
+    LOGV("Found return address region for '%.*s' at %p", static_cast<int>(module_suffix.length()), module_suffix.data(),
+         reinterpret_cast<void *>(start));
+    return reinterpret_cast<void *>(start);
 }
 
 std::string generateMagic(size_t length) {
