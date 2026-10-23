@@ -61,6 +61,18 @@ pub fn classify_stop(stop_signal: i32, reg_ip: u64, expected_return_addr: u64) -
     }
 }
 
+/// Mask that clears the low four bits, i.e. the 16-byte `sp` alignment every Android ABI wants.
+pub const STACK_ALIGNMENT_MASK: usize = 0xf;
+
+/// Reserves `bytes` bytes on the tracee stack and returns the 16-byte-aligned pointer.
+///
+/// This is the arithmetic step behind `align_stack`: subtract first, then round down, which is
+/// exactly what the C++ helper did with two statements. The subtraction wraps instead of trapping
+/// when `bytes` exceeds the current stack pointer, matching the unsigned arithmetic it replaces.
+pub fn reserve_stack(sp: usize, bytes: usize) -> usize {
+    sp.wrapping_sub(bytes) & !STACK_ALIGNMENT_MASK
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -114,5 +126,24 @@ mod tests {
         assert_eq!(CallStep::Crashed.code(), 1);
         assert_eq!(CallStep::Suppress.code(), 2);
         assert_eq!(CallStep::Unexpected.code(), 3);
+    }
+    #[test]
+    fn reserving_aligns_the_stack_pointer() {
+        assert_eq!(reserve_stack(0x1000, 0), 0x1000);
+        assert_eq!(reserve_stack(0x1008, 0), 0x1000);
+        assert_eq!(reserve_stack(0x1000, 8), 0xff0);
+        assert_eq!(reserve_stack(0x1000, 0x20), 0xfe0);
+    }
+
+    #[test]
+    fn reserving_rounds_down_whatever_the_start_pointer() {
+        // The subtraction happens first, so an already unaligned pointer still lands on a
+        // 16-byte boundary.
+        assert_eq!(reserve_stack(0x1fff, 1), 0x1ff0);
+    }
+
+    #[test]
+    fn reserving_past_the_stack_pointer_wraps() {
+        assert_eq!(reserve_stack(0x10, 0x20), usize::MAX & !STACK_ALIGNMENT_MASK);
     }
 }

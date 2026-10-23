@@ -61,6 +61,10 @@ uintptr_t ts_maps_find_module(const struct TsMapList *list, const char *suffix, 
 // Maps a symbol address resolved in our own process onto the tracee's module base, keeping the
 // distance it has from `local_base`. Both steps wrap, like the ptrdiff_t arithmetic it replaces.
 uintptr_t ts_translate_remote_symbol(uintptr_t local_base, uintptr_t remote_base, uintptr_t symbol_addr);
+// Subtracts `bytes` from `sp` and clears the low four bits, i.e. the stack alignment step
+// every Android ABI needs before a call. The subtraction wraps, like the unsigned arithmetic
+// it replaces in align_stack().
+uintptr_t ts_reserve_stack(uintptr_t sp, size_t bytes);
 
 // snprintf-style renderers: they return the length the text needs, excluding the terminator, so
 // a return value >= capacity means the output was truncated. A null buffer or a zero capacity

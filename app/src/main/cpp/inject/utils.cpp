@@ -37,7 +37,6 @@ namespace {
 constexpr size_t kMaxPathLength = 256;
 constexpr size_t kMsgBufferSize = 64;
 constexpr int kInvalidFd = -1;
-constexpr uintptr_t kStackAlignment = 0xf;
 constexpr int kMaxArguments = 8;
 } // namespace
 
@@ -213,7 +212,7 @@ void *find_func_addr(const ts::MapScan &local_map, const ts::MapScan &remote_map
 }
 
 void align_stack(struct user_regs_struct &regs, uintptr_t preserve_bytes) {
-    regs.REG_SP = (regs.REG_SP - preserve_bytes) & ~kStackAlignment;
+    regs.REG_SP = ts_reserve_stack(static_cast<uintptr_t>(regs.REG_SP), preserve_bytes);
     LOGV("Stack aligned to %" PRIxPTR " (preserved %zu bytes)", static_cast<uintptr_t>(regs.REG_SP), preserve_bytes);
 }
 

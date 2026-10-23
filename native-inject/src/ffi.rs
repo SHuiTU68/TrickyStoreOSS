@@ -225,6 +225,15 @@ pub extern "C" fn ts_translate_remote_symbol(
     remote_base.wrapping_add(symbol_addr.wrapping_sub(local_base))
 }
 
+/// Reserves `bytes` bytes on the tracee stack and returns the 16-byte-aligned pointer.
+///
+/// Replaces the `sp - bytes` then `& ~0xf` pair in `align_stack`. The payload helpers keep their
+/// own subtraction so their log messages still report the raw payload size.
+#[no_mangle]
+pub extern "C" fn ts_reserve_stack(sp: usize, bytes: usize) -> usize {
+    remote::reserve_stack(sp, bytes)
+}
+
 /// Copies `text` into a caller buffer with `snprintf` semantics, returning the full length.
 ///
 /// The return value is the number of bytes the text needs *excluding* the terminator, so a
@@ -507,6 +516,11 @@ mod tests {
         assert_eq!(ts_translate_remote_symbol(0, 0, 0x5555), 0x5555);
     }
 
+    #[test]
+    fn reserve_stack_matches_the_cpp_alignment() {
+        assert_eq!(ts_reserve_stack(0x1000, 0), 0x1000);
+        assert_eq!(ts_reserve_stack(0x1000, 8), 0xff0);
+    }
     #[test]
     fn setfilecon_rejects_null() {
         // SAFETY: the function only checks for null before touching the pointers.
