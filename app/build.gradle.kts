@@ -143,11 +143,15 @@ val buildRustCertgen =
 // native-inject owns the pure-logic half of the injector: /proc/<pid>/maps parsing, wait-status
 // and PTRACE_EVENT rendering, magic-string generation and the SELinux knob writers. It builds to
 // a static archive that CMake links into libinject.so, so nothing new lands in jniLibs.
-val rustInjectOutDir = layout.buildDirectory.dir("rust/inject").get().asFile
 val rustInjectCrateDir = rootProject.projectDir.resolve("native-inject")
-// cargo-ndk only copies cdylib artifacts, and this crate is a staticlib, so the archive is
-// cross-built with plain cargo using the NDK's versioned clang wrapper from .cargo/config.toml,
-// then copied into the ABI directory CMake looks at.
+// The staging directory CMake looks at. Resolved eagerly at configuration time so the task body
+// only ever sees plain strings — build-script objects cannot be serialized by the configuration
+// cache, so nothing here may be deferred into a task action.
+val rustInjectAbiDir = layout.buildDirectory.dir("rust/inject/arm64-v8a").get().asFile
+val rustInjectArchive = rustInjectCrateDir.resolve("target/aarch64-linux-android/release/librustinject.a")
+// cargo-ndk only copies cdylib artifacts and this crate is a staticlib, so the archive is
+// cross-built with plain cargo (linker from .cargo/config.toml) and staged with `cp` in the very
+// same shell command instead of a doLast action.
 val ndkToolchainBin =
     ndkForCargo
         ?.let { file("$it/toolchains/llvm/prebuilt") }
@@ -159,24 +163,25 @@ val buildRustInject =
         group = "TrickyStoreOSS Native Build"
         description = "Builds librustinject.a for arm64-v8a (statically linked into libinject.so)."
         workingDir = rustInjectCrateDir
-        commandLine("cargo", "build", "--release", "--locked", "--target", "aarch64-linux-android")
+        commandLine(
+            "sh",
+            "-c",
+            "cargo build --release --locked --target aarch64-linux-android" +
+                " && mkdir -p '${rustInjectAbiDir.absolutePath}'" +
+                " && cp '${rustInjectArchive.absolutePath}' '${rustInjectAbiDir.absolutePath}/librustinject.a'",
+        )
         environment(
             "PATH",
-            listOfNotNull(ndkToolchainBin?.absolutePath, "${System.getProperty("user.home")}/.cargo/bin", System.getenv("PATH"))
-                .joinToString(":"),
+            listOfNotNull(
+                ndkToolchainBin?.absolutePath,
+                "${System.getProperty("user.home")}/.cargo/bin",
+                System.getenv("PATH"),
+            ).joinToString(":"),
         )
-
         inputs.dir(rustInjectCrateDir.resolve("src"))
         inputs.file(rustInjectCrateDir.resolve("Cargo.toml"))
         inputs.file(rustInjectCrateDir.resolve("Cargo.lock"))
-        outputs.dir(rustInjectOutDir)
-        doLast {
-            val abiDir = rustInjectOutDir.resolve("arm64-v8a")
-            abiDir.mkdirs()
-            rustInjectCrateDir
-                .resolve("target/aarch64-linux-android/release/librustinject.a")
-                .copyTo(abiDir.resolve("librustinject.a"), overwrite = true)
-        }
+        outputs.dir(rustInjectAbiDir)
     }
 // CMakeLists.txt consumes the archive by path, so it has to exist before every configure step.
 tasks.configureEach {
