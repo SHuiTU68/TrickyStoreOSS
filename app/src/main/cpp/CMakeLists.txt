@@ -38,7 +38,7 @@ set(RUSTINJECT_LIB
 if(NOT EXISTS "${RUSTINJECT_LIB}")
     message(
         FATAL_ERROR
-            "Missing ${RUSTINJECT_LIB}. Build it with `cargo ndk -t arm64-v8a -o app/build/rust/inject build --release` from native-inject/ (Gradle's buildRustInject task does this automatically), or point -DRUSTINJECT_LIB at an existing archive."
+            "Missing ${RUSTINJECT_LIB}. Build it with `cargo build --release --target aarch64-linux-android` from native-inject/ (Gradle's buildRustInject task does this and copies the archive here), or point -DRUSTINJECT_LIB at an existing archive."
     )
 endif()
 add_library(rustinject STATIC IMPORTED)

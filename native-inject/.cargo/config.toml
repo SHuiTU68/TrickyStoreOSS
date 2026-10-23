@@ -1,0 +1,4 @@
+# The NDK ships versioned clang wrappers on PATH; native-certgen uses the same names so both crates
+# can be cross-built the same way. Gradle prepends the NDK toolchain bin directory.
+[target.aarch64-linux-android]
+linker = "aarch64-linux-android29-clang"
