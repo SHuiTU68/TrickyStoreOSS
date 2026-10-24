@@ -1,13 +1,12 @@
 #!/system/bin/sh
-
 MODDIR=$1
-
-# Determine classpath
-if [ -f "$MODDIR/service.apk" ]; then
+# Determine classpath: prefer classes.dex (built without aapt2), fall back to service.apk.
+if [ -f "$MODDIR/classes.dex" ]; then
+    CLASSPATH="$MODDIR/classes.dex"
+elif [ -f "$MODDIR/service.apk" ]; then
     CLASSPATH="$MODDIR/service.apk"
 else
-    echo "Error: service.apk not found in $MODDIR"
+    echo "Error: neither classes.dex nor service.apk found in $MODDIR"
     exit 1
 fi
-
 exec /system/bin/app_process -Djava.class.path="$CLASSPATH" "$MODDIR" --nice-name=TrickyStoreOSS io.github.beakthoven.TrickyStoreOSS.MainKt

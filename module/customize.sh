@@ -2,21 +2,17 @@
 SKIPUNZIP=1
 MIN_SDK=29
 CONFIG_DIR=/data/adb/tricky_store
-
 # --- Installation Context Check ---
 if [ "$BOOTMODE" != true ]; then
   ui_print "! Please install in Magisk Manager or KernelSU Manager"
   abort "! Install from recovery is NOT supported"
 fi
-
 if [ "$KSU" = true ] && [ "$KSU_VER_CODE" -lt 10670 ]; then
   abort "! Please update your KernelSU and KernelSU Manager"
 fi
-
 # --- Version Info ---
 ui_print "- Installing Tricky Store OSS-RS $(grep_prop version "$TMPDIR/module.prop")"
 ui_print ""
-
 # --- Architecture Handling ---
 case "$ARCH" in
   arm64) ABI_DIR="arm64-v8a" ;;
@@ -25,7 +21,6 @@ case "$ARCH" in
   x86)   ABI_DIR="x86" ;;
   *)     abort "! Unsupported architecture: $ARCH" ;;
 esac
-
 # This build ships a single ABI (arm64-v8a); refuse cleanly on anything else.
 if ! unzip -l "$ZIPFILE" | grep -q "lib/$ABI_DIR/"; then
   abort "! This build only supports arm64-v8a (device platform: $ARCH)"
@@ -33,7 +28,6 @@ fi
 
 ui_print "- Device platform: $ARCH"
 ui_print "- Using ABI dir: $ABI_DIR"
-
 # --- SDK Check ---
 if [ "$API" -lt "$MIN_SDK" ]; then
   abort "! Unsupported SDK: $API. Minimum required is $MIN_SDK"
@@ -41,7 +35,6 @@ else
   ui_print "- Device SDK: $API"
 fi
 ui_print ""
-
 # --- Helper to install files ---
 install_file() {
   if ! unzip -qqjo "$ZIPFILE" "$1" -d "$2"; then
@@ -49,7 +42,6 @@ install_file() {
   fi
   ui_print "- Extracted $1"
 }
-
 # --- Remove any conflicting modules ---
 for remove_id in oh_my_keymint teesim; do
     if [ -d "/data/adb/modules/$remove_id" ]; then
@@ -57,30 +49,32 @@ for remove_id in oh_my_keymint teesim; do
         ui_print "! $(grep_prop name "/data/adb/modules/$remove_id/module.prop") module will be removed on next reboot"
     fi
 done
-
 # --- Installation ---
 ui_print "- Extracting module files"
 for file in customize.sh module.prop post-fs-data.sh service.sh sepolicy.rule daemon; do
   install_file "$file" "$MODPATH"
 done
 
-install_file "tricky-daemon" "$MODPATH"
-chmod 755 "$MODPATH/daemon" "$MODPATH/tricky-daemon"
+# The JVM control plane ships either as a bare classes.dex (manual build without aapt2) or as
+# service.apk (AGP build). daemon accepts both, so install whichever the zip carries.
+if unzip -l "$ZIPFILE" | grep -q "classes.dex$"; then
+  install_file "classes.dex" "$MODPATH"
+elif unzip -l "$ZIPFILE" | grep -q "service.apk$"; then
+  install_file "service.apk" "$MODPATH"
+else
+  abort "! Neither classes.dex nor service.apk found in package"
+fi
+chmod 755 "$MODPATH/daemon"
 ui_print ""
-
-
 ui_print "- Extracting $ARCH libraries"
 install_file "lib/$ABI_DIR/libTrickyStoreOSS.so" "$MODPATH"
 install_file "lib/$ABI_DIR/libinject.so" "$MODPATH"
 install_file "lib/$ABI_DIR/libcertgen.so" "$MODPATH"
-install_file "librustinject.so" "$MODPATH"
-chmod 755 "$MODPATH/librustinject.so"
 ui_print ""
-# `interceptor.rs` looks for `<module>/tricky-inject` and dlopen()s `<module>/librustinject.so`
-# next to it, so the injector is renamed on install — CMake still produces `libinject.so`.
-mv "$MODPATH/libinject.so" "$MODPATH/tricky-inject"
-chmod 755 "$MODPATH/tricky-inject"
-
+# `Keystore2Interceptor` spawns `<module>/inject <keystore2 pid> libTrickyStoreOSS.so entry`, so the
+# injector is renamed on install — CMake still produces `libinject.so`.
+mv "$MODPATH/libinject.so" "$MODPATH/inject"
+chmod 755 "$MODPATH/inject"
 # --- Configuration Files ---
 if [ ! -d "$CONFIG_DIR" ]; then
   ui_print "- Creating configuration directory"
@@ -91,7 +85,6 @@ if [ ! -f "$CONFIG_DIR/keybox.xml" ]; then
   ui_print "- Adding AOSP software keybox"
   install_file "keybox.xml" "$CONFIG_DIR"
 fi
-
 if [ ! -f "$CONFIG_DIR/target.txt" ]; then
   ui_print "- Adding default target scope"
   install_file "target.txt" "$CONFIG_DIR"
