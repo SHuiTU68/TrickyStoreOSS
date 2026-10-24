@@ -1,16 +1,13 @@
 #!/system/bin/sh
-# Thin shim over the Rust control plane.
-#
-# `service.sh` invokes `./daemon "$MODDIR"` from the supervisor loop and expects the caller to keep
-# running until it exits, so this file execs (never forks) and forwards the module root explicitly:
-# `tricky-daemon` would guess it from argv[0], but an explicit --module-dir survives relocations and
-# keeps the failure mode readable if the binary is ever moved into a subdirectory.
-MODDIR=${1:-${0%/*}}
 
-if [ ! -x "$MODDIR/tricky-daemon" ]; then
-    echo "Error: tricky-daemon not found in $MODDIR"
+MODDIR=$1
+
+# Determine classpath
+if [ -f "$MODDIR/service.apk" ]; then
+    CLASSPATH="$MODDIR/service.apk"
+else
+    echo "Error: service.apk not found in $MODDIR"
     exit 1
 fi
 
-# The daemon honours $TRICKY_STORE_DIR for the data directory, so no extra flag is needed here.
-exec "$MODDIR/tricky-daemon" --module-dir "$MODDIR"
+exec /system/bin/app_process -Djava.class.path="$CLASSPATH" "$MODDIR" --nice-name=TrickyStoreOSS io.github.beakthoven.TrickyStoreOSS.MainKt

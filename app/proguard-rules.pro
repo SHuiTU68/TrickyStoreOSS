@@ -1,6 +1,20 @@
 # Add project specific ProGuard rules here.
 # You can control the set of applied configuration files using the
 # proguardFiles setting in build.gradle.
+
+# The JVM control plane is launched directly via
+#   app_process -Djava.class.path=service.apk ... io.github.beakthoven.TrickyStoreOSS.MainKt
+# so the entry point and its whole package must survive R8.
+-keep class io.github.beakthoven.TrickyStoreOSS.MainKt { *; }
+-keep class io.github.beakthoven.TrickyStoreOSS.** { *; }
+
+# AIDL / hidden-API stubs are referenced by name through Binder at runtime.
+-keep class android.system.keystore2.** { *; }
+-keep class android.security.keymaster.** { *; }
+-keep class android.hardware.security.keymint.** { *; }
+-dontwarn android.system.**
+-dontwarn android.security.**
+-dontwarn android.hardware.**
 #
 # For more details, see
 #   http://developer.android.com/guide/developing/tools/proguard.html
@@ -57,3 +71,16 @@
 -overloadaggressively
 -keepattributes SourceFile,LineNumberTable,LocalVariableTable
 -renamesourcefileattribute
+# The JVM control plane is launched directly via
+#   app_process -Djava.class.path=service.apk ... io.github.beakthoven.TrickyStoreOSS.MainKt
+# so the entry point and its whole package must survive R8.
+-keep class io.github.beakthoven.TrickyStoreOSS.MainKt { *; }
+-keep class io.github.beakthoven.TrickyStoreOSS.** { *; }
+
+# AIDL / hidden-API stubs are resolved by name through Binder at runtime.
+-keep class android.system.keystore2.** { *; }
+-keep class android.security.keymaster.** { *; }
+-keep class android.hardware.security.keymint.** { *; }
+-dontwarn android.system.**
+-dontwarn android.security.**
+-dontwarn android.hardware.**

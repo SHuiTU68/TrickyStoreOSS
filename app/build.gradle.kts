@@ -392,14 +392,10 @@ androidComponents {
                         .replace("REPLACEMEVER", "$verName ($gitCommitCount-$gitCommitHash-$variantName)"),
                 )
 
-                // The Rust control plane and the payload it dlopen()s go to the module root:
-                // `module/daemon` execs `tricky-daemon`, and `interceptor.rs` looks for
-                // `<module>/librustinject.so` next to `<module>/tricky-inject`.
-                rustDaemonBinary.copyTo(tempDir.resolve("tricky-daemon"), overwrite = true)
-                rustInjectAbiDir
-                    .resolve("librustinject.so")
-                    .copyTo(tempDir.resolve("librustinject.so"), overwrite = true)
-
+                // `module/daemon` starts the JVM control plane with this APK as its classpath, so the
+                // APK has to be shipped next to the module scripts. The Rust daemon
+                // (`tricky-daemon`/`librustinject.so`) is still built but no longer installed: the
+                // Kotlin interceptors are the control plane again.
                 val apks = apkFile.get().asFile.walkTopDown()
                     .filter { it.isFile && it.extension == "apk" }
                     .sortedBy { it.invariantSeparatorsPath }
@@ -407,9 +403,9 @@ androidComponents {
                 check(apks.size == 1) { "Expected exactly one APK output for $variantName, found ${apks.size}" }
                 val apk = apks.single()
 
-                // The APK is only a carrier for the native libraries now that the JVM control plane
-                // is gone, so it is not shipped as service.apk: the module would otherwise carry
-                // every .so twice.
+                // The module needs the .so files unpacked, so they are pulled out of the APK and
+                // installed loose; the APK itself ships as `service.apk` because `module/daemon`
+                // runs `app_process` with it as the classpath.
                 ZipFile(apk).use { zip ->
                     val entries = zip.entries()
                     while (entries.hasMoreElements()) {
@@ -426,6 +422,9 @@ androidComponents {
                         }
                     }
                 }
+
+                // Shipped under the name `module/daemon` and `customize.sh` expect.
+                apk.copyTo(tempDir.resolve("service.apk"), overwrite = true)
             }
         }
 
