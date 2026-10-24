@@ -44,7 +44,11 @@ endif()
 add_library(rustinject STATIC IMPORTED)
 set_target_properties(rustinject PROPERTIES IMPORTED_LOCATION "${RUSTINJECT_LIB}")
 # std's runtime borrows from libdl/libm; `log` comes along for the bindings that log errors.
-target_link_libraries(rustinject INTERFACE dl log m)
+# `c++abi` is not optional: some of the objects the archive carries are compiled by a `cc` build
+# script with unwind tables, and they reference `DW.ref.__gxx_personality_v0`. The prefab `cxx`
+# module only ships libc++ itself (stl: none, exceptions off), so nothing in the default link line
+# defines that symbol and ld.lld fails with "undefined symbol: __gxx_personality_v0".
+target_link_libraries(rustinject INTERFACE dl log m c++abi)
 
 add_executable(libinject.so inject/main.cpp inject/utils.cpp)
 target_include_directories(libinject.so PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
