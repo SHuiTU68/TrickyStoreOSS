@@ -99,10 +99,10 @@ fn epoch_seconds() -> u64 {
 
 #[cfg(target_os = "android")]
 fn logcat(level: Level, message: &str) {
-    use std::ffi::CString;
+    use std::ffi::{c_char, CString};
 
     extern "C" {
-        fn __android_log_write(prio: i32, tag: *const i8, text: *const i8) -> i32;
+        fn __android_log_write(prio: i32, tag: *const c_char, text: *const c_char) -> i32;
     }
 
     // liblog priorities: 3 = DEBUG, 4 = INFO, 5 = WARN, 6 = ERROR.
