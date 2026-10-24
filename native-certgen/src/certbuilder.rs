@@ -113,7 +113,8 @@ fn build_leaf_cert(
     // The leaf is signed by the keybox (or designated attest) key, which is independent of the
     // leaf key's algorithm, so the signing algorithm must come from the signing key itself.
     let signing_algorithm = detect_signing_key_algorithm(&keybox.signing_key_der)?;
-    let sig_alg_der = signature_algorithm_for_signing_key(&keybox.signing_key_der, signing_algorithm)?;
+    let sig_alg_der =
+        signature_algorithm_for_signing_key(&keybox.signing_key_der, signing_algorithm)?;
 
     // Serial number
     let serial_bytes = if let Some(ref serial) = params.cert_serial {
@@ -196,9 +197,12 @@ fn sign_tbs_ec(tbs_der: &[u8], signing_key_der: &[u8]) -> Result<Vec<u8>> {
     // Determine EC curve from the signing key's PKCS8 AlgorithmIdentifier
     let alg = detect_ec_signing_algorithm(signing_key_der)?;
 
-    let key_pair =
-        ring::signature::EcdsaKeyPair::from_pkcs8(alg, signing_key_der, &ring::rand::SystemRandom::new())
-            .map_err(|e| CertGenError::SigningFailed(format!("EC key parse: {e}")))?;
+    let key_pair = ring::signature::EcdsaKeyPair::from_pkcs8(
+        alg,
+        signing_key_der,
+        &ring::rand::SystemRandom::new(),
+    )
+    .map_err(|e| CertGenError::SigningFailed(format!("EC key parse: {e}")))?;
 
     let rng = ring::rand::SystemRandom::new();
     let sig = key_pair
@@ -232,7 +236,9 @@ pub(crate) fn detect_ec_signing_algorithm(
     } else if params_oid == p384_oid {
         Ok(&ring::signature::ECDSA_P384_SHA384_ASN1_SIGNING)
     } else {
-        Err(CertGenError::SigningFailed(format!("unsupported EC curve OID: {params_oid}")))
+        Err(CertGenError::SigningFailed(format!(
+            "unsupported EC curve OID: {params_oid}"
+        )))
     }
 }
 
@@ -251,7 +257,10 @@ fn sign_tbs_rsa(tbs_der: &[u8], signing_key_der: &[u8]) -> Result<Vec<u8>> {
     Ok(signature.to_vec())
 }
 
-fn signature_algorithm_for_signing_key(signing_key_der: &[u8], algorithm: Algorithm) -> Result<Vec<u8>> {
+fn signature_algorithm_for_signing_key(
+    signing_key_der: &[u8],
+    algorithm: Algorithm,
+) -> Result<Vec<u8>> {
     match algorithm {
         Algorithm::Ec => {
             let ring_alg = detect_ec_signing_algorithm(signing_key_der)?;
@@ -319,11 +328,17 @@ fn extract_ec_spki(pkcs8_der: &[u8], info: &pkcs8::PrivateKeyInfo) -> Result<Vec
                 encode_der_oid(&[1, 3, 132, 0, 34]),
             )
         } else {
-            return Err(CertGenError::CertBuildFailed(format!("unsupported EC curve: {params_oid}")));
+            return Err(CertGenError::CertBuildFailed(format!(
+                "unsupported EC curve: {params_oid}"
+            )));
         };
 
-    let kp = ring::signature::EcdsaKeyPair::from_pkcs8(ring_alg, pkcs8_der, &ring::rand::SystemRandom::new())
-        .map_err(|e| CertGenError::CertBuildFailed(format!("EC key parse: {e}")))?;
+    let kp = ring::signature::EcdsaKeyPair::from_pkcs8(
+        ring_alg,
+        pkcs8_der,
+        &ring::rand::SystemRandom::new(),
+    )
+    .map_err(|e| CertGenError::CertBuildFailed(format!("EC key parse: {e}")))?;
     let ec_kp = kp.public_key().as_ref().to_vec();
 
     // SPKI = SEQUENCE { AlgorithmIdentifier, BIT STRING (public key) }
@@ -510,11 +525,17 @@ fn encode_der_length_bytes(len: usize) -> Vec<u8> {
     } else if len <= 0xFF_FFFF {
         vec![0x83, (len >> 16) as u8, (len >> 8) as u8, len as u8]
     } else {
-        vec![0x84, (len >> 24) as u8, (len >> 16) as u8, (len >> 8) as u8, len as u8]
+        vec![
+            0x84,
+            (len >> 24) as u8,
+            (len >> 16) as u8,
+            (len >> 8) as u8,
+            len as u8,
+        ]
     }
 }
 
-fn encode_der_tag_length_value(tag: u8, content: &[u8]) -> Vec<u8> {
+pub(crate) fn encode_der_tag_length_value(tag: u8, content: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(1 + 4 + content.len());
     out.push(tag);
     out.extend_from_slice(&encode_der_length_bytes(content.len()));
@@ -531,7 +552,7 @@ fn encode_der_sequence(items: &[&[u8]]) -> Vec<u8> {
     encode_der_tag_length_value(0x30, &content)
 }
 
-fn encode_der_sequence_of(items: &[Vec<u8>]) -> Vec<u8> {
+pub(crate) fn encode_der_sequence_of(items: &[Vec<u8>]) -> Vec<u8> {
     let total: usize = items.iter().map(|i| i.len()).sum();
     let mut content = Vec::with_capacity(total);
     for item in items {
@@ -547,6 +568,11 @@ fn encode_der_set(items: &[&[u8]]) -> Vec<u8> {
         content.extend_from_slice(item);
     }
     encode_der_tag_length_value(0x31, &content)
+}
+
+pub(crate) fn encode_der_set_slices(items: &[Vec<u8>]) -> Vec<u8> {
+    let refs: Vec<&[u8]> = items.iter().map(|item| item.as_slice()).collect();
+    encode_der_set(&refs)
 }
 
 fn encode_der_explicit_tag(tag_num: u8, content: &[u8]) -> Vec<u8> {
@@ -586,7 +612,7 @@ pub(crate) fn encode_der_bit_string(bits: &[u8]) -> Vec<u8> {
     encode_der_tag_length_value(0x03, &content)
 }
 
-fn encode_der_octet_string(content: &[u8]) -> Vec<u8> {
+pub(crate) fn encode_der_octet_string(content: &[u8]) -> Vec<u8> {
     encode_der_tag_length_value(0x04, content)
 }
 
@@ -714,13 +740,23 @@ mod tests {
         assert_eq!(cert.tbs_certificate.issuer, cert.tbs_certificate.subject);
         // the embedded subjectPublicKeyInfo matches the generated key's SPKI byte for byte
         assert_eq!(
-            cert.tbs_certificate.subject_public_key_info.to_der().unwrap(),
+            cert.tbs_certificate
+                .subject_public_key_info
+                .to_der()
+                .unwrap(),
             key.public_key_spki
         );
 
-        let point = cert.tbs_certificate.subject_public_key_info.subject_public_key.raw_bytes();
+        let point = cert
+            .tbs_certificate
+            .subject_public_key_info
+            .subject_public_key
+            .raw_bytes();
         UnparsedPublicKey::new(&ECDSA_P256_SHA256_ASN1, point)
-            .verify(&cert.tbs_certificate.to_der().unwrap(), cert.signature.raw_bytes())
+            .verify(
+                &cert.tbs_certificate.to_der().unwrap(),
+                cert.signature.raw_bytes(),
+            )
             .unwrap();
     }
 
@@ -736,19 +772,32 @@ mod tests {
         let leaf_key = ec_key();
         let chain = build_certificate_chain(&leaf_key, None, &keybox, &test_params()).unwrap();
         assert_eq!(chain.len(), 2);
-        assert_eq!(chain[1], ca_certs[0], "keybox certificates are appended verbatim");
+        assert_eq!(
+            chain[1], ca_certs[0],
+            "keybox certificates are appended verbatim"
+        );
 
         let leaf = x509_cert::Certificate::from_der(&chain[0]).unwrap();
         // issuer DN reuses the keybox leaf's subject bytes verbatim
-        assert_eq!(leaf.tbs_certificate.issuer.to_der().unwrap(), keybox.issuer_dn_der);
+        assert_eq!(
+            leaf.tbs_certificate.issuer.to_der().unwrap(),
+            keybox.issuer_dn_der
+        );
         // the leaf carries its own public key
         assert_eq!(
-            leaf.tbs_certificate.subject_public_key_info.to_der().unwrap(),
+            leaf.tbs_certificate
+                .subject_public_key_info
+                .to_der()
+                .unwrap(),
             leaf_key.public_key_spki
         );
         // the leaf notAfter is bounded by the keybox leaf (params.cert_not_after == -1)
         assert_eq!(
-            leaf.tbs_certificate.validity.not_after.to_unix_duration().as_secs() as i64,
+            leaf.tbs_certificate
+                .validity
+                .not_after
+                .to_unix_duration()
+                .as_secs() as i64,
             keybox.leaf_not_after
         );
 
@@ -761,7 +810,10 @@ mod tests {
             .raw_bytes()
             .to_vec();
         UnparsedPublicKey::new(&ECDSA_P256_SHA256_ASN1, &ca_point)
-            .verify(&leaf.tbs_certificate.to_der().unwrap(), leaf.signature.raw_bytes())
+            .verify(
+                &leaf.tbs_certificate.to_der().unwrap(),
+                leaf.signature.raw_bytes(),
+            )
             .unwrap();
     }
 
@@ -782,7 +834,10 @@ mod tests {
         let chain = build_self_signed_cert(&key, &params).unwrap();
         let cert = x509_cert::Certificate::from_der(&chain[0]).unwrap();
         assert_eq!(
-            cert.tbs_certificate.subject_public_key_info.to_der().unwrap(),
+            cert.tbs_certificate
+                .subject_public_key_info
+                .to_der()
+                .unwrap(),
             key.public_key_spki
         );
 

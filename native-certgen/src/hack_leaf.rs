@@ -17,7 +17,8 @@ use crate::attestation::{
     enc_boolean, enc_enumerated, enc_explicit_tag, enc_integer, enc_octet_string, enc_sequence,
 };
 use crate::certbuilder::{
-    detect_ec_signing_algorithm, detect_signing_key_algorithm, encode_der_bit_string, encode_der_oid,
+    detect_ec_signing_algorithm, detect_signing_key_algorithm, encode_der_bit_string,
+    encode_der_oid,
 };
 use crate::error::{CertGenError, Result};
 use crate::keybox::{parse_keybox, ParsedKeybox};
@@ -133,7 +134,12 @@ fn hack_leaf(req: &HackRequest, keybox: &ParsedKeybox) -> Result<Vec<u8>> {
     tbs_inner.extend_from_slice(&extensions_tagged);
     let tbs_der = enc_sequence(&tbs_inner);
 
-    let signature = sign_tbs(&tbs_der, &req.signing_private_key_pkcs8, signing_algorithm, digest)?;
+    let signature = sign_tbs(
+        &tbs_der,
+        &req.signing_private_key_pkcs8,
+        signing_algorithm,
+        digest,
+    )?;
     let signature_bits = encode_der_bit_string(&signature);
 
     let mut cert_inner = Vec::new();
@@ -161,9 +167,9 @@ fn rebuild_key_description(keydesc: &[u8], req: &HackRequest) -> Result<Vec<u8>>
     } else {
         7
     };
-    let tee_element = *elements
-        .get(tee_index)
-        .ok_or_else(|| CertGenError::CertBuildFailed("attestation extension is missing the TEE list".into()))?;
+    let tee_element = *elements.get(tee_index).ok_or_else(|| {
+        CertGenError::CertBuildFailed("attestation extension is missing the TEE list".into())
+    })?;
     let (_, tee_content, _) = read_tlv(tee_element)?;
     let tee_fields = iter_tlvs(tee_content)?;
     let new_tee = rebuild_tee_enforced(&tee_fields, req)?;
@@ -207,19 +213,26 @@ fn rebuild_tee_enforced(fields: &[&[u8]], req: &HackRequest) -> Result<Vec<u8>> 
 
     // Prefer the hash already baked into the original root of trust; only fall back to the caller's
     // value when the original is missing or malformed.
-    let boot_hash = extract_root_of_trust_hash(original_root_of_trust)
-        .unwrap_or_else(|| req.boot_hash.clone());
+    let boot_hash =
+        extract_root_of_trust_hash(original_root_of_trust).unwrap_or_else(|| req.boot_hash.clone());
 
     rebuilt.push((
         TAG_OS_VERSION,
         enc_explicit_tag(TAG_OS_VERSION, &enc_integer(req.os_version as i64)),
     ));
     push_patch_level(&mut rebuilt, TAG_OS_PATCHLEVEL, req.os_patch_override);
-    push_patch_level(&mut rebuilt, TAG_VENDOR_PATCHLEVEL, req.vendor_patch_override);
+    push_patch_level(
+        &mut rebuilt,
+        TAG_VENDOR_PATCHLEVEL,
+        req.vendor_patch_override,
+    );
     push_patch_level(&mut rebuilt, TAG_BOOT_PATCHLEVEL, req.boot_patch_override);
     rebuilt.push((
         TAG_ROOT_OF_TRUST,
-        enc_explicit_tag(TAG_ROOT_OF_TRUST, &build_root_of_trust(&req.boot_key, &boot_hash)),
+        enc_explicit_tag(
+            TAG_ROOT_OF_TRUST,
+            &build_root_of_trust(&req.boot_key, &boot_hash),
+        ),
     ));
 
     rebuilt.sort_by_key(|(tag, _)| *tag);
@@ -337,16 +350,23 @@ fn signature_algorithm_der(algorithm: Algorithm, digest: Digest) -> Vec<u8> {
 /// Signs the TBS with the keybox key, using `digest`. ring couples an EC key's curve to a single
 /// digest and cannot hash from the SHA-1 family, so those combinations throw and surface to the
 /// Kotlin caller as an error.
-fn sign_tbs(tbs_der: &[u8], signing_key_der: &[u8], algorithm: Algorithm, digest: Digest) -> Result<Vec<u8>> {
+fn sign_tbs(
+    tbs_der: &[u8],
+    signing_key_der: &[u8],
+    algorithm: Algorithm,
+    digest: Digest,
+) -> Result<Vec<u8>> {
     match algorithm {
         Algorithm::Ec => {
             let ring_algorithm = detect_ec_signing_algorithm(signing_key_der)?;
-            let native_digest =
-                if std::ptr::eq(ring_algorithm, &ring::signature::ECDSA_P384_SHA384_ASN1_SIGNING) {
-                    Digest::Sha384
-                } else {
-                    Digest::Sha256
-                };
+            let native_digest = if std::ptr::eq(
+                ring_algorithm,
+                &ring::signature::ECDSA_P384_SHA384_ASN1_SIGNING,
+            ) {
+                Digest::Sha384
+            } else {
+                Digest::Sha256
+            };
             if digest != native_digest {
                 return Err(CertGenError::SigningFailed(format!(
                     "EC key digest {native_digest:?} does not match leaf digest {digest:?}"
@@ -372,7 +392,9 @@ fn sign_tbs(tbs_der: &[u8], signing_key_der: &[u8], algorithm: Algorithm, digest
                 Digest::Sha384 => SigningKey::<rsa::sha2::Sha384>::new(private_key).sign(tbs_der),
                 Digest::Sha512 => SigningKey::<rsa::sha2::Sha512>::new(private_key).sign(tbs_der),
                 Digest::Sha1 => {
-                    return Err(CertGenError::SigningFailed("RSA with SHA-1 is unsupported natively".into()))
+                    return Err(CertGenError::SigningFailed(
+                        "RSA with SHA-1 is unsupported natively".into(),
+                    ))
                 }
             };
             Ok(signature.to_vec())
@@ -495,11 +517,17 @@ mod tests {
 
         let leaf_key = ec_key();
         let key_description = build_key_description(&params).unwrap();
-        let chain = build_certificate_chain(&leaf_key, Some(&key_description), &keybox, &params).unwrap();
+        let chain =
+            build_certificate_chain(&leaf_key, Some(&key_description), &keybox, &params).unwrap();
         (ca_key, ca_certs[0].clone(), chain[0].clone())
     }
 
-    fn encode_request(leaf_der: &[u8], key: &crate::types::GeneratedKeyPair, chain: &[u8], req: &HackSpec) -> Vec<u8> {
+    fn encode_request(
+        leaf_der: &[u8],
+        key: &crate::types::GeneratedKeyPair,
+        chain: &[u8],
+        req: &HackSpec,
+    ) -> Vec<u8> {
         let mut out = Vec::new();
         push(&mut out, leaf_der);
         push(&mut out, &key.private_key_pkcs8);
@@ -556,7 +584,10 @@ mod tests {
                 continue;
             }
             let children = iter_tlvs(inner).unwrap();
-            if children.iter().any(|c| read_tlv(c).unwrap().0 == TAG_ROOT_OF_TRUST) {
+            if children
+                .iter()
+                .any(|c| read_tlv(c).unwrap().0 == TAG_ROOT_OF_TRUST)
+            {
                 return children
                     .iter()
                     .map(|c| {
@@ -570,7 +601,10 @@ mod tests {
     }
 
     fn field(fields: &[(u32, Vec<u8>)], tag: u32) -> Option<Vec<u8>> {
-        fields.iter().find(|(t, _)| *t == tag).map(|(_, v)| v.clone())
+        fields
+            .iter()
+            .find(|(t, _)| *t == tag)
+            .map(|(_, v)| v.clone())
     }
 
     fn first_tlv_len(blob: &[u8]) -> usize {
@@ -598,7 +632,10 @@ mod tests {
         let leaf = Certificate::from_der(&blob[..leaf_len]).unwrap();
 
         // issuer reuses the keybox leaf's subject bytes
-        assert_eq!(leaf.tbs_certificate.issuer.to_der().unwrap(), keybox.issuer_dn_der);
+        assert_eq!(
+            leaf.tbs_certificate.issuer.to_der().unwrap(),
+            keybox.issuer_dn_der
+        );
 
         // signature must verify against the CA/keybox public key
         let ca_parsed = Certificate::from_der(&ca_cert).unwrap();
@@ -609,7 +646,10 @@ mod tests {
             .raw_bytes()
             .to_vec();
         UnparsedPublicKey::new(&ECDSA_P256_SHA256_ASN1, &point)
-            .verify(&leaf.tbs_certificate.to_der().unwrap(), leaf.signature.raw_bytes())
+            .verify(
+                &leaf.tbs_certificate.to_der().unwrap(),
+                leaf.signature.raw_bytes(),
+            )
             .unwrap();
 
         let fields = tee_fields(&blob[..leaf_len]);
@@ -621,13 +661,26 @@ mod tests {
         let boot_key = read_tlv(rot_elements[0]).unwrap().1;
         let boot_hash = read_tlv(rot_elements[3]).unwrap().1;
         assert_eq!(boot_key, vec![0x22; 32]);
-        assert_eq!(boot_hash, vec![0xAB; 32], "original boot hash must be preserved");
+        assert_eq!(
+            boot_hash,
+            vec![0xAB; 32],
+            "original boot hash must be preserved"
+        );
 
         // OS version was rebuilt, the OS patch level overridden, vendor/boot kept from the original
         assert_eq!(field(&fields, TAG_OS_VERSION).unwrap(), enc_integer(150000));
-        assert_eq!(field(&fields, TAG_OS_PATCHLEVEL).unwrap(), enc_integer(202505));
-        assert_eq!(field(&fields, TAG_VENDOR_PATCHLEVEL).unwrap(), enc_integer(20250301));
-        assert_eq!(field(&fields, TAG_BOOT_PATCHLEVEL).unwrap(), enc_integer(20250301));
+        assert_eq!(
+            field(&fields, TAG_OS_PATCHLEVEL).unwrap(),
+            enc_integer(202505)
+        );
+        assert_eq!(
+            field(&fields, TAG_VENDOR_PATCHLEVEL).unwrap(),
+            enc_integer(20250301)
+        );
+        assert_eq!(
+            field(&fields, TAG_BOOT_PATCHLEVEL).unwrap(),
+            enc_integer(20250301)
+        );
     }
 
     #[test]
@@ -678,7 +731,8 @@ mod tests {
             os_version: 140000,
             ..Default::default()
         };
-        let mut request = encode_request(&leaf_der, &ca_key, &keybox.cert_chain_ders.concat(), &spec);
+        let mut request =
+            encode_request(&leaf_der, &ca_key, &keybox.cert_chain_ders.concat(), &spec);
         request.push(0x00);
         assert!(HackRequest::decode(&request).is_err());
     }

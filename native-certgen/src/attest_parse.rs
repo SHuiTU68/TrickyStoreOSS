@@ -241,7 +241,8 @@ mod tests {
 
         let leaf_key = generate_key_pair(Algorithm::Ec, 256, Some(EcCurve::P256), 0).unwrap();
         let key_description = build_attestation_extension(&params).unwrap();
-        let chain = build_certificate_chain(&leaf_key, Some(&key_description), &keybox, &params).unwrap();
+        let chain =
+            build_certificate_chain(&leaf_key, Some(&key_description), &keybox, &params).unwrap();
         chain[0].clone()
     }
 
@@ -255,7 +256,16 @@ mod tests {
     }
 
     /// Decodes the response blob the same way the Kotlin caller does.
-    fn decode(blob: &[u8]) -> (i32, i32, Option<Vec<u8>>, Option<Vec<u8>>, Option<i32>, Option<Vec<u8>>) {
+    fn decode(
+        blob: &[u8],
+    ) -> (
+        i32,
+        i32,
+        Option<Vec<u8>>,
+        Option<Vec<u8>>,
+        Option<i32>,
+        Option<Vec<u8>>,
+    ) {
         let mut cursor = Cursor::new(blob);
         let attest_version = cursor.i32().unwrap();
         let keymaster_version = cursor.i32().unwrap();
@@ -264,19 +274,30 @@ mod tests {
         let os_version = cursor.optional_i32().unwrap();
         let module_hash = optional_blob(&mut cursor);
         assert!(cursor.is_at_end(), "response must not have trailing bytes");
-        (attest_version, keymaster_version, verified_boot_key, verified_boot_hash, os_version, module_hash)
+        (
+            attest_version,
+            keymaster_version,
+            verified_boot_key,
+            verified_boot_hash,
+            os_version,
+            module_hash,
+        )
     }
 
     /// Reads a presence byte then a length-prefixed blob, mirroring the encoder's optional format.
     fn optional_blob(cursor: &mut Cursor) -> Option<Vec<u8>> {
-        cursor.bool().unwrap().then(|| cursor.length_prefixed().unwrap())
+        cursor
+            .bool()
+            .unwrap()
+            .then(|| cursor.length_prefixed().unwrap())
     }
 
     #[test]
     fn parses_the_attested_fields() {
         let leaf = leaf_with_attestation();
         let blob = parse_attestation_blob(&request(&leaf, CHALLENGE)).unwrap();
-        let (attest_version, keymaster_version, boot_key, boot_hash, os_version, module_hash) = decode(&blob);
+        let (attest_version, keymaster_version, boot_key, boot_hash, os_version, module_hash) =
+            decode(&blob);
 
         assert_eq!(attest_version, 400);
         assert_eq!(keymaster_version, 41);
@@ -311,7 +332,8 @@ mod tests {
         let keybox = parse_keybox(&ca_cert[0], &ca_key.private_key_pkcs8).unwrap();
         let leaf_key = generate_key_pair(Algorithm::Ec, 256, Some(EcCurve::P256), 0).unwrap();
         let key_description = build_attestation_extension(&params).unwrap();
-        let chain = build_certificate_chain(&leaf_key, Some(&key_description), &keybox, &params).unwrap();
+        let chain =
+            build_certificate_chain(&leaf_key, Some(&key_description), &keybox, &params).unwrap();
 
         let blob = parse_attestation_blob(&request(&chain[0], CHALLENGE)).unwrap();
         let (_, _, boot_key, boot_hash, os_version, module_hash) = decode(&blob);

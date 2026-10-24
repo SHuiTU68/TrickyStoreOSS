@@ -47,7 +47,9 @@ pub fn read_tlv(data: &[u8]) -> Result<(u32, &[u8], usize)> {
         // buffer bounds this loop.
         let mut index = 1;
         loop {
-            let byte = *data.get(index).ok_or_else(|| truncated("truncated high-tag DER"))?;
+            let byte = *data
+                .get(index)
+                .ok_or_else(|| truncated("truncated high-tag DER"))?;
             number = number
                 .checked_mul(128)
                 .and_then(|shifted| shifted.checked_add((byte & 0x7F) as u32))
@@ -59,7 +61,9 @@ pub fn read_tlv(data: &[u8]) -> Result<(u32, &[u8], usize)> {
         }
         (number, index + 1)
     };
-    let length_first = *data.get(tag_len).ok_or_else(|| truncated("truncated DER length"))?;
+    let length_first = *data
+        .get(tag_len)
+        .ok_or_else(|| truncated("truncated DER length"))?;
     let (content_len, len_bytes) = if length_first < 0x80 {
         (length_first as usize, 1)
     } else {

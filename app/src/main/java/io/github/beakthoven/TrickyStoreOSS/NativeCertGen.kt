@@ -139,4 +139,129 @@ object NativeCertGen {
      * `keybox_xml` module), or throws if the label is unsupported or the body is not a certificate.
      */
     external fun nativeDecodePemCertificate(pem: String): ByteArray
+
+    /**
+     * Plans the boot-time global property spoofing from the text of `hide_props.txt` (see the Rust
+     * `hide_props` module) without touching the device.
+     *
+     * Returns `[notes][u32 BE scriptLen][script UTF-8][u32 BE changed][u32 BE removed]`, where the
+     * notes section is `[u32 BE count]{ [u8 level][u32 BE len][UTF-8 message] }`. The script is the
+     * whole plan in one `sh` command; the caller replays the notes through [Logger] and then runs it.
+     */
+    external fun nativeHidePropsPlan(config: String): ByteArray
+
+    /**
+     * Applies one property through `resetprop` natively (see the Rust `hide_props` module). Returns
+     * true when the property already held [value] or the write succeeded, false when it could not be
+     * applied (no `resetprop` on this device, or the shell command failed).
+     */
+    external fun nativeHidePropsSetProperty(
+        name: String,
+        value: String,
+    ): Boolean
+
+    /**
+     * Writes one key record into [dir] (see the Rust `persist` module).
+     *
+     * [record] is the version-4 encoding assembled by [PersistenceManager]. The native side
+     * re-validates every bound, picks the file name from the SHA-256 of the alias and performs the
+     * crash-safe write: `.tmp` at mode 0600 before the payload goes in, `fsync`, `rename` onto the
+     * live name, then a directory `fsync`. Returns true once the record is durable.
+     */
+    external fun nativePersistSave(
+        dir: String,
+        record: ByteArray,
+    ): Boolean
+
+    /**
+     * Reads every record in [dir] and returns
+     * `[u32 BE ok]{ [u32 BE len][record] }[u32 BE failed]{ [u32 BE len][name][u32 BE len][message] }`.
+     *
+     * Records come back re-encoded in canonical form, so the caller decodes exactly the field order
+     * the writer produced. A file that does not parse lands in the failure list instead of aborting
+     * the sweep.
+     */
+    external fun nativePersistLoad(dir: String): ByteArray
+
+    /**
+     * Removes the record that [uid] and [alias] map to. Returns true when the file is gone, whether
+     * this call deleted it or it was never there.
+     */
+    external fun nativePersistDelete(
+        dir: String,
+        uid: Int,
+        alias: String,
+    ): Boolean
+
+    /**
+     * Parses `target.txt` (see the Rust `config` module) and returns
+     * `[notes][u32 BE count]{ [u32 BE len][package][u8 mode] }`.
+     *
+     * The mode byte is the pinned discriminant: `0` auto, `1` leaf hack, `2` generate. Invalid
+     * lines are dropped with a warning in the notes section instead of failing the whole file, so
+     * one typo cannot leave the device with no targets at all.
+     */
+    external fun nativeConfigParseTargets(text: String): ByteArray
+
+    /**
+     * Parses `security_patch.txt` and returns
+     * `[notes][u32 BE count]{ [u32 BE len][context][u8 present][u32 BE len][value] x4 }`.
+     *
+     * The four value slots are `system`, `vendor`, `boot` and `all`; a zero presence byte means the
+     * key was absent and the caller falls back to `all`. An empty context name is the global block
+     * that applies to every package without an override.
+     */
+    external fun nativeConfigParsePatchLevels(text: String): ByteArray
+
+    /**
+     * Renders the four-line `tee_status` report (`status`, `category`, `serviceErrorCode`,
+     * `teeBroken`) for [status], [category] and [serviceErrorCode]. A null [category] and a
+     * negative [serviceErrorCode] are written as `none`.
+     */
+    external fun nativeConfigFormatTeeStatus(
+        status: String,
+        category: String?,
+        serviceErrorCode: Int,
+    ): String
+
+    /**
+     * Binder instance name of the KeyMint HAL for [securityLevel], or null for a security level
+     * KeyMint does not serve. `1` is trusted environment, `2` is StrongBox.
+     */
+    external fun nativeVersionKeyMintInstance(securityLevel: Int): String?
+
+    /**
+     * Scales a KeyMint `interfaceVersion` into eight bytes,
+     * `[i32 BE attestation][i32 BE keymaster]`, or null when the version is not positive.
+     */
+    external fun nativeVersionFromInterfaceVersion(interfaceVersion: Int): ByteArray?
+
+    /**
+     * Maps a legacy Keymaster `versionNumber` to its eight-byte
+     * `[i32 BE attestation][i32 BE keymaster]` pair, or null for an unrecognised backend.
+     */
+    external fun nativeVersionLegacyKeymaster(versionNumber: Int): ByteArray?
+
+    /**
+     * Builds the attestation application id natively from a packed request blob (see the Rust
+     * `aaid` module), returning `SEQUENCE { SET OF SEQUENCE { OCTET STRING packageName, INTEGER
+     * versionCode }, SET OF OCTET STRING signatureDigest }`.
+     *
+     * The request is `[u32 BE packageCount]{ [u32 BE nameLen][name UTF-8][i64 BE versionCode]
+     * [u32 BE digestCount]{ [u32 BE len][digest] } }`; walking the PackageManager stays on this
+     * side because only the Android API can see it.
+     */
+    external fun nativeApplicationId(request: ByteArray): ByteArray?
+
+    /**
+     * Derives the KeyMint `unique_id` natively (see the Rust `aaid` module): HMAC-SHA256 over
+     * `[i64 BE temporal counter][application id DER][0x00]` keyed by [key], truncated to 16 bytes.
+     *
+     * Returns null when [key] is empty, which the caller reports as a configuration error.
+     */
+    external fun nativeUniqueId(
+        creationTimeMs: Long,
+        applicationId: ByteArray,
+        key: ByteArray,
+    ): ByteArray?
 }

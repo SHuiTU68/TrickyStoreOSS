@@ -11,16 +11,37 @@ import android.os.FileObserver
 import android.os.IBinder
 import android.os.IInterface
 import android.os.ServiceManager
-import io.github.beakthoven.TrickyStoreOSS.AttestUtils.ProbeStatus
 import io.github.beakthoven.TrickyStoreOSS.AttestUtils
+import io.github.beakthoven.TrickyStoreOSS.AttestUtils.ProbeStatus
 import io.github.beakthoven.TrickyStoreOSS.KeyBoxUtils
+import io.github.beakthoven.TrickyStoreOSS.NativeCertGen
 import io.github.beakthoven.TrickyStoreOSS.interceptors.SecurityLevelInterceptor
 import io.github.beakthoven.TrickyStoreOSS.logging.Logger
 import java.io.File
+import java.nio.ByteBuffer
 import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
 
+/**
+ * State that the keystore path reads on every request, rebuilt from the three config files in
+ * [CONFIG_PATH].
+ *
+ * The files' *contents* are parsed in the native crate (`native-certgen`'s `config` module): the
+ * `target.txt` line grammar, the `security_patch.txt` block grammar and the `tee_status` report are
+ * pure functions over text, unit-tested on the host, and they are the only place that knows which
+ * spellings are accepted. This object owns everything that is not text processing:
+ *
+ *  - the file system side: watching the directory, reading the files, debouncing `keybox.xml`;
+ *  - the binder side: resolving `IPackageManager` for the calling UID so [Mode.AUTO] can be
+ *    resolved against the live TEE probe, and answering the per-UID permission lookups;
+ *  - the publication side: swapping the immutable tables through `@Volatile` fields so a binder
+ *    thread never observes a half-built snapshot.
+ *
+ * Each table is decoded from a length-prefixed blob; every count is checked against the bytes that
+ * are actually left before it is used to size a collection, because the blob crosses JNI and a
+ * truncated one must not be able to ask for a huge allocation.
+ */
 object PkgConfig {
     // volatile immutable map; swapped on reload so binder threads read a consistent snapshot
     @Volatile private var packageModes: Map<String, Mode> = emptyMap()
@@ -31,29 +52,26 @@ object PkgConfig {
         GENERATE,
     }
 
-    private val packageNameRegex = Regex("[A-Za-z_][A-Za-z0-9_]*(\\.[A-Za-z_][A-Za-z0-9_]*)+")
+    // Must match `report::Level` in the native crate, which is the wire contract for the notes.
+    private const val LEVEL_DEBUG = 1
+    private const val LEVEL_WARN = 2
+    private const val LEVEL_ERROR = 3
+
+    /** The probe never produced a service error code; the native formatter writes `none` for it. */
+    private const val NO_SERVICE_ERROR_CODE = -1
+
+    private const val CONFIG_PATH = "/data/adb/tricky_store"
+    private const val TARGET_FILE = "target.txt"
+    private const val KEYBOX_FILE = "keybox.xml"
+    private const val TEE_STATUS_FILE = "tee_status"
+    private const val PATCHLEVEL_FILE = "security_patch.txt"
+    private val root = File(CONFIG_PATH)
 
     private fun updateTargetPackages(f: File?) {
         val raw = runCatching {
-            val modes = mutableMapOf<String, Mode>()
-            f?.readLines()?.forEach { line ->
-                val n = line.substringBefore('#').trim()
-                if (n.isEmpty()) return@forEach
-                val mode = when {
-                    n.endsWith("!") -> Mode.GENERATE
-                    n.endsWith("?") -> Mode.LEAF_HACK
-                    else -> Mode.AUTO
-                }
-                val packageName = when (mode) {
-                    Mode.GENERATE, Mode.LEAF_HACK -> n.dropLast(1).trim()
-                    Mode.AUTO -> n
-                }
-                if (packageName.endsWith('!') || packageName.endsWith('?') || !packageNameRegex.matches(packageName)) {
-                    Logger.w("ignoring invalid target package entry: $n")
-                    return@forEach
-                }
-                modes[packageName] = mode
-            }
+            // A missing file is an empty target list, not an error: the daemon then rewrites
+            // certificates for nobody, which is the documented meaning of an absent target.txt.
+            val modes = parseTargets(NativeCertGen.nativeConfigParseTargets(f?.readText() ?: ""))
             packageModes = modes
             SecurityLevelInterceptor.invalidatePatchedResponses()
             Logger.i("update target packages: $modes")
@@ -94,12 +112,6 @@ object PkgConfig {
         raw.onFailure { Logger.e("failed to read keybox file") }
     }
 
-    private const val CONFIG_PATH = "/data/adb/tricky_store"
-    private const val TARGET_FILE = "target.txt"
-    private const val KEYBOX_FILE = "keybox.xml"
-    private const val TEE_STATUS_FILE = "tee_status"
-    private const val PATCHLEVEL_FILE = "security_patch.txt"
-    private val root = File(CONFIG_PATH)
     private val keyboxReloadExecutor = Executors.newSingleThreadExecutor { r ->
         Thread(r, "ts-keybox-reload").apply { isDaemon = true }
     }
@@ -129,18 +141,14 @@ object PkgConfig {
     private fun storeTEEStatus(root: File) {
         val result = AttestUtils.probeResult
         probe = result
-        val teeBroken = when (result.status) {
-            ProbeStatus.AVAILABLE -> false
-            ProbeStatus.FAILED -> true
-            ProbeStatus.UNAVAILABLE -> null
-        }
         val statusFile = File(root, TEE_STATUS_FILE)
         try {
             statusFile.writeText(
-                "status=${result.status}\n" +
-                    "category=${result.failureCategory ?: "none"}\n" +
-                    "serviceErrorCode=${result.serviceErrorCode ?: "none"}\n" +
-                    "teeBroken=${teeBroken ?: "unknown"}",
+                NativeCertGen.nativeConfigFormatTeeStatus(
+                    result.status.name,
+                    result.failureCategory,
+                    result.serviceErrorCode ?: NO_SERVICE_ERROR_CODE,
+                ),
             )
             Logger.i(
                 "TEE status written to $statusFile: status=${result.status}, " +
@@ -261,8 +269,6 @@ object PkgConfig {
         return packages.firstNotNullOfOrNull { packagePatchLevels[it] }
     }
 
-    private val patchSectionRegex = Regex("^\\[([A-Za-z0-9_.-]+)]$")
-
     fun updatePatchLevel(f: File?) {
         val raw = runCatching {
             if (f == null || !f.exists()) {
@@ -271,16 +277,7 @@ object PkgConfig {
                 SecurityLevelInterceptor.invalidatePatchedResponses()
                 return@runCatching
             }
-            val contexts = LinkedHashMap<String, MutableList<String>>()
-            var current = ""
-            f.readLines().forEach { line ->
-                val trimmed = line.substringBefore('#').trim()
-                if (trimmed.isEmpty()) return@forEach
-                patchSectionRegex.find(trimmed)?.let { current = it.groupValues[1] }
-                    ?: contexts.getOrPut(current) { mutableListOf() }.add(trimmed)
-            }
-            val parsed = mutableMapOf<String, CustomPatchLevel>()
-            for ((ctx, lines) in contexts) parsePatchContext(lines)?.let { parsed[ctx] = it }
+            val parsed = parsePatchLevels(NativeCertGen.nativeConfigParsePatchLevels(f.readText()))
             globalPatchLevel = parsed[""]
             packagePatchLevels = parsed.filterKeys { it.isNotEmpty() }
             SecurityLevelInterceptor.invalidatePatchedResponses()
@@ -291,23 +288,102 @@ object PkgConfig {
         raw.onFailure { Logger.e("failed to update patch level", it) }
     }
 
-    private fun parsePatchContext(lines: List<String>): CustomPatchLevel? {
-        if (lines.isEmpty()) return null
-        if (lines.size == 1 && '=' !in lines[0]) return CustomPatchLevel(all = lines[0])
-        val map = mutableMapOf<String, String>()
-        for (line in lines) {
-            val idx = line.indexOf('=')
-            if (idx > 0) {
-                map[line.substring(0, idx).trim().lowercase()] = line.substring(idx + 1).trim()
+    /**
+     * Decodes the `target.txt` blob: `[notes][u32 count]{ [text package][u8 mode] }`.
+     *
+     * The table is filled in file order, so a later line for the same package replaces an earlier
+     * one — the last spelling wins, exactly as it did when the file was read line by line.
+     */
+    private fun parseTargets(blob: ByteArray): Map<String, Mode> {
+        val buffer = ByteBuffer.wrap(blob)
+        replayNotes(buffer)
+        require(buffer.remaining() >= 4) { "truncated native target.txt blob" }
+        val count = buffer.int
+        // Each entry costs at least five bytes: a four-byte length prefix plus the mode byte.
+        require(count in 0..(buffer.remaining() / 5)) {
+            "malformed native target.txt entry count: $count"
+        }
+        val modes = LinkedHashMap<String, Mode>(count)
+        repeat(count) {
+            val packageName = buffer.readLengthPrefixed().toString(Charsets.UTF_8)
+            require(buffer.remaining() >= 1) { "truncated native target.txt mode" }
+            val mode = when (val code = buffer.get().toInt() and 0xFF) {
+                0 -> Mode.AUTO
+                1 -> Mode.LEAF_HACK
+                2 -> Mode.GENERATE
+                else -> throw IllegalArgumentException("unknown native target mode byte: $code")
+            }
+            modes[packageName] = mode
+        }
+        require(!buffer.hasRemaining()) { "trailing bytes in native target.txt blob" }
+        return modes
+    }
+
+    /**
+     * Decodes the `security_patch.txt` blob:
+     * `[notes][u32 count]{ [text context][opt text system][opt text vendor][opt text boot][opt text all] }`.
+     *
+     * The empty context name is the global block; the caller splits it off the table.
+     */
+    private fun parsePatchLevels(blob: ByteArray): LinkedHashMap<String, CustomPatchLevel> {
+        val buffer = ByteBuffer.wrap(blob)
+        replayNotes(buffer)
+        require(buffer.remaining() >= 4) { "truncated native patch level blob" }
+        val count = buffer.int
+        // Each block costs at least eight bytes: a four-byte context length plus four presence bytes.
+        require(count in 0..(buffer.remaining() / 8)) {
+            "malformed native patch level block count: $count"
+        }
+        val parsed = LinkedHashMap<String, CustomPatchLevel>(count)
+        repeat(count) {
+            val context = buffer.readLengthPrefixed().toString(Charsets.UTF_8)
+            parsed[context] =
+                CustomPatchLevel(
+                    system = buffer.readOptionalText(),
+                    vendor = buffer.readOptionalText(),
+                    boot = buffer.readOptionalText(),
+                    all = buffer.readOptionalText(),
+                )
+        }
+        require(!buffer.hasRemaining()) { "trailing bytes in native patch level blob" }
+        return parsed
+    }
+
+    /**
+     * Replays the leading notes section — `[u32 count]{ [u8 level][u32 len][message] }` — through
+     * [Logger], then leaves the buffer positioned at the payload. The parsers live on the native side
+     * and have no log sink, so they hand their warnings back instead of printing them.
+     */
+    private fun replayNotes(buffer: ByteBuffer) {
+        require(buffer.remaining() >= 4) { "truncated native notes section" }
+        val count = buffer.int
+        // Each note costs at least five bytes: one level plus a four-byte length prefix.
+        require(count in 0..(buffer.remaining() / 5)) { "malformed native note count: $count" }
+        repeat(count) {
+            require(buffer.remaining() >= 5) { "truncated native note" }
+            val level = buffer.get().toInt() and 0xFF
+            val message = buffer.readLengthPrefixed().toString(Charsets.UTF_8)
+            when (level) {
+                LEVEL_DEBUG -> Logger.d(message)
+                LEVEL_WARN -> Logger.w(message)
+                LEVEL_ERROR -> Logger.e(message)
+                else -> Logger.i(message)
             }
         }
-        val all = map["all"]
-        return CustomPatchLevel(
-            system = map["system"] ?: all,
-            vendor = map["vendor"] ?: all,
-            boot = map["boot"] ?: all,
-            all = all,
-        )
+    }
+
+    private fun ByteBuffer.readLengthPrefixed(): ByteArray {
+        require(remaining() >= 4) { "truncated native config field" }
+        val length = int
+        require(length in 0..remaining()) { "malformed native config blob" }
+        val bytes = ByteArray(length)
+        get(bytes)
+        return bytes
+    }
+
+    private fun ByteBuffer.readOptionalText(): String? {
+        require(remaining() >= 1) { "truncated native optional text presence" }
+        return if (get().toInt() == 0) null else readLengthPrefixed().toString(Charsets.UTF_8)
     }
 
     private fun waitAndGetSystemService(name: String): IBinder? {

@@ -32,7 +32,9 @@ pub fn build_attestation_extension(params: &CertGenParams) -> Result<Vec<u8>> {
     // keymintSecurityLevel — ENUMERATED, not INTEGER
     inner.extend_from_slice(&enc_enumerated(params.security_level));
     // attestationChallenge — OCTET STRING
-    inner.extend_from_slice(&enc_octet_string(params.attestation_challenge.as_deref().unwrap_or(&[])));
+    inner.extend_from_slice(&enc_octet_string(
+        params.attestation_challenge.as_deref().unwrap_or(&[]),
+    ));
     // uniqueId — OCTET STRING (empty when the caller requested none)
     inner.extend_from_slice(&enc_octet_string(&params.unique_id));
     // softwareEnforced
@@ -288,7 +290,13 @@ pub(crate) fn enc_length(len: usize) -> Vec<u8> {
     } else if len <= 0xFF_FFFF {
         vec![0x83, (len >> 16) as u8, (len >> 8) as u8, len as u8]
     } else {
-        vec![0x84, (len >> 24) as u8, (len >> 16) as u8, (len >> 8) as u8, len as u8]
+        vec![
+            0x84,
+            (len >> 24) as u8,
+            (len >> 16) as u8,
+            (len >> 8) as u8,
+            len as u8,
+        ]
     }
 }
 
@@ -436,7 +444,10 @@ mod tests {
     #[test]
     fn test_enc_integer_large() {
         // 20250301 = 0x01_34_FE_BD
-        assert_eq!(enc_integer(20250301), vec![0x02, 0x04, 0x01, 0x34, 0xFE, 0xBD]);
+        assert_eq!(
+            enc_integer(20250301),
+            vec![0x02, 0x04, 0x01, 0x34, 0xFE, 0xBD]
+        );
     }
 
     #[test]
@@ -546,14 +557,14 @@ mod tests {
         assert_eq!(rot[0], 0x30);
         // Find BOOLEAN TRUE inside
         let rot_inner = &rot[2..]; // skip tag+length
-        // First: OCTET STRING (32 bytes boot key)
+                                   // First: OCTET STRING (32 bytes boot key)
         assert_eq!(rot_inner[0], 0x04);
         assert_eq!(rot_inner[1], 0x20); // 32 bytes
-        // After boot key (34 bytes): BOOLEAN TRUE
+                                        // After boot key (34 bytes): BOOLEAN TRUE
         assert_eq!(rot_inner[34], 0x01); // BOOLEAN tag
         assert_eq!(rot_inner[35], 0x01); // length 1
         assert_eq!(rot_inner[36], 0xFF); // TRUE = 0xFF
-        // Then ENUMERATED 0 (verifiedBootState)
+                                         // Then ENUMERATED 0 (verifiedBootState)
         assert_eq!(rot_inner[37], 0x0A); // ENUMERATED tag, not 0x02
         assert_eq!(rot_inner[38], 0x01);
         assert_eq!(rot_inner[39], 0x00);
@@ -570,8 +581,14 @@ mod tests {
         // Tags 706, 718, 719 should not appear
         // Tag 706 = BF 85 42, 718 = BF 85 4E, 719 = BF 85 4F
         assert!(!hex.contains("bf8542"), "os_patch_level should be omitted");
-        assert!(!hex.contains("bf854e"), "vendor_patch_level should be omitted");
-        assert!(!hex.contains("bf854f"), "boot_patch_level should be omitted");
+        assert!(
+            !hex.contains("bf854e"),
+            "vendor_patch_level should be omitted"
+        );
+        assert!(
+            !hex.contains("bf854f"),
+            "boot_patch_level should be omitted"
+        );
     }
 
     #[test]
@@ -609,7 +626,10 @@ mod tests {
         let tags = extract_tag_numbers(inner);
         let mut sorted = tags.clone();
         sorted.sort();
-        assert_eq!(tags, sorted, "AuthorizationList fields must be sorted by tag number");
+        assert_eq!(
+            tags, sorted,
+            "AuthorizationList fields must be sorted by tag number"
+        );
     }
 
     #[test]
@@ -622,10 +642,22 @@ mod tests {
         let sw = build_software_enforced(&params);
         let inner = skip_tlv_header(&sw);
         let tags = extract_tag_numbers(inner);
-        assert!(tags.contains(&400), "ACTIVE_DATETIME (400) must be in softwareEnforced");
-        assert!(tags.contains(&404), "MAX_USES_PER_BOOT (404) must be in softwareEnforced");
-        assert!(tags.contains(&405), "USAGE_COUNT_LIMIT (405) must be in softwareEnforced");
-        assert!(tags.contains(&509), "UNLOCKED_DEVICE_REQUIRED (509) must be in softwareEnforced");
+        assert!(
+            tags.contains(&400),
+            "ACTIVE_DATETIME (400) must be in softwareEnforced"
+        );
+        assert!(
+            tags.contains(&404),
+            "MAX_USES_PER_BOOT (404) must be in softwareEnforced"
+        );
+        assert!(
+            tags.contains(&405),
+            "USAGE_COUNT_LIMIT (405) must be in softwareEnforced"
+        );
+        assert!(
+            tags.contains(&509),
+            "UNLOCKED_DEVICE_REQUIRED (509) must be in softwareEnforced"
+        );
     }
 
     #[test]
@@ -634,8 +666,14 @@ mod tests {
         params.caller_nonce = true;
         let tee = build_tee_enforced(&params);
         let tags = extract_tag_numbers(skip_tlv_header(&tee));
-        assert!(tags.contains(&1005), "CALLER_NONCE must be tag 1005 in teeEnforced");
-        assert!(!tags.contains(&303), "CALLER_NONCE must not use the software tag 303");
+        assert!(
+            tags.contains(&1005),
+            "CALLER_NONCE must be tag 1005 in teeEnforced"
+        );
+        assert!(
+            !tags.contains(&303),
+            "CALLER_NONCE must not use the software tag 303"
+        );
     }
 
     #[test]
@@ -645,7 +683,10 @@ mod tests {
         let tee = build_tee_enforced(&params);
         let inner = skip_tlv_header(&tee);
         let tags = extract_tag_numbers(inner);
-        assert!(!tags.contains(&503), "NO_AUTH_REQUIRED (503) must be absent when false");
+        assert!(
+            !tags.contains(&503),
+            "NO_AUTH_REQUIRED (503) must be absent when false"
+        );
     }
 
     #[test]
@@ -654,10 +695,22 @@ mod tests {
         let sw = build_software_enforced(&params);
         let inner = skip_tlv_header(&sw);
         let tags = extract_tag_numbers(inner);
-        assert!(!tags.contains(&400), "ACTIVE_DATETIME should be absent when -1");
-        assert!(!tags.contains(&404), "MAX_USES_PER_BOOT should be absent when 0");
-        assert!(!tags.contains(&405), "USAGE_COUNT_LIMIT should be absent when 0");
-        assert!(!tags.contains(&509), "UNLOCKED_DEVICE_REQUIRED should be absent when false");
+        assert!(
+            !tags.contains(&400),
+            "ACTIVE_DATETIME should be absent when -1"
+        );
+        assert!(
+            !tags.contains(&404),
+            "MAX_USES_PER_BOOT should be absent when 0"
+        );
+        assert!(
+            !tags.contains(&405),
+            "USAGE_COUNT_LIMIT should be absent when 0"
+        );
+        assert!(
+            !tags.contains(&509),
+            "UNLOCKED_DEVICE_REQUIRED should be absent when false"
+        );
     }
 
     #[test]

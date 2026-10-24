@@ -53,7 +53,11 @@ impl<'a> Cursor<'a> {
     /// Reads a presence byte followed by an `i32` when set, modelling an optional enum-valued
     /// field that the Kotlin caller may leave unset.
     pub fn optional_i32(&mut self) -> Result<Option<i32>> {
-        Ok(if self.bool()? { Some(self.i32()?) } else { None })
+        Ok(if self.bool()? {
+            Some(self.i32()?)
+        } else {
+            None
+        })
     }
 
     pub fn i64(&mut self) -> Result<i64> {
@@ -116,11 +120,75 @@ impl<'a> Cursor<'a> {
     pub fn is_at_end(&self) -> bool {
         self.pos >= self.data.len()
     }
+    /// Hands out an unsized slice of exactly `len` bytes, for callers that already validated the
+    /// length against their own limits (see [`crate::persist`]) and only need the payload.
+    pub fn take_bytes(&mut self, len: usize) -> Result<&'a [u8]> {
+        self.take(len)
+    }
+    /// Reads a presence byte followed by a `bool` when set.
+    pub fn optional_bool(&mut self) -> Result<Option<bool>> {
+        Ok(if self.bool()? {
+            Some(self.bool()?)
+        } else {
+            None
+        })
+    }
+    /// Reads a presence byte followed by an `i64` when set.
+    pub fn optional_i64(&mut self) -> Result<Option<i64>> {
+        Ok(if self.bool()? {
+            Some(self.i64()?)
+        } else {
+            None
+        })
+    }
 }
 
 /// The shared error for a truncated or over-long request blob.
 pub fn malformed(msg: &str) -> CertGenError {
     CertGenError::InvalidParameter(format!("malformed request: {msg}"))
+}
+
+/// Forward-only writer for the response blobs the JNI entry points return.
+///
+/// Everything this crate hands back to Kotlin is length-prefixed big-endian, mirroring [`Cursor`], so
+/// the Kotlin decoder is a single `ByteBuffer` walk per entry point. The writer is a plain `Vec`
+/// because every caller builds the blob in one go and the sizes involved (a keybox report, a
+/// property-spoofing plan) are small.
+#[derive(Default)]
+pub struct Encoder {
+    buf: Vec<u8>,
+}
+
+impl Encoder {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn u8(&mut self, value: u8) -> &mut Self {
+        self.buf.push(value);
+        self
+    }
+
+    pub fn u32(&mut self, value: u32) -> &mut Self {
+        self.buf.extend_from_slice(&value.to_be_bytes());
+        self
+    }
+
+    /// Appends `[u32 BE length][bytes]`.
+    pub fn bytes(&mut self, bytes: &[u8]) -> &mut Self {
+        self.u32(bytes.len() as u32);
+        self.buf.extend_from_slice(bytes);
+        self
+    }
+
+    /// Appends `[u32 BE length][UTF-8]`.
+    pub fn text(&mut self, text: &str) -> &mut Self {
+        self.bytes(text.as_bytes())
+    }
+
+    pub fn into_vec(self) -> Vec<u8> {
+        self.buf
+    }
 }
 
 #[cfg(test)]

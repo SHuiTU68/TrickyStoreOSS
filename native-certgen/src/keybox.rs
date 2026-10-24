@@ -80,9 +80,9 @@ fn split_der_certificates(data: &[u8]) -> Result<Vec<Vec<u8>>> {
     let mut certs = Vec::new();
     let mut offset = 0usize;
     while offset < data.len() {
-        let rest = data
-            .get(offset..)
-            .ok_or_else(|| CertGenError::KeyboxParseFailed("certificate offset out of range".into()))?;
+        let rest = data.get(offset..).ok_or_else(|| {
+            CertGenError::KeyboxParseFailed("certificate offset out of range".into())
+        })?;
         let (tag, _, total_len) = tlv::read_tlv(rest).map_err(|e| {
             CertGenError::KeyboxParseFailed(format!("malformed cert at offset {offset}: {e}"))
         })?;
@@ -107,7 +107,9 @@ fn split_der_certificates(data: &[u8]) -> Result<Vec<Vec<u8>>> {
         offset += total_len;
     }
     if certs.is_empty() {
-        return Err(CertGenError::KeyboxParseFailed("no certificates in chain".into()));
+        return Err(CertGenError::KeyboxParseFailed(
+            "no certificates in chain".into(),
+        ));
     }
     Ok(certs)
 }

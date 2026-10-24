@@ -19,7 +19,10 @@ pub fn build_certificate_chain_blob(request: &[u8]) -> Result<Vec<u8>> {
     // destructured) until this function returns: its `Drop` wipes whatever the builder did not take,
     // including on the early `?` returns above and below.
     let mut request = ChainBuildRequest::decode(request)?;
-    let keybox = parse_keybox(&request.signing_chain_der, &request.signing_private_key_pkcs8)?;
+    let keybox = parse_keybox(
+        &request.signing_chain_der,
+        &request.signing_private_key_pkcs8,
+    )?;
     // The chain builder only reads the private key (it derives the SPKI itself), so the public
     // half stays empty. `mem::take` moves the key out and leaves an empty vector behind, which
     // `Drop` then finds nothing to wipe in.

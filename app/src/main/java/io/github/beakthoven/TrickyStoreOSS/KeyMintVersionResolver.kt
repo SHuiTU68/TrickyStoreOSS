@@ -6,26 +6,30 @@
 package io.github.beakthoven.TrickyStoreOSS
 
 import android.hardware.security.keymint.IKeyMintDevice
-import android.hardware.security.keymint.SecurityLevel
 import android.os.Build
 import android.os.IBinder
 import android.os.Parcel
 import android.os.ServiceManager
 import androidx.annotation.RequiresApi
 import io.github.beakthoven.TrickyStoreOSS.logging.Logger
+import java.nio.ByteBuffer
 
-/** Resolves versions from Android 12+ native KeyMint and legacy Keymaster backends. */
+/**
+ * Resolves versions from Android 12+ native KeyMint and legacy Keymaster backends.
+ *
+ * Only the binder plumbing lives here: the service lookup, the AIDL `interfaceVersion` read and the
+ * hand-rolled compat `Parcel` transaction all need a live `IBinder`, so they cannot move. Everything
+ * that turns a number into an attestation/keymaster pair — the KeyMint instance names, the
+ * `interfaceVersion * 100` scaling and the legacy `20`/`30`/`40`/`41` table — is owned by the native
+ * `version` module and returned as an eight-byte big-endian pair.
+ */
 @RequiresApi(Build.VERSION_CODES.S)
 internal object KeyMintVersionResolver {
     fun resolve(securityLevel: Int): AndroidUtils.AttestationVersions? =
         nativeKeyMintVersions(securityLevel) ?: compatKeymasterVersions(securityLevel)
 
     private fun keyMintInstance(securityLevel: Int): String? =
-        when (securityLevel) {
-            SecurityLevel.TRUSTED_ENVIRONMENT -> "default"
-            SecurityLevel.STRONGBOX -> "strongbox"
-            else -> null
-        }
+        NativeCertGen.nativeVersionKeyMintInstance(securityLevel)
 
     private fun nativeKeyMintVersions(securityLevel: Int): AndroidUtils.AttestationVersions? {
         val instance = keyMintInstance(securityLevel) ?: return null
@@ -34,10 +38,7 @@ internal object KeyMintVersionResolver {
 
         return runCatching {
                 val keyMint = IKeyMintDevice.Stub.asInterface(binder)
-                val interfaceVersion = keyMint.interfaceVersion
-                if (interfaceVersion <= 0) return@runCatching null
-                val version = interfaceVersion * 100
-                AndroidUtils.AttestationVersions(version, version)
+                decodeVersions(NativeCertGen.nativeVersionFromInterfaceVersion(keyMint.interfaceVersion))
             }
             .onSuccess { versions -> if (versions != null) Logger.i("Resolved $serviceName versions: $versions") }
             .onFailure { Logger.w("Failed to query $serviceName interface version", it) }
@@ -45,13 +46,7 @@ internal object KeyMintVersionResolver {
     }
 
     private fun legacyKeymasterVersions(versionNumber: Int): AndroidUtils.AttestationVersions? =
-        when (versionNumber) {
-            20 -> AndroidUtils.AttestationVersions(1, 2)
-            30 -> AndroidUtils.AttestationVersions(2, 3)
-            40 -> AndroidUtils.AttestationVersions(3, 4)
-            41 -> AndroidUtils.AttestationVersions(4, 41)
-            else -> null
-        }
+        decodeVersions(NativeCertGen.nativeVersionLegacyKeymaster(versionNumber))
 
     private const val COMPAT_DESCRIPTOR = "android.security.compat.IKeystoreCompatService"
     private const val TRANSACTION_GET_KEYMINT_DEVICE = IBinder.FIRST_CALL_TRANSACTION
@@ -88,5 +83,22 @@ internal object KeyMintVersionResolver {
             .onSuccess { versions -> Logger.i("Resolved $serviceName level=$securityLevel versions: $versions") }
             .onFailure { Logger.w("Failed to query $serviceName level=$securityLevel", it) }
             .getOrNull()
+    }
+
+    /** Number of bytes in the native `[i32 attestation][i32 keymaster]` wire form. */
+    private const val VERSIONS_BYTES = 8
+
+    /**
+     * Decodes the native pair. A null blob means the native side had no answer for the input, which
+     * is not an error: the caller falls through to the next resolution strategy. A non-null blob of
+     * the wrong width would be a programming error, so it throws instead of being silently ignored.
+     */
+    private fun decodeVersions(blob: ByteArray?): AndroidUtils.AttestationVersions? {
+        if (blob == null) return null
+        require(blob.size == VERSIONS_BYTES) {
+            "Expected $VERSIONS_BYTES version bytes, got ${blob.size}"
+        }
+        val buffer = ByteBuffer.wrap(blob)
+        return AndroidUtils.AttestationVersions(attestation = buffer.int, keymaster = buffer.int)
     }
 }

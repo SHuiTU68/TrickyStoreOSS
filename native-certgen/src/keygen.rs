@@ -14,7 +14,8 @@ pub fn generate_key_pair(
 ) -> Result<GeneratedKeyPair> {
     match algorithm {
         Algorithm::Ec => generate_ec_key_pair(
-            ec_curve.ok_or_else(|| CertGenError::InvalidParameter("ec_curve required for EC".into()))?,
+            ec_curve
+                .ok_or_else(|| CertGenError::InvalidParameter("ec_curve required for EC".into()))?,
         ),
         Algorithm::Rsa => generate_rsa_key_pair(key_size, rsa_public_exponent),
     }
@@ -28,7 +29,10 @@ fn generate_ec_key_pair(curve: EcCurve) -> Result<GeneratedKeyPair> {
         EcCurve::P256 => {
             let secret = p256::SecretKey::random(&mut rand::thread_rng());
             let private = secret.to_pkcs8_der().map_err(serialization_failed)?;
-            let public = secret.public_key().to_public_key_der().map_err(serialization_failed)?;
+            let public = secret
+                .public_key()
+                .to_public_key_der()
+                .map_err(serialization_failed)?;
             Ok(GeneratedKeyPair {
                 private_key_pkcs8: private.as_bytes().to_vec(),
                 public_key_spki: public.as_bytes().to_vec(),
@@ -37,7 +41,10 @@ fn generate_ec_key_pair(curve: EcCurve) -> Result<GeneratedKeyPair> {
         EcCurve::P384 => {
             let secret = p384::SecretKey::random(&mut rand::thread_rng());
             let private = secret.to_pkcs8_der().map_err(serialization_failed)?;
-            let public = secret.public_key().to_public_key_der().map_err(serialization_failed)?;
+            let public = secret
+                .public_key()
+                .to_public_key_der()
+                .map_err(serialization_failed)?;
             Ok(GeneratedKeyPair {
                 private_key_pkcs8: private.as_bytes().to_vec(),
                 public_key_spki: public.as_bytes().to_vec(),
@@ -68,7 +75,9 @@ fn generate_rsa_key_pair(key_size: u32, rsa_public_exponent: u64) -> Result<Gene
         .map_err(|e| CertGenError::KeyGenFailed(e.to_string()))?;
 
     let private = private_key.to_pkcs8_der().map_err(serialization_failed)?;
-    let public = rsa::RsaPublicKey::from(&private_key).to_public_key_der().map_err(serialization_failed)?;
+    let public = rsa::RsaPublicKey::from(&private_key)
+        .to_public_key_der()
+        .map_err(serialization_failed)?;
 
     Ok(GeneratedKeyPair {
         private_key_pkcs8: private.as_bytes().to_vec(),

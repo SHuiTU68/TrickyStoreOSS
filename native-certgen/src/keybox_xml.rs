@@ -26,16 +26,18 @@ const OID_RSA_ENCRYPTION: &[u64] = &[1, 2, 840, 113549, 1, 1, 1];
 const CONTEXT_0_CONSTRUCTED: u8 = 0xA0;
 
 /// `id-ecPublicKey` as an OID, parsed once at compile time instead of on every key.
-const EC_ALGORITHM_OID: const_oid::ObjectIdentifier = match const_oid::ObjectIdentifier::new("1.2.840.10045.2.1") {
-    Ok(oid) => oid,
-    Err(_) => panic!("id-ecPublicKey is a valid OID"),
-};
+const EC_ALGORITHM_OID: const_oid::ObjectIdentifier =
+    match const_oid::ObjectIdentifier::new("1.2.840.10045.2.1") {
+        Ok(oid) => oid,
+        Err(_) => panic!("id-ecPublicKey is a valid OID"),
+    };
 
 /// `rsaEncryption` as an OID, parsed once at compile time instead of on every key.
-const RSA_ALGORITHM_OID: const_oid::ObjectIdentifier = match const_oid::ObjectIdentifier::new("1.2.840.113549.1.1.1") {
-    Ok(oid) => oid,
-    Err(_) => panic!("rsaEncryption is a valid OID"),
-};
+const RSA_ALGORITHM_OID: const_oid::ObjectIdentifier =
+    match const_oid::ObjectIdentifier::new("1.2.840.113549.1.1.1") {
+        Ok(oid) => oid,
+        Err(_) => panic!("rsaEncryption is a valid OID"),
+    };
 
 /// One parsed keybox entry: the signing key plus the certificate chain it was issued with.
 pub struct NativeKeybox {
@@ -145,18 +147,28 @@ fn tokenize(xml: &str) -> Result<Vec<XmlEvent<'_>>> {
                 .ok_or_else(|| keybox_error("unterminated XML declaration"))?;
             cursor += 2 + end + 2;
         } else if let Some(after_marker) = rest.strip_prefix("<!--") {
-            let end = after_marker.find("-->").ok_or_else(|| keybox_error("unterminated XML comment"))?;
+            let end = after_marker
+                .find("-->")
+                .ok_or_else(|| keybox_error("unterminated XML comment"))?;
             cursor += 4 + end + 3;
         } else if let Some(after_marker) = rest.strip_prefix("<![CDATA[") {
-            let end = after_marker.find("]]>").ok_or_else(|| keybox_error("unterminated CDATA section"))?;
+            let end = after_marker
+                .find("]]>")
+                .ok_or_else(|| keybox_error("unterminated CDATA section"))?;
             push_text(&mut events, &after_marker[..end]);
             cursor += 9 + end + 3;
         } else if rest.starts_with("<!") {
-            let end = rest.find('>').ok_or_else(|| keybox_error("unterminated XML declaration"))?;
+            let end = rest
+                .find('>')
+                .ok_or_else(|| keybox_error("unterminated XML declaration"))?;
             cursor += end + 1;
         } else if let Some(after_marker) = rest.strip_prefix("</") {
-            let end = after_marker.find('>').ok_or_else(|| keybox_error("unterminated closing tag"))?;
-            events.push(XmlEvent::End { name: after_marker[..end].trim() });
+            let end = after_marker
+                .find('>')
+                .ok_or_else(|| keybox_error("unterminated closing tag"))?;
+            events.push(XmlEvent::End {
+                name: after_marker[..end].trim(),
+            });
             cursor += 2 + end + 1;
         } else {
             let end = find_tag_end(rest)?;
@@ -293,7 +305,8 @@ impl<'a> Walker<'a> {
                         return Err(keybox_error("duplicate keybox count"));
                     }
                     self.pos += 1;
-                    expected_keyboxes = Some(parse_count(&self.leaf_text("NumberOfKeyboxes")?, "keybox")?);
+                    expected_keyboxes =
+                        Some(parse_count(&self.leaf_text("NumberOfKeyboxes")?, "keybox")?);
                 }
                 XmlEvent::Start { name } if name == "Keybox" => {
                     keybox_blocks += 1;
@@ -334,7 +347,10 @@ impl<'a> Walker<'a> {
                     let keybox = self.parse_key()?;
                     // A later entry for the same algorithm replaces the earlier one, mirroring the
                     // Kotlin map put, and keeps the earlier entry's position.
-                    match keyboxes.iter_mut().find(|existing| existing.algorithm == keybox.algorithm) {
+                    match keyboxes
+                        .iter_mut()
+                        .find(|existing| existing.algorithm == keybox.algorithm)
+                    {
                         Some(slot) => *slot = keybox,
                         None => keyboxes.push(keybox),
                     }
@@ -420,8 +436,10 @@ impl<'a> Walker<'a> {
                         return Err(keybox_error("duplicate certificate count"));
                     }
                     self.pos += 1;
-                    expected =
-                        Some(parse_count(&self.leaf_text("NumberOfCertificates")?, "certificate")?);
+                    expected = Some(parse_count(
+                        &self.leaf_text("NumberOfCertificates")?,
+                        "certificate",
+                    )?);
                 }
                 XmlEvent::Start { name } if name == "Certificate" => {
                     self.pos += 1;
@@ -436,9 +454,9 @@ impl<'a> Walker<'a> {
 
         // `first` is `certificates.len()` sampled before this chain block, so the subtraction is safe
         // by construction; `saturating_sub` keeps it total even if that invariant is ever broken.
-        if expected.is_some_and(|expected| {
-            expected != (certificates.len().saturating_sub(first)) as u32
-        }) {
+        if expected
+            .is_some_and(|expected| expected != (certificates.len().saturating_sub(first)) as u32)
+        {
             return Err(keybox_error("incomplete certificate chain"));
         }
         Ok(())
@@ -491,7 +509,11 @@ fn build_entry(private_key_text: &str, certificate_texts: &[String]) -> Result<N
         certificates.push(decode_certificate(text)?);
     }
 
-    Ok(NativeKeybox { algorithm, private_key_pkcs8, certificates })
+    Ok(NativeKeybox {
+        algorithm,
+        private_key_pkcs8,
+        certificates,
+    })
 }
 
 /// Decodes the first `-----BEGIN <label>-----` block in the text.
@@ -504,7 +526,9 @@ fn first_pem_block(text: &str) -> Result<Option<(&str, Vec<u8>)>> {
     const BEGIN: &str = "-----BEGIN ";
     const DASHES: &str = "-----";
 
-    let Some(open) = text.find(BEGIN) else { return Ok(None) };
+    let Some(open) = text.find(BEGIN) else {
+        return Ok(None);
+    };
     let header_start = open + BEGIN.len();
     let Some(label_len) = text[header_start..].find(DASHES) else {
         return Err(keybox_error("unterminated PEM block"));
@@ -538,7 +562,8 @@ fn first_pem_block(text: &str) -> Result<Option<(&str, Vec<u8>)>> {
 
 /// The base64 alphabet, in six-bit value order. Encoding is only needed by the tests, but the decode
 /// table is built from the same string so the two can never disagree.
-const BASE64_ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+const BASE64_ALPHABET: &[u8; 64] =
+    b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
 /// Value of a byte that is not base64 data. Every byte is looked up in [`BASE64_DECODE`] once, so
 /// decoding is one indexed read per character instead of a scan of the 64-character alphabet.
@@ -582,7 +607,10 @@ fn base64_decode(input: &str) -> Result<Vec<u8>> {
             let ch = if byte.is_ascii() {
                 char::from(byte)
             } else {
-                input[index..].chars().next().unwrap_or(char::REPLACEMENT_CHARACTER)
+                input[index..]
+                    .chars()
+                    .next()
+                    .unwrap_or(char::REPLACEMENT_CHARACTER)
             };
             return Err(keybox_error(format!("invalid base64 character {ch:?}")));
         }
@@ -674,7 +702,10 @@ fn key_algorithm(pkcs8_der: &[u8]) -> Result<String> {
     } else if info.algorithm.oid == RSA_ALGORITHM_OID {
         Ok("RSA".to_string())
     } else {
-        Err(keybox_error(format!("unsupported private key algorithm: {}", info.algorithm.oid)))
+        Err(keybox_error(format!(
+            "unsupported private key algorithm: {}",
+            info.algorithm.oid
+        )))
     }
 }
 
@@ -719,14 +750,18 @@ fn validate_certificate_der(der: &[u8]) -> Result<()> {
     }
     let (algorithm_tag, algorithm_content) = next_tlv(content, &mut offset)?;
     if algorithm_tag != TAG_SEQUENCE {
-        return Err(keybox_error("certificate signatureAlgorithm is not a sequence"));
+        return Err(keybox_error(
+            "certificate signatureAlgorithm is not a sequence",
+        ));
     }
     let (signature_tag, signature_content) = next_tlv(content, &mut offset)?;
     if offset != content.len() {
         return Err(keybox_error("certificate has trailing fields"));
     }
     if signature_tag != TAG_BIT_STRING || signature_content.len() < 2 || signature_content[0] != 0 {
-        return Err(keybox_error("certificate signature is not an octet-aligned bit string"));
+        return Err(keybox_error(
+            "certificate signature is not an octet-aligned bit string",
+        ));
     }
     let (oid_tag, _) = next_tlv(algorithm_content, &mut 0usize)?;
     if oid_tag != TAG_OID {
@@ -739,8 +774,14 @@ fn validate_certificate_der(der: &[u8]) -> Result<()> {
     if tbs_content.first() == Some(&CONTEXT_0_CONSTRUCTED) {
         next_tlv(tbs_content, &mut offset)?;
     }
-    for expected in [TAG_INTEGER, TAG_SEQUENCE, TAG_SEQUENCE, TAG_SEQUENCE, TAG_SEQUENCE, TAG_SEQUENCE]
-    {
+    for expected in [
+        TAG_INTEGER,
+        TAG_SEQUENCE,
+        TAG_SEQUENCE,
+        TAG_SEQUENCE,
+        TAG_SEQUENCE,
+        TAG_SEQUENCE,
+    ] {
         let (tag, _) = next_tlv(tbs_content, &mut offset)?;
         if tag != expected {
             return Err(keybox_error("certificate tbsCertificate is malformed"));
@@ -761,10 +802,12 @@ fn next_tlv<'a>(data: &'a [u8], offset: &mut usize) -> Result<(u32, &'a [u8])> {
 
 /// Decodes one certificate PEM block into DER, rejecting anything that is not certificate shaped.
 pub fn decode_certificate(text: &str) -> Result<Vec<u8>> {
-    let (label, der) =
-        first_pem_block(text)?.ok_or_else(|| keybox_error("certificate element has no PEM block"))?;
+    let (label, der) = first_pem_block(text)?
+        .ok_or_else(|| keybox_error("certificate element has no PEM block"))?;
     if label != "CERTIFICATE" {
-        return Err(keybox_error(format!("unsupported PEM certificate label: {label}")));
+        return Err(keybox_error(format!(
+            "unsupported PEM certificate label: {label}"
+        )));
     }
     validate_certificate_der(&der)?;
     Ok(der)
@@ -853,14 +896,22 @@ mod tests {
     /// A P-256 keybox entry: the PEM key block and its self-signed certificate.
     fn ec_material() -> (String, Vec<u8>, Vec<u8>) {
         let key = generate_key_pair(Algorithm::Ec, 256, Some(EcCurve::P256), 0).unwrap();
-        let params = CertGenParams { algorithm: Algorithm::Ec, key_size: 256, ..Default::default() };
+        let params = CertGenParams {
+            algorithm: Algorithm::Ec,
+            key_size: 256,
+            ..Default::default()
+        };
         let cert = build_self_signed_cert(&key, &params).unwrap();
         let scalar = sec1_scalar(&pkcs8_inner(&key.private_key_pkcs8));
         let pem_key = pem("EC PRIVATE KEY", &sec1_blob(&scalar, CURVE_P256));
         (pem_key, scalar, cert[0].clone())
     }
 
-    fn document(private_key_block: &str, certificates: &[&[u8]], declared: Option<usize>) -> String {
+    fn document(
+        private_key_block: &str,
+        certificates: &[&[u8]],
+        declared: Option<usize>,
+    ) -> String {
         let mut xml = String::from("<?xml version=\"1.0\"?>\n<AndroidAttestation>\n");
         xml.push_str("  <NumberOfKeyboxes>1</NumberOfKeyboxes>\n");
         xml.push_str("  <Keybox DeviceID=\"sw\">\n");
@@ -870,7 +921,9 @@ mod tests {
         xml.push_str("\n      </PrivateKey>\n");
         xml.push_str("      <CertificateChain>\n");
         if let Some(count) = declared {
-            xml.push_str(&format!("        <NumberOfCertificates>{count}</NumberOfCertificates>\n"));
+            xml.push_str(&format!(
+                "        <NumberOfCertificates>{count}</NumberOfCertificates>\n"
+            ));
         }
         for certificate in certificates {
             xml.push_str("        <Certificate format=\"pem\">\n");
@@ -893,7 +946,10 @@ mod tests {
         assert_eq!(keyboxes[0].certificates.len(), 1);
         assert_eq!(keyboxes[0].certificates[0], cert);
         // The SEC1 key was re-wrapped: the same private scalar must come back out of the PKCS#8.
-        assert_eq!(sec1_scalar(&pkcs8_inner(&keyboxes[0].private_key_pkcs8)), scalar);
+        assert_eq!(
+            sec1_scalar(&pkcs8_inner(&keyboxes[0].private_key_pkcs8)),
+            scalar
+        );
         assert_eq!(key_algorithm(&keyboxes[0].private_key_pkcs8).unwrap(), "EC");
     }
 
@@ -905,7 +961,10 @@ mod tests {
 
         let info = pkcs8::PrivateKeyInfo::from_der(&wrapped).unwrap();
         let curve = info.algorithm.parameters_oid().unwrap().to_string();
-        assert_eq!(curve, "1.3.132.0.34", "P-384 curve OID must survive the wrap");
+        assert_eq!(
+            curve, "1.3.132.0.34",
+            "P-384 curve OID must survive the wrap"
+        );
         assert_eq!(sec1_scalar(&pkcs8_inner(&wrapped)), scalar);
     }
 
@@ -925,8 +984,14 @@ mod tests {
         let keyboxes = parse_keybox_xml(include_str!("../../module/keybox.xml")).unwrap();
 
         assert_eq!(keyboxes.len(), 2);
-        let ec = keyboxes.iter().find(|entry| entry.algorithm == "EC").unwrap();
-        let rsa = keyboxes.iter().find(|entry| entry.algorithm == "RSA").unwrap();
+        let ec = keyboxes
+            .iter()
+            .find(|entry| entry.algorithm == "EC")
+            .unwrap();
+        let rsa = keyboxes
+            .iter()
+            .find(|entry| entry.algorithm == "RSA")
+            .unwrap();
         assert_eq!(ec.certificates.len(), 2);
         assert_eq!(rsa.certificates.len(), 2);
 
@@ -938,7 +1003,10 @@ mod tests {
             .subject_public_key
             .raw_bytes();
         let scalar = sec1_scalar(&pkcs8_inner(&ec.private_key_pkcs8));
-        let derived = p256::SecretKey::from_slice(&scalar).unwrap().public_key().to_encoded_point(false);
+        let derived = p256::SecretKey::from_slice(&scalar)
+            .unwrap()
+            .public_key()
+            .to_encoded_point(false);
         assert_eq!(derived.as_bytes(), leaf_point);
 
         // The RSA entry went through the PKCS#1 wrap and still parses back as a PKCS#8 key.
@@ -962,8 +1030,10 @@ mod tests {
     #[test]
     fn duplicate_keybox_count_is_rejected() {
         let (private_key, _, cert) = ec_material();
-        let xml = document(&private_key, &[&cert], Some(1))
-            .replace("<NumberOfKeyboxes>1</NumberOfKeyboxes>", "<NumberOfKeyboxes>1</NumberOfKeyboxes><NumberOfKeyboxes>1</NumberOfKeyboxes>");
+        let xml = document(&private_key, &[&cert], Some(1)).replace(
+            "<NumberOfKeyboxes>1</NumberOfKeyboxes>",
+            "<NumberOfKeyboxes>1</NumberOfKeyboxes><NumberOfKeyboxes>1</NumberOfKeyboxes>",
+        );
         assert!(parse_keybox_xml(&xml).is_err());
     }
 
@@ -998,9 +1068,12 @@ mod tests {
         let algorithm_len = u32::from_be_bytes([blob[0], blob[1], blob[2], blob[3]]) as usize;
         assert_eq!(&blob[4..4 + algorithm_len], b"EC");
         let key_offset = 4 + algorithm_len;
-        let key_len =
-            u32::from_be_bytes([blob[key_offset], blob[key_offset + 1], blob[key_offset + 2], blob[key_offset + 3]])
-                as usize;
+        let key_len = u32::from_be_bytes([
+            blob[key_offset],
+            blob[key_offset + 1],
+            blob[key_offset + 2],
+            blob[key_offset + 3],
+        ]) as usize;
         let pkcs8 = &blob[key_offset + 4..key_offset + 4 + key_len];
         assert_eq!(key_algorithm(pkcs8).unwrap(), "EC");
         assert_eq!(sec1_scalar(&pkcs8_inner(pkcs8)), scalar);
@@ -1009,7 +1082,10 @@ mod tests {
     #[test]
     fn decodes_a_standalone_pem_certificate_block() {
         let (_, _, cert) = ec_material();
-        assert_eq!(decode_certificate(&pem("CERTIFICATE", &cert)).unwrap(), cert);
+        assert_eq!(
+            decode_certificate(&pem("CERTIFICATE", &cert)).unwrap(),
+            cert
+        );
         // A key block is not a certificate: the label check must reject it.
         assert!(decode_certificate(&pem("PRIVATE KEY", &cert)).is_err());
     }

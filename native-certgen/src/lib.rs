@@ -33,6 +33,26 @@ mod types;
 mod wire;
 // Minimal DER reader shared by the hand-rolled parsers.
 mod tlv;
+// Log lines the native side hands back for Kotlin to replay through `Logger`.
+mod report;
+// Plans the boot-time global property spoofing without touching the device itself.
+mod hide_props;
+// The Android implementations of the traits `hide_props` plans against.
+mod system;
+// On-disk key persistence: the record format, its bounds checks, and the crash-safe write sequence.
+mod persist;
+
+// The three text files the daemon reads at boot: `target.txt`, `security_patch.txt` and the
+// `tee_status` report. Parsing and formatting live here; inotify and binder stay in Kotlin.
+mod config;
+
+// The KeyMint/Keymaster version tables. `KeyMintVersionResolver` keeps the binder calls; the
+// number-to-version mappings live here so they can be tested without a device.
+mod version;
+
+// Assembles the attestation application id and derives `unique_id`. `CertificateGen` keeps the
+// `PackageManager` traversal; the DER container and the HMAC live here.
+mod aaid;
 
 use jni::objects::{JByteArray, JClass, JString};
 use jni::sys::{jboolean, jbyteArray, jint, jlong, jstring};
@@ -40,12 +60,13 @@ use jni::JNIEnv;
 
 use ring::rand::SystemRandom;
 use ring::signature::{
-    EcdsaKeyPair, KeyPair, UnparsedPublicKey, ECDSA_P256_SHA256_ASN1, ECDSA_P256_SHA256_ASN1_SIGNING,
+    EcdsaKeyPair, KeyPair, UnparsedPublicKey, ECDSA_P256_SHA256_ASN1,
+    ECDSA_P256_SHA256_ASN1_SIGNING,
 };
 
-use zeroize::Zeroizing;
 use crate::error::{CertGenError, Result};
 use crate::types::{Algorithm, EcCurve, GeneratedKeyPair};
+use zeroize::Zeroizing;
 
 /// Build/version marker surfaced to Kotlin so a successful load can be confirmed in the daemon log.
 const VERSION: &str = concat!("certgen ", env!("CARGO_PKG_VERSION"));
@@ -87,8 +108,7 @@ pub extern "system" fn Java_io_github_beakthoven_TrickyStoreOSS_NativeCertGen_na
     ec_curve: jint,
     rsa_public_exponent: jlong,
 ) -> jbyteArray {
-    let result =
-        generate_key_pair_blob(algorithm, key_size, ec_curve, rsa_public_exponent);
+    let result = generate_key_pair_blob(algorithm, key_size, ec_curve, rsa_public_exponent);
     byte_array_result(&mut env, result)
 }
 
@@ -104,8 +124,12 @@ fn generate_key_pair_blob(
     } else {
         None
     };
-    let key_pair =
-        keygen::generate_key_pair(algorithm, key_size as u32, ec_curve, rsa_public_exponent as u64)?;
+    let key_pair = keygen::generate_key_pair(
+        algorithm,
+        key_size as u32,
+        ec_curve,
+        rsa_public_exponent as u64,
+    )?;
     Ok(encode_key_pair(&key_pair)?)
 }
 
@@ -118,7 +142,9 @@ fn encode_key_pair(key_pair: &GeneratedKeyPair) -> Result<Vec<u8>> {
     let capacity = 8usize
         .checked_add(key_pair.private_key_pkcs8.len())
         .and_then(|size| size.checked_add(key_pair.public_key_spki.len()))
-        .ok_or_else(|| CertGenError::SerializationFailed("key pair blob length overflows".into()))?;
+        .ok_or_else(|| {
+            CertGenError::SerializationFailed("key pair blob length overflows".into())
+        })?;
     let mut blob = Vec::with_capacity(capacity);
     blob.extend_from_slice(&(key_pair.private_key_pkcs8.len() as u32).to_be_bytes());
     blob.extend_from_slice(&key_pair.private_key_pkcs8);
@@ -204,8 +230,8 @@ pub extern "system" fn Java_io_github_beakthoven_TrickyStoreOSS_NativeCertGen_na
     _this: JClass,
     pem: JString,
 ) -> jbyteArray {
-    let result = read_string(&mut env, &pem, "PEM key")
-        .and_then(|text| keybox_xml::decode_key_blob(&text));
+    let result =
+        read_string(&mut env, &pem, "PEM key").and_then(|text| keybox_xml::decode_key_blob(&text));
     byte_array_result(&mut env, result)
 }
 
@@ -241,6 +267,313 @@ pub extern "system" fn Java_io_github_beakthoven_TrickyStoreOSS_NativeCertGen_na
     byte_array_result(&mut env, result)
 }
 
+/// Plans the boot-time global property spoofing and hands the result back without touching the
+/// device. Response blob layout: `[notes][u32 scriptLen][script UTF-8][u32 changed][u32 removed]`,
+/// where the notes section is `report`'s `[u32 count]` plus entries.
+///
+/// The native side reads the live properties and probes for `resetprop` itself, but deliberately
+/// does *not* run the script: Kotlin wants the notes replayed through `Logger` before anything
+/// executes, and it wants a single place that owns running `sh`.
+#[no_mangle]
+pub extern "system" fn Java_io_github_beakthoven_TrickyStoreOSS_NativeCertGen_nativeHidePropsPlan(
+    mut env: JNIEnv,
+    _this: JClass,
+    config: JString,
+) -> jbyteArray {
+    let result = read_string(&mut env, &config, "hide_props config").map(|text| {
+        let outcome = hide_props::apply(&text, &system::SystemProperties, &system::ShShell);
+        let mut encoder = crate::wire::Encoder::new();
+        report::encode_notes(&outcome.notes, &mut encoder);
+        encoder.text(&outcome.script);
+        encoder.u32(outcome.changed as u32);
+        encoder.u32(outcome.removed as u32);
+        encoder.into_vec()
+    });
+    byte_array_result(&mut env, result)
+}
+
+/// Applies one property through `resetprop`, mirroring `HideProps.setProperty`. Returns true when
+/// the property already held the value or the write succeeded; throws only on JNI-level problems
+/// (a null or oversized string), never on "no `resetprop` here" — that is just `false`.
+#[no_mangle]
+pub extern "system" fn Java_io_github_beakthoven_TrickyStoreOSS_NativeCertGen_nativeHidePropsSetProperty(
+    mut env: JNIEnv,
+    _this: JClass,
+    name: JString,
+    value: JString,
+) -> jboolean {
+    let applied = (|| -> Result<bool> {
+        let name = read_string(&mut env, &name, "property name")?;
+        let value = read_string(&mut env, &value, "property value")?;
+        Ok(hide_props::set_property(
+            &name,
+            &value,
+            &system::SystemProperties,
+            &system::ShShell,
+        ))
+    })();
+    match applied {
+        Ok(flag) => flag as jboolean,
+        Err(e) => {
+            let _ = env.throw_new("java/lang/RuntimeException", format!("NativeCertGen: {e}"));
+            false as jboolean
+        }
+    }
+}
+
+/// Writes one encoded record to `dir`, mirroring `PersistenceManager.saveKeySync`. The blob is
+/// decoded and re-encoded first, so a caller that hands over a hand-built buffer still produces a
+/// canonical file. Returns true once the data is renamed into place and both the file and its
+/// directory are fsynced.
+#[no_mangle]
+pub extern "system" fn Java_io_github_beakthoven_TrickyStoreOSS_NativeCertGen_nativePersistSave(
+    mut env: JNIEnv,
+    _this: JClass,
+    dir: JString,
+    record: jbyteArray,
+) -> jboolean {
+    let saved = (|| -> Result<bool> {
+        let dir = read_string(&mut env, &dir, "persist directory")?;
+        let blob = read_byte_array(&mut env, record, "persist record")?;
+        persist::persist(std::path::Path::new(&*dir), &blob)?;
+        Ok(true)
+    })();
+    match saved {
+        Ok(flag) => flag as jboolean,
+        Err(e) => {
+            let _ = env.throw_new("java/lang/RuntimeException", format!("NativeCertGen: {e}"));
+            false as jboolean
+        }
+    }
+}
+
+/// Reads every record under `dir`, skipping unreadable files into the failure list instead of
+/// aborting, and encodes the outcome as
+/// `[u32 ok]{[u32 len][record]} [u32 failed]{[u32 len][name][u32 len][message]}`. The Kotlin side
+/// reconstructs the Java objects from the record blobs; this call only owns the bytes.
+#[no_mangle]
+pub extern "system" fn Java_io_github_beakthoven_TrickyStoreOSS_NativeCertGen_nativePersistLoad(
+    mut env: JNIEnv,
+    _this: JClass,
+    dir: JString,
+) -> jbyteArray {
+    let result = read_string(&mut env, &dir, "persist directory").map(|dir| {
+        let outcome = persist::load(std::path::Path::new(&*dir));
+        let mut encoder = crate::wire::Encoder::new();
+        persist::encode_load_outcome(&outcome, &mut encoder);
+        encoder.into_vec()
+    });
+    byte_array_result(&mut env, result)
+}
+
+/// Removes the record for `(uid, alias)` and fsyncs the parent directory so the unlink survives a
+/// crash. Deleting a file that is already gone succeeds, matching `File.delete()`.
+#[no_mangle]
+pub extern "system" fn Java_io_github_beakthoven_TrickyStoreOSS_NativeCertGen_nativePersistDelete(
+    mut env: JNIEnv,
+    _this: JClass,
+    dir: JString,
+    uid: jint,
+    alias: JString,
+) -> jboolean {
+    let deleted = (|| -> Result<bool> {
+        let dir = read_string(&mut env, &dir, "persist directory")?;
+        let alias = read_string(&mut env, &alias, "key alias")?;
+        persist::delete(std::path::Path::new(&*dir), uid, &alias)?;
+        Ok(true)
+    })();
+    match deleted {
+        Ok(flag) => flag as jboolean,
+        Err(e) => {
+            let _ = env.throw_new("java/lang/RuntimeException", format!("NativeCertGen: {e}"));
+            false as jboolean
+        }
+    }
+}
+/// Parses `target.txt`, mirroring `Config.parseTargets`. The blob is `[notes][u32 count]` followed
+/// by one `[text package][u8 mode]` pair per entry; the notes carry every line that was skipped.
+#[no_mangle]
+pub extern "system" fn Java_io_github_beakthoven_TrickyStoreOSS_NativeCertGen_nativeConfigParseTargets(
+    mut env: JNIEnv,
+    _this: JClass,
+    text: JString,
+) -> jbyteArray {
+    let result = read_string(&mut env, &text, "target.txt").map(|body| {
+        let mut notes = Vec::new();
+        let entries = config::parse_targets(&body, &mut notes);
+        let mut encoder = crate::wire::Encoder::new();
+        config::encode_targets(&entries, &notes, &mut encoder);
+        encoder.into_vec()
+    });
+    byte_array_result(&mut env, result)
+}
+/// Parses `security_patch.txt`, mirroring `Config.parseSecurityPatchLevels`. The blob is
+/// `[notes][u32 count]` followed by one `[text context][u8 presence][text value] x4` group per
+/// block; an empty context name is the global block that applies to every package.
+#[no_mangle]
+pub extern "system" fn Java_io_github_beakthoven_TrickyStoreOSS_NativeCertGen_nativeConfigParsePatchLevels(
+    mut env: JNIEnv,
+    _this: JClass,
+    text: JString,
+) -> jbyteArray {
+    let result = read_string(&mut env, &text, "security_patch.txt").map(|body| {
+        let mut notes = Vec::new();
+        let levels = config::parse_patch_levels(&body, &mut notes);
+        let mut encoder = crate::wire::Encoder::new();
+        config::encode_patch_levels(&levels, &notes, &mut encoder);
+        encoder.into_vec()
+    });
+    byte_array_result(&mut env, result)
+}
+/// Renders the four-line `tee_status` report, mirroring `Config.storeTEEStatus`. A negative
+/// `serviceErrorCode` means "the probe never produced one" and is written as `unknown`.
+#[no_mangle]
+pub extern "system" fn Java_io_github_beakthoven_TrickyStoreOSS_NativeCertGen_nativeConfigFormatTeeStatus(
+    mut env: JNIEnv,
+    _this: JClass,
+    status: JString,
+    category: JString,
+    service_error_code: jint,
+) -> jstring {
+    let built = (|| -> Result<String> {
+        let status = read_string(&mut env, &status, "tee status")?;
+        let category = if category.is_null() {
+            None
+        } else {
+            Some(read_string(&mut env, &category, "tee failure category")?)
+        };
+        let code = if service_error_code < 0 {
+            None
+        } else {
+            Some(service_error_code)
+        };
+        Ok(config::format_tee_status(
+            &status,
+            category.as_ref().map(|c| c.as_str()),
+            code,
+        ))
+    })();
+    match built {
+        Ok(text) => match env.new_string(text) {
+            Ok(value) => value.into_raw(),
+            Err(e) => {
+                let _ = env.throw_new(
+                    "java/lang/RuntimeException",
+                    format!("NativeCertGen: failed to allocate result string: {e}"),
+                );
+                std::ptr::null_mut()
+            }
+        },
+        Err(e) => {
+            let _ = env.throw_new("java/lang/RuntimeException", format!("NativeCertGen: {e}"));
+            std::ptr::null_mut()
+        }
+    }
+}
+/// Binder instance name for the KeyMint HAL serving `securityLevel`, or null when KeyMint does not
+/// serve that level and the legacy Keymaster path has to answer instead.
+#[no_mangle]
+pub extern "system" fn Java_io_github_beakthoven_TrickyStoreOSS_NativeCertGen_nativeVersionKeyMintInstance(
+    mut env: JNIEnv,
+    _this: JClass,
+    security_level: jint,
+) -> jstring {
+    match version::keymint_instance(security_level) {
+        Some(name) => match env.new_string(name) {
+            Ok(value) => value.into_raw(),
+            Err(e) => {
+                let _ = env.throw_new(
+                    "java/lang/RuntimeException",
+                    format!("NativeCertGen: failed to allocate result string: {e}"),
+                );
+                std::ptr::null_mut()
+            }
+        },
+        None => std::ptr::null_mut(),
+    }
+}
+/// Scales a KeyMint `interfaceVersion` into the `[attestation][keymaster]` pair, or null when the
+/// service reported no usable version.
+#[no_mangle]
+pub extern "system" fn Java_io_github_beakthoven_TrickyStoreOSS_NativeCertGen_nativeVersionFromInterfaceVersion(
+    mut env: JNIEnv,
+    _this: JClass,
+    interface_version: jint,
+) -> jbyteArray {
+    let result = Ok::<Option<Vec<u8>>, CertGenError>(
+        version::versions_from_interface_version(interface_version)
+            .map(|versions| versions.encode().to_vec()),
+    );
+    optional_byte_array_result(&mut env, result)
+}
+/// Maps a legacy Keymaster `versionNumber` (`20`/`30`/`40`/`41`) to the pair it argues for, or null
+/// for a backend whose numbering we do not recognise.
+#[no_mangle]
+pub extern "system" fn Java_io_github_beakthoven_TrickyStoreOSS_NativeCertGen_nativeVersionLegacyKeymaster(
+    mut env: JNIEnv,
+    _this: JClass,
+    version_number: jint,
+) -> jbyteArray {
+    let result = Ok::<Option<Vec<u8>>, CertGenError>(
+        version::legacy_keymaster_versions(version_number)
+            .map(|versions| versions.encode().to_vec()),
+    );
+    optional_byte_array_result(&mut env, result)
+}
+/// Like [`byte_array_result`], but treats `Ok(None)` as a legitimate "no answer" and returns null
+/// without throwing. Callers distinguish "unknown" from "failed" by whether an exception is pending.
+fn optional_byte_array_result(env: &mut JNIEnv, result: Result<Option<Vec<u8>>>) -> jbyteArray {
+    match result {
+        Ok(Some(blob)) => match env.byte_array_from_slice(&blob) {
+            Ok(array) => array.into_raw(),
+            Err(e) => {
+                let _ = env.throw_new(
+                    "java/lang/RuntimeException",
+                    format!("NativeCertGen: failed to allocate result array: {e}"),
+                );
+                std::ptr::null_mut()
+            }
+        },
+        Ok(None) => std::ptr::null_mut(),
+        Err(e) => {
+            let _ = env.throw_new("java/lang/RuntimeException", format!("NativeCertGen: {e}"));
+            std::ptr::null_mut()
+        }
+    }
+}
+/// Builds the DER attestation application id (RFC 5280 §4.2.1.13) from a packed package list.
+///
+/// The request is `[u32 count][per entry: [u32 len]name, i64 version code, u32 sig count, per
+/// signature [u32 len]digest]`. A signer can back several packages, so repeated digests are
+/// collapsed here before the `SET OF` is written.
+#[no_mangle]
+pub extern "system" fn Java_io_github_beakthoven_TrickyStoreOSS_NativeCertGen_nativeApplicationId(
+    mut env: JNIEnv,
+    _this: JClass,
+    request: jbyteArray,
+) -> jbyteArray {
+    let result = read_byte_array(&mut env, request, "application id request")
+        .and_then(|request| aaid::build_application_id(&request));
+    byte_array_result(&mut env, result)
+}
+/// Derives the KeyMint `unique_id` from the creation time, the application id DER and the
+/// persisted HMAC key. Returns 16 bytes (HMAC-SHA256 truncated).
+#[no_mangle]
+pub extern "system" fn Java_io_github_beakthoven_TrickyStoreOSS_NativeCertGen_nativeUniqueId(
+    mut env: JNIEnv,
+    _this: JClass,
+    creation_time_ms: jlong,
+    application_id: jbyteArray,
+    key: jbyteArray,
+) -> jbyteArray {
+    let result = (|| {
+        let application_id = read_byte_array(&mut env, application_id, "application id")?;
+        let key = read_byte_array(&mut env, key, "unique id key")?;
+        aaid::compute_unique_id(creation_time_ms, &application_id, &key)
+    })();
+    // The closure borrows `env`, so the call has to happen after it is dropped.
+    byte_array_result(&mut env, result)
+}
 /// Turns the entry point's result into a JNI byte array, throwing the mapped Java exception and
 /// returning null on failure. Shared by every entry point that hands a byte blob back.
 fn byte_array_result(env: &mut JNIEnv, result: Result<Vec<u8>>) -> jbyteArray {
@@ -346,7 +679,9 @@ fn self_test() -> std::result::Result<(), &'static str> {
     let key_pair = EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, pkcs8.as_ref(), &rng)
         .map_err(|_| "ecdsa key parse failed")?;
     let message = b"TrickyStoreOSS native self test";
-    let signature = key_pair.sign(&rng, message).map_err(|_| "ecdsa sign failed")?;
+    let signature = key_pair
+        .sign(&rng, message)
+        .map_err(|_| "ecdsa sign failed")?;
     UnparsedPublicKey::new(&ECDSA_P256_SHA256_ASN1, key_pair.public_key().as_ref())
         .verify(message, signature.as_ref())
         .map_err(|_| "ecdsa verify failed")?;
