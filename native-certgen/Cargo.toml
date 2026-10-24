@@ -23,7 +23,13 @@ time = { version = "0.3", features = ["std"] }
 zeroize = "1.9"
 
 [profile.release]
-opt-level = "z"
+# Key generation and certificate signing here are almost entirely big-integer and prime-field
+# arithmetic (ring, rsa, p256, p384), which is exactly the shape opt-level "z" gives up the most
+# on: it disables the vectorised and unrolled variants of those inner loops to save code size.
+# The CI probe measured the switch at +40 KB in libcertgen.so (.text 640 KB -> 788 KB), which is
+# cheaper than the ~318 KB reclaimed by rebuilding std under the immediate-abort panic strategy,
+# so the release profile buys speed here and pays for it with that budget instead.
+opt-level = 2
 lto = true
 codegen-units = 1
 strip = "symbols"

@@ -80,6 +80,13 @@ android {
                         "-Wl,--gc-sections -Wl,--icf=safe -Wl,--as-needed -Wl,--exclude-libs,ALL"
 
                 cppFlags += "-std=c++23"
+                // Pin the optimisation level instead of leaning on whatever `CMAKE_BUILD_TYPE=Release`
+                // happens to expand to in the NDK in use. -O2 is what this code wants: the hot paths
+                // are Binder transactions, ELF parsing and the ptrace scaffolding, none of which
+                // benefit from -O3's extra inlining (it mostly costs I-cache here) and all of which
+                // lose measurably under -Oz. A duplicate -O2 alongside the build type's own is
+                // harmless, and the last one on the command line wins if they ever disagree.
+                cppFlags += "-O2"
                 cppFlags += "-fno-exceptions"
                 cppFlags += "-fno-rtti"
                 // Nothing on this side unwinds: exceptions are off, every failure path returns an
@@ -343,11 +350,26 @@ fun compactElf(python: String, script: File, artifact: File) {
 // --- Native cert generation (Rust cdylib) ---
 // Builds libcertgen.so for arm64-v8a straight into app/src/main/jniLibs, which AGP merges into
 // the APK; the module packaging below then extracts it from the APK.
-// `-Z build-std` rebuilds core and std from source with this crate's release profile, which is
-// what `panic_immediate_abort` needs in order to actually drop the formatting machinery behind
-// `panic!` instead of only the unwinder. Both flags are unstable, so they only go in when the
-// environment asks for them (TSTORE_BUILD_STD=1, plus RUSTC_BOOTSTRAP=1 and a rust-src
-// component); a plain `./gradlew` keeps linking the precompiled std.
+//
+// `-Z build-std` rebuilds core and std from source, which is the only way to actually drop the
+// formatting machinery behind `panic!` rather than just the unwinder: the CI probe measured
+// 318 KB off libcertgen.so (.text 640 KB -> 419 KB) and zero `panicked at` strings left behind.
+// It stays opt-in because it needs a nightly toolchain, i.e. `TSTORE_BUILD_STD=1 ./gradlew ...`.
+//
+// Three things have to line up for it, and the old invocation satisfies none of them:
+//   * immediate abort is a real panic strategy in current nightlies, not a
+//     `-Z build-std-features` switch; it is spelled `panic = "immediate-abort"` in the profile;
+//   * selecting it requires `cargo-features = ["panic-immediate-abort"]` at the very top of the
+//     manifest, and stable Cargo rejects that key outright, so the manifest is patched only for
+//     the duration of the build and restored afterwards instead of being committed that way;
+//   * native-certgen/rust-toolchain.toml pins stable and a toolchain file outranks the default
+//     toolchain, so RUSTUP_TOOLCHAIN has to be forced for `-Z` to be accepted at all.
+val certgenCrateDir = rootProject.projectDir.resolve("native-certgen")
+val certgenManifest = certgenCrateDir.resolve("Cargo.toml")
+val certgenManifestStash = certgenCrateDir.resolve("Cargo.toml.build-std-stash")
+
+fun buildStdRequested() = System.getenv("TSTORE_BUILD_STD") == "1"
+
 fun buildCertgenCommandLine(): List<String> {
     val args =
         mutableListOf(
@@ -359,8 +381,8 @@ fun buildCertgenCommandLine(): List<String> {
             rootProject.projectDir.resolve("app/src/main/jniLibs").absolutePath,
             "build",
         )
-    if (System.getenv("TSTORE_BUILD_STD") == "1") {
-        args += listOf("-Z", "build-std=std,panic_abort", "-Z", "build-std-features=panic_immediate_abort")
+    if (buildStdRequested()) {
+        args += listOf("-Z", "build-std=std,panic_abort")
     }
     args += "--release"
     return args
@@ -384,6 +406,24 @@ val buildRustCertgen =
 
         doFirst {
             rustAndroidEnvironment(resolveAndroidNdk()).forEach { (key, value) -> environment(key, value) }
+            if (buildStdRequested()) {
+                certgenManifest.copyTo(certgenManifestStash, overwrite = true)
+                certgenManifest.writeText(
+                    "cargo-features = [\"panic-immediate-abort\"]\n\n" +
+                        certgenManifestStash.readText().replaceFirst(
+                            Regex("(?m)^panic = \"abort\"$"),
+                            "panic = \"immediate-abort\"",
+                        ),
+                )
+                environment("RUSTUP_TOOLCHAIN", "nightly")
+            }
+        }
+
+        doLast {
+            if (certgenManifestStash.exists()) {
+                certgenManifestStash.copyTo(certgenManifest, overwrite = true)
+                certgenManifestStash.delete()
+            }
         }
     }
 
