@@ -36,10 +36,16 @@ jobs:
           # native-certgen/rust-toolchain.toml pins stable, and a toolchain file
           # outranks the default toolchain, so the nightly switch has to be an
           # explicit environment override for `-Z` to be accepted.
+          # `-Zbuild-std-features=panic_immediate_abort` is gone in current
+          # nightlies: immediate abort is a real panic strategy now, selected
+          # through the profile, and it still needs core built from source.
+          cp Cargo.toml /tmp/Cargo.toml.bak
+          sed -i 's/^panic = "abort"/panic = "immediate-abort"/' Cargo.toml
+          grep -n 'panic =' Cargo.toml
           RUSTUP_TOOLCHAIN=nightly cargo ndk -t arm64-v8a -o /tmp/probe/buildstd build \
             -Z build-std=std,panic_abort \
-            -Z build-std-features=panic_immediate_abort \
             --release
+          cp /tmp/Cargo.toml.bak Cargo.toml
 
       - name: Report sizes
         run: |
