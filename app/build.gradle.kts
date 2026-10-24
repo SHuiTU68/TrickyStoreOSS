@@ -64,10 +64,33 @@ android {
                 arguments += "-DCMAKE_CXX_STANDARD=23"
                 arguments += "-DCMAKE_C_STANDARD=23"
                 arguments += "-DCMAKE_INTERPROCEDURAL_OPTIMIZATION=ON"
+                // Link-time dead stripping. LTO already removes what no caller in the same module
+                // reaches, but the stub archives (`utils`, `binder`, `PLTI`) and the Rust
+                // staticlib are only trimmed at link time. `--icf=safe` (not `all`) folds
+                // identical functions whose address is never taken — this codebase compares
+                // function pointers in its hook tables, so `all` would be a correctness gamble.
+                // `--as-needed` drops the DT_NEEDED entries nothing calls, which also removes the
+                // matching relocation blocks; `--exclude-libs,ALL` re-hides the archive symbols a
+                // static link would otherwise promote into `.dynsym`.
+                arguments +=
+                    "-DCMAKE_SHARED_LINKER_FLAGS=" +
+                        "-Wl,--gc-sections -Wl,--icf=safe -Wl,--as-needed -Wl,--exclude-libs,ALL"
+                arguments +=
+                    "-DCMAKE_EXE_LINKER_FLAGS=" +
+                        "-Wl,--gc-sections -Wl,--icf=safe -Wl,--as-needed -Wl,--exclude-libs,ALL"
 
                 cppFlags += "-std=c++23"
                 cppFlags += "-fno-exceptions"
                 cppFlags += "-fno-rtti"
+                // Nothing on this side unwinds: exceptions are off, every failure path returns an
+                // error code, and the injector talks to the target through ptrace. Without these
+                // flags clang still emits a call-site table per function, which is what made
+                // `.eh_frame` 34 KB of the 348 KB `inject` binary. `-ffunction-sections` /
+                // `-fdata-sections` are what give `--gc-sections` something to drop.
+                cppFlags += "-ffunction-sections"
+                cppFlags += "-fdata-sections"
+                cppFlags += "-fno-unwind-tables"
+                cppFlags += "-fno-asynchronous-unwind-tables"
                 cppFlags += "-fvisibility=hidden"
                 cppFlags += "-fvisibility-inlines-hidden"
             }
@@ -231,6 +254,51 @@ fun rustAndroidEnvironment(ndk: File): Map<String, String> {
         )
     libclangDir?.let { env["LIBCLANG_PATH"] = it.absolutePath }
     return env
+}
+
+/**
+ * Drops the DWARF unwind tables (`.eh_frame` / `.eh_frame_hdr`) from a shipped ELF.
+ *
+ * Every native artifact this module ships is built without exceptions and with `panic = "abort"`,
+ * so no frame is ever unwound on purpose. The tables are still emitted for two reasons no flag set
+ * in this file can reach: `libcertgen`/`inject` link the precompiled Rust std, which carries
+ * `.eh_frame` for all of its own code, and clang keeps a call-site table per function wherever a
+ * landing pad exists. Post-link removal is the only place that catches all of them at once.
+ *
+ * `.eh_frame_hdr` has to go with `.eh_frame` — it is a sorted binary index into it. The loader
+ * reads neither: `dlopen` needs `.dynamic`, `.dynsym`/`.dynstr`, the relocation tables and the
+ * program headers, all of which stay untouched. The only real loss is stack unwinding for these
+ * files in a crash report (frames show up as `<unknown>`).
+ */
+fun stripUnwindTables(ndk: File, artifact: File) {
+    val objcopy =
+        ndk.resolve("toolchains/llvm/prebuilt")
+            .listFiles()
+            ?.firstOrNull { it.isDirectory }
+            ?.resolve("bin/llvm-objcopy")
+    if (objcopy == null || !objcopy.isFile) {
+        throw GradleException("No llvm-objcopy in the NDK at ${ndk.absolutePath}.")
+    }
+    val before = artifact.length()
+    val process =
+        ProcessBuilder(
+                objcopy.absolutePath,
+                "--remove-section=.eh_frame",
+                "--remove-section=.eh_frame_hdr",
+                artifact.absolutePath,
+            )
+            .redirectErrorStream(true)
+            .start()
+    val output = process.inputStream.bufferedReader().use { it.readText() }.trim()
+    val exit = process.waitFor()
+    if (exit != 0) {
+        throw GradleException("llvm-objcopy failed on ${artifact.name} (exit $exit): $output")
+    }
+    val after = artifact.length()
+    println(
+        "shrink: ${artifact.name} $before -> $after bytes " +
+            "(${before - after} bytes of unwind tables dropped)",
+    )
 }
 
 // --- Native cert generation (Rust cdylib) ---
@@ -441,7 +509,19 @@ androidComponents {
                     }
                 }
                 check(carried > 0) { "the $variantName APK carries no classes.dex to publish" }
-
+                // Last step before the zip is assembled: drop the unwind tables from the three
+                // ELF files that actually get installed. Sizes are printed so the saving shows up
+                // in the CI log instead of only in the zip.
+                val ndk = resolveAndroidNdk()
+                for (name in listOf("libcertgen.so", "libinject.so", "libTrickyStoreOSS.so")) {
+                    val artifact = tempDir.resolve("lib/arm64-v8a/$name")
+                    if (!artifact.isFile) {
+                        throw GradleException(
+                            "expected $name in the staged module at ${artifact.absolutePath}",
+                        )
+                    }
+                    stripUnwindTables(ndk, artifact)
+                }
             }
         }
 

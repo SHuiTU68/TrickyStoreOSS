@@ -299,9 +299,18 @@ class SecurityLevelInterceptor(private val original: IKeystoreSecurityLevel, pri
             )
         }
 
-        private fun bootIdentity(): String? = runCatching {
-            File("/proc/sys/kernel/random/boot_id").readText().trim().takeIf { it.isNotEmpty() }
-        }.getOrNull()
+        // `/proc/sys/kernel/random/boot_id` is generated once per boot and cannot change for as long
+        // as this process lives, yet the old version re-opened and re-parsed it at every call site:
+        // once per generated key (`storeGeneratedKey`), twice per quota-aware key restore
+        // (`restoreKeys`) and once per persisted usage update (`currentUseState`). Key generation
+        // is exactly where the latency is observable, so the read happens once, lazily, and every
+        // caller afterwards pays a field access.
+        private val bootIdentityCache: String? by lazy {
+            runCatching {
+                File("/proc/sys/kernel/random/boot_id").readText().trim().takeIf { it.isNotEmpty() }
+            }.getOrNull()
+        }
+        private fun bootIdentity(): String? = bootIdentityCache
 
         private fun normalizeModificationTime(value: Long): Long {
             val now = System.currentTimeMillis()
