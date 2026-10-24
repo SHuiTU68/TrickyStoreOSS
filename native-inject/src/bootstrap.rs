@@ -27,6 +27,15 @@ use crate::surgeon::RuntimeConfig;
 /// Directory the module keeps its configuration in. Mirrors `certgen::config::CONFIG_PATH`.
 pub const CONFIG_DIR: &str = "/data/adb/tricky_store";
 
+/// Mirror of [`CONFIG_DIR`] inside the key store's private data directory.
+///
+/// `/data/adb` is root-only, and this library runs inside `keystore2` as uid 1017, which cannot
+/// traverse it -- the read fails on directory permissions long before SELinux is consulted. The
+/// daemon is root, so it copies the three files here and hands them to `keystore`, and the
+/// payload reads this copy instead. `/data/misc/keystore` is already labelled
+/// `keystore_data_file`, which the `keystore` domain can read, so no policy has to be added.
+pub const MIRROR_DIR: &str = "/data/misc/keystore/.tricky";
+
 /// Keybox file name, as written by the app.
 pub const KEYBOX_FILE: &str = "keybox.xml";
 
@@ -38,9 +47,17 @@ pub const BOOT_KEY_FILE: &str = "boot_key";
 
 /// Loads the configuration from the module directory and installs it.
 ///
-/// Returns `false` when there is no usable keybox, in which case the hook stays a pass-through.
+/// Both locations are tried, in order: the module directory first, so a payload that can read it
+/// (a root injection, or a future platform that widens the directory) needs no mirror, then the
+/// key store's mirror directory. Returns `false` when there is no usable keybox anywhere, in
+/// which case the hook stays a pass-through.
 pub fn install_default() -> bool {
-    install(Path::new(CONFIG_DIR))
+    for dir in [CONFIG_DIR, MIRROR_DIR] {
+        if let Some(config) = load(Path::new(dir)) {
+            return crate::surgeon::install(config);
+        }
+    }
+    false
 }
 
 /// Loads the configuration from `dir` and installs it. Returns `false` if nothing was installed.

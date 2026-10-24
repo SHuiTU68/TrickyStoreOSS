@@ -38,9 +38,21 @@ pub const ENTRY_SYMBOL: &str = "entry";
 /// Name of the injector binary inside the module directory.
 pub const INJECTOR_FILE: &str = "tricky-inject";
 
-/// UID the platform's keystore runs as. Checked before injecting so a user application that happens
-/// to be named `keystore2` is never a target.
-const KEYSTORE_UID: u32 = 1000;
+/// UID the platform's keystore runs as: `AID_KEYSTORE`, which is **1017** on every Android release
+/// that ships `keystore2` (10 and up).
+///
+/// This must not be 1000. 1000 is `AID_SYSTEM`; a wrong constant is silent and total, because the
+/// guard below then rejects every real `keystore2` with "runs as uid 1017, not the keystore" and the
+/// hook never lands — the property layer still looks hidden while TEE attestation keeps reporting
+/// the unlocked state.
+pub const KEYSTORE_UID: u32 = 1017;
+
+/// First UID reserved for applications. Anything at or above this is an app, never a system daemon.
+///
+/// Used as the real guard: the point of the check is to refuse a *user application* that happens to
+/// be named `keystore2`, so comparing against one hardcoded system uid is both too strict (breaks
+/// silently when the AID moves) and unnecessary (applications can never squat below this boundary).
+const FIRST_APP_UID: u32 = 10_000;
 
 /// Scan interval. One second matches the Kotlin retry cadence and keeps the boot path responsive
 /// without making the scan itself noticeable.
@@ -158,10 +170,12 @@ pub fn attempt(plan: &Plan) -> Attempt {
         return Attempt::AlreadyInjected { pid };
     }
     if let Some(uid) = uid_of(pid) {
-        if uid != KEYSTORE_UID && uid != 0 {
+        if !looks_like_keystore(uid) {
             return Attempt::Failed {
                 pid,
-                error: format!("pid {pid} runs as uid {uid}, not the keystore"),
+                error: format!(
+                    "pid {pid} runs as uid {uid}, an application uid (>= {FIRST_APP_UID}), not the keystore (uid {KEYSTORE_UID})"
+                ),
             };
         }
     }
@@ -182,6 +196,21 @@ pub fn attempt(plan: &Plan) -> Attempt {
             error: error.to_string(),
         },
     }
+}
+
+/// Whether `uid` can belong to the platform keystore.
+///
+/// Two things are deliberately *not* done here. It does not compare against `KEYSTORE_UID` alone: a
+/// single pin is what broke this module once already, because the constant was `AID_SYSTEM` and every
+/// real `keystore2` was rejected as "not the keystore" while the property spoofing happily succeeded.
+/// And it does not accept `0` (root) unconditionally: the keystore never runs as root, and a root
+/// process named `keystore2` is the one case the guard exists for.
+///
+/// What remains is the boundary that actually matters: applications start at `FIRST_APP_UID`, system
+/// daemons never reach it. `AID_KEYSTORE` (1017) and, on pre-keystore2 builds, `AID_SYSTEM` (1000)
+/// both pass; a user application impersonating `keystore2` does not.
+fn looks_like_keystore(uid: u32) -> bool {
+    uid > 0 && uid < FIRST_APP_UID
 }
 
 /// The argv the injector is invoked with.
@@ -392,6 +421,23 @@ mod tests {
             "12c00000-12d00000 r--p 00000000 fd:05 1234 /system/lib64/librustinject.so.bak\n",
             "librustinject.so"
         ));
+    }
+
+    #[test]
+    fn only_a_system_daemon_uid_can_be_the_keystore() {
+        // `AID_KEYSTORE`: the uid `keystore2` runs as on every Android that ships it. Pinning the
+        // wrong constant here (1000, i.e. `AID_SYSTEM`) silently disables the whole module: the
+        // property spoof still lands, the keystore hook never does, and attestation keeps reporting
+        // an unverified boot.
+        assert_eq!(KEYSTORE_UID, 1017);
+        assert!(looks_like_keystore(KEYSTORE_UID));
+        // Pre-`keystore2` builds ran the provider as system, which must stay accepted.
+        assert!(looks_like_keystore(1000));
+        // Applications, including one impersonating `keystore2`, are what the guard is for.
+        assert!(!looks_like_keystore(10_173));
+        assert!(!looks_like_keystore(FIRST_APP_UID));
+        // The keystore never runs as root.
+        assert!(!looks_like_keystore(0));
     }
 
     #[test]

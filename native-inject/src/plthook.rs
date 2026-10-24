@@ -1,31 +1,38 @@
 //! PLT hook installation on top of `lsplt-rs`.
 //!
 //! The C++ payload used `external/PLTI` for the same job. This module keeps the *policy*
-//! (which mapped object to hook, which symbol, what to do when the library is missing) and
-//! delegates the mechanism to `lsplt-rs`. Two behaviours of lsplt are worth spelling out
-//! because they differ from PLTI and they shape the caller:
+//! (which mapped objects are candidates, which symbol, what to do when nothing matches) and
+//! delegates the mechanism to `lsplt-rs`. Three behaviours of lsplt shape the caller, and two of
+//! them each cost a debugging session:
 //!
-//! * A hook is only live after [`commit`]. Registering alone changes nothing, which is why
-//!   `entry` registers every symbol first and commits once: a half-installed interception
-//!   layer sees some transactions and not others.
-//! * `register_hook` takes the `(dev, inode)` pair of the *mapped object*, not a dlopen handle.
-//!   The inode is what makes this work inside keystore, where the same `libbinder_ndk.so` may
-//!   be mapped from the APEX or from `/system/lib64` depending on the release. We therefore
-//!   identify the object by scanning our own maps and matching the trailing path component.
+//! * `register_hook` takes the `(dev, inode)` pair of the object whose **PLT is patched**, which
+//!   is the object that *calls* the symbol, not the one that defines it. Passing the definer
+//!   (`libbinder_ndk.so` for `AIBinder_transact`) registers a hook that can never fire: a library
+//!   resolves its own exports internally and has no relocation for them, so the PLT scan finds
+//!   nothing while lsplt still reports success.
+//! * That silent miss is the second trap: a symbol with no matching relocation is skipped without
+//!   an error, so success can only be judged after [`commit`], by looking at which backup slots
+//!   were filled.
+//! * A hook is only live after [`commit`], and lsplt writes the backup pointer *during* that
+//!   commit. The trampoline therefore does not exist before it, and checking earlier can only
+//!   ever answer "not found". `entry` registers every candidate first and commits once: a
+//!   half-installed interception layer sees some transactions and not others.
 //!
 //! The `#[cfg(not(target_os = "android"))]` half exists so the path matching and the call
 //! ordering stay unit-testable on a host, where lsplt has nothing to hook.
 
-/// One `(object, symbol)` pair to hook.
+/// One symbol to hook everywhere it is imported.
 ///
-/// `libraries` is a list of sonames tried in order. Android canary merges `libbinder` and
-/// `libutils` into `libcore_bundle.so`, and the ndk backend means the function we want may be
-/// in `libbinder_ndk.so` while the parcellable helpers live in `libbinder.so`; both spellings
-/// have to be tried rather than guessed.
+/// `exclude` lists objects whose PLT must not be patched: the libraries that *define* the symbol
+/// (they have no PLT slot for it, and a PLT hook redirects call sites, not definitions), plus our
+/// own payload, which must never intercept itself. Everything else that is mapped from a real
+/// file is a candidate. A fixed list of "the library we want" is what made the first version
+/// fail: on keystore2 the callers are `android.hardware.security.keymint-V5-ndk.so` and friends,
+/// while `libbinder_ndk.so` only exports the symbol.
 #[derive(Debug, Clone, Copy)]
 pub struct HookSpec {
-    /// Candidate sonames, e.g. `&["libbinder_ndk.so", "libbinder.so"]`.
-    pub libraries: &'static [&'static str],
+    /// Objects never hooked, matched on the trailing path component.
+    pub exclude: &'static [&'static str],
     /// The PLT symbol to redirect, e.g. `"AIBinder_transact"`.
     pub symbol: &'static str,
 }
@@ -58,44 +65,103 @@ mod platform {
     use super::HookSpec;
     use std::ffi::c_void;
     use std::io;
+    use std::sync::Mutex;
 
-    /// Installs `symbol` in the first mapped object named by `spec.libraries`.
+    use lsplt_rs::{DeviceId, Inode};
+
+    /// One `*mut c_void` slot that lsplt writes the trampoline into during [`commit`].
     ///
-    /// Returns the trampoline the caller must use to reach the original function. `lsplt`
-    /// fills the backup pointer during `commit`, so a `null` return means the registration
-    /// succeeded but the symbol was not found in that object's PLT -- the caller has to treat
-    /// that as a failure, because forwarding through a null pointer is an instant SIGSEGV in
-    /// the process that owns the keystore.
-    pub fn install(spec: &HookSpec, callback: *mut c_void) -> io::Result<*mut c_void> {
+    /// The slot is heap-allocated and never freed so its address stays valid for the life of the
+    /// process: lsplt stores the address at registration time and writes through it later, and a
+    /// reallocated `Vec` element would leave it writing into freed memory. Only the address of the
+    /// box is kept, so nothing ever frees it.
+    struct Slot(*mut *mut c_void);
+
+    // SAFETY: the pointer refers to a leaked allocation that lsplt writes and `trampoline()` reads
+    // under the same mutex. Rust cannot observe an alias to it.
+    unsafe impl Send for Slot {}
+    // SAFETY: see above; all access is serialised by `SLOTS`.
+    unsafe impl Sync for Slot {}
+
+    static SLOTS: Mutex<Vec<Slot>> = Mutex::new(Vec::new());
+
+    /// Registers `spec.symbol` in every mapped object that is not excluded.
+    ///
+    /// Objects are deduplicated by `(dev, inode)`: `/proc/self/maps` lists one line per segment,
+    /// and registering the same object once per segment would patch the same PLT slot repeatedly.
+    ///
+    /// Registration itself cannot detect a miss -- lsplt queues the request and only touches
+    /// memory in [`commit`] -- so the real test is [`trampoline`] after that commit.
+    pub fn install(spec: &HookSpec, callback: *mut c_void) -> io::Result<()> {
         let maps = lsplt_rs::MapInfo::scan_self();
-        let mapped = maps
-            .iter()
-            .find(|entry| {
-                entry
-                    .pathname
-                    .as_deref()
-                    .is_some_and(|pathname| super::path_matches_any(pathname, spec.libraries))
-            })
-            .ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::NotFound,
-                    format!("none of {:?} is mapped into this process", spec.libraries),
-                )
-            })?;
-        let mut backup: *mut c_void = std::ptr::null_mut();
-        lsplt_rs::register_hook(
-            mapped.dev,
-            mapped.inode,
+        let mut seen: Vec<(DeviceId, Inode)> = Vec::new();
+        let mut slots = SLOTS.lock().unwrap_or_else(|error| error.into_inner());
+        slots.clear();
+        for entry in &maps {
+            let Some(pathname) = entry.pathname.as_deref() else {
+                // Anonymous mappings and `[anon:...]` regions are not files.
+                continue;
+            };
+            if !pathname.starts_with('/') {
+                // `[vdso]`, `[stack]`, `[anon:dalvik-...]`: no ELF on disk to scan.
+                continue;
+            }
+            if entry.dev == 0 || entry.inode == 0 {
+                // Deleted or special files carry no identity lsplt can match against.
+                continue;
+            }
+            if super::path_matches_any(pathname, spec.exclude) {
+                continue;
+            }
+            if seen.contains(&(entry.dev, entry.inode)) {
+                continue;
+            }
+            seen.push((entry.dev, entry.inode));
+            let slot = Box::into_raw(Box::new(std::ptr::null_mut::<c_void>()));
+            // SAFETY: `slot` came from `Box::into_raw`, so it is a valid, aligned, uniquely owned
+            // `*mut c_void` for the rest of the process; lsplt writes the trampoline through it at
+            // commit. The allocation is intentionally leaked, so the reference stays valid.
+            let backup = unsafe { &mut *slot };
+            lsplt_rs::register_hook(entry.dev, entry.inode, spec.symbol, callback, Some(backup))?;
+            slots.push(Slot(slot));
+        }
+        if slots.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "no loaded object is eligible for a PLT hook",
+            ));
+        }
+        // Worth a line on the device: the registration count is the only evidence that the scan
+        // found the callers of the symbol at all, and it costs nothing at injection time.
+        crate::diag::info(&format!(
+            "queued a PLT hook for {} in {} mapped object(s)",
             spec.symbol,
-            callback,
-            Some(&mut backup),
-        )?;
-        Ok(backup)
+            slots.len()
+        ));
+        Ok(())
     }
 
-    /// Makes every [`install`]ed hook live.
+    /// Makes every [`install`]ed hook live and fills the backup slots.
     pub fn commit() -> io::Result<()> {
         lsplt_rs::commit_hook()
+    }
+
+    /// The trampoline lsplt published for the first object that actually had the symbol.
+    ///
+    /// `None` means no loaded object had a PLT slot for the symbol, which is the only honest
+    /// signal available because lsplt reports that miss as success. Every trampoline resolves to
+    /// the same real function, so the first one found serves every patched call site.
+    pub fn trampoline() -> Option<*mut c_void> {
+        let slots = SLOTS.lock().unwrap_or_else(|error| error.into_inner());
+        for slot in slots.iter() {
+            // SAFETY: the slot is a leaked allocation, valid for the whole process lifetime, and
+            // `commit` -- the only writer -- has already returned on this thread.
+            let value = unsafe { *slot.0 };
+            if !value.is_null() {
+                return Some(value);
+            }
+        }
+        None
     }
 }
 
@@ -114,19 +180,23 @@ mod platform {
     /// asking [`registrations`] what happened.
     static REGISTRATIONS: Mutex<Vec<(Vec<&'static str>, &'static str)>> = Mutex::new(Vec::new());
 
-    pub fn install(spec: &HookSpec, _callback: *mut c_void) -> io::Result<*mut c_void> {
+    pub fn install(spec: &HookSpec, _callback: *mut c_void) -> io::Result<()> {
         let mut guard = REGISTRATIONS
             .lock()
             .unwrap_or_else(|error| error.into_inner());
-        guard.push((spec.libraries.to_vec(), spec.symbol));
-        Ok(std::ptr::without_provenance_mut(1))
+        guard.push((spec.exclude.to_vec(), spec.symbol));
+        Ok(())
     }
 
     pub fn commit() -> io::Result<()> {
         Ok(())
     }
 
-    /// The `(libraries, symbol)` pairs registered so far, in order.
+    pub fn trampoline() -> Option<*mut c_void> {
+        Some(std::ptr::without_provenance_mut(1))
+    }
+
+    /// The `(exclude, symbol)` pairs registered so far, in order.
     ///
     /// Test-only in practice: on a device the equivalent observation is "did the transaction
     /// arrive", which the reply rewrite answers. Keeping the accessor unconditionally would be
@@ -149,7 +219,7 @@ mod platform {
     }
 }
 
-pub use platform::{commit, install};
+pub use platform::{commit, install, trampoline};
 
 #[cfg(test)]
 mod tests {
@@ -196,10 +266,12 @@ mod tests {
     fn a_host_install_records_the_request_and_yields_a_trampoline() {
         platform::clear();
         let spec = HookSpec {
-            libraries: &["libbinder_ndk.so", "libbinder.so"],
+            exclude: &["libbinder_ndk.so", "libbinder.so"],
             symbol: "AIBinder_transact",
         };
-        let trampoline = install(&spec, std::ptr::null_mut()).expect("a host install cannot fail");
+        install(&spec, std::ptr::null_mut()).expect("a host install cannot fail");
+        commit().expect("committing on a host has nothing to do and must not fail");
+        let trampoline = trampoline().expect("the host build always has a trampoline");
         assert!(
             !trampoline.is_null(),
             "null is what the caller rejects as a failure"
@@ -211,6 +283,5 @@ mod tests {
                 "AIBinder_transact"
             )]
         );
-        commit().expect("committing on a host has nothing to do and must not fail");
     }
 }

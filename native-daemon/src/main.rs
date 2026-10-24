@@ -38,6 +38,8 @@ mod probe;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::thread;
+use std::time::Duration;
 
 use certgen::hide_props;
 use certgen::hide_props::ShellRunner;
@@ -47,6 +49,18 @@ use certgen::system::{ShShell, SystemProperties};
 const DATA_DIR_ENV: &str = "TRICKY_STORE_DIR";
 /// File name of the property-spoofing config, taken from the planner so the two never drift apart.
 const HIDE_PROPS_NAME: &str = "hide_props.txt";
+
+/// Where the payload reads its configuration from, inside the key store's private data directory.
+///
+/// The payload is loaded into `keystore2`, which runs as uid 1017, and `/data/adb` is root-only:
+/// the read fails on directory permissions before SELinux is consulted. `/data/misc/keystore` is
+/// `drwx------ keystore keystore` labelled `keystore_data_file`, which is exactly what the
+/// `keystore` domain may read, so the daemon mirrors the payload's three inputs there and hands
+/// them over. This must stay in step with `native_inject::bootstrap::MIRROR_DIR`.
+const MIRROR_DIR: &str = "/data/misc/keystore/.tricky";
+
+/// `AID_KEYSTORE`, the uid and gid `keystore2` runs as on every Android release.
+const KEYSTORE_ID: u32 = 1017;
 
 fn main() -> ExitCode {
     match run() {
@@ -95,6 +109,7 @@ fn run() -> Result<(), String> {
     ));
 
     apply_hide_props(&args.data_dir);
+    mirror_payload_config(&args.data_dir);
 
     let plan = interceptor::Plan::discover(&args.module_dir);
     if args.dump {
@@ -155,14 +170,149 @@ fn apply_hide_props(data_dir: &Path) {
                 "Applied {} property change(s), removed {}; resetprop said: {}",
                 outcome.changed,
                 outcome.removed,
-                if trimmed.is_empty() { "(nothing)" } else { trimmed }
+                if trimmed.is_empty() {
+                    "(nothing)"
+                } else {
+                    trimmed
+                }
             ));
         }
-        None => log::warn(format!(
-            "Applying {} property change(s) / {} removal(s) failed; the script ran but exited non-zero",
-            outcome.changed, outcome.removed
-        )),
+        None => {
+            log::warn(format!(
+                "Applying {} property change(s) / {} removal(s) failed; the script ran but exited non-zero",
+                outcome.changed, outcome.removed
+            ));
+            replay_steps(&outcome.script);
+        }
     }
+}
+
+/// Copies the payload's three inputs into [`MIRROR_DIR`] and hands them to `keystore`.
+///
+/// Only the files that exist are copied: a device with no keybox is a supported state, and the
+/// payload already treats a missing keybox as "forward every reply untouched". Failures are
+/// logged and skipped rather than fatal -- the daemon's other duties (boot hash, property
+/// spoofing, injection) must not be dropped because one `chown` was refused.
+fn mirror_payload_config(data_dir: &Path) {
+    let dir = Path::new(MIRROR_DIR);
+    if let Err(error) = std::fs::create_dir_all(dir) {
+        log::warn(format!("cannot create {}: {error}", dir.display()));
+        return;
+    }
+    // The directory has to be searchable by `keystore` for the payload to reach the files inside.
+    if let Err(error) = hand_to_keystore(dir, 0o700) {
+        log::warn(format!(
+            "cannot hand {} over to keystore: {error}",
+            dir.display()
+        ));
+        return;
+    }
+
+    let mut copied = 0;
+    for name in [
+        certgen::config::KEYBOX_FILE,
+        certgen::config::TEE_STATUS_FILE,
+        boot::BOOT_KEY_FILE,
+    ] {
+        let source = data_dir.join(name);
+        if !source.exists() {
+            log::debug(format!("No {} to mirror", source.display()));
+            continue;
+        }
+        let target = dir.join(name);
+        if let Err(error) = std::fs::copy(&source, &target) {
+            log::warn(format!(
+                "cannot mirror {} to {}: {error}",
+                source.display(),
+                target.display()
+            ));
+            continue;
+        }
+        if let Err(error) = hand_to_keystore(&target, 0o600) {
+            log::warn(format!("cannot hand {} over: {error}", target.display()));
+            continue;
+        }
+        copied += 1;
+    }
+    log::info(format!(
+        "Mirrored {copied} payload config file(s) into {}",
+        dir.display()
+    ));
+}
+
+/// Sets `mode` on `path` and gives it to `keystore`, so the injected payload can open it.
+fn hand_to_keystore(path: &Path, mode: u32) -> std::io::Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::PermissionsExt;
+
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))?;
+    let c_path = std::ffi::CString::new(path.as_os_str().as_bytes())
+        .map_err(|_| std::io::Error::other("path contains a NUL byte"))?;
+    // SAFETY: `c_path` is a live NUL-terminated string for the duration of the call, and `chown`
+    // only reads it.
+    let result = unsafe { libc::chown(c_path.as_ptr(), KEYSTORE_ID, KEYSTORE_ID) };
+    if result != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// How often a single `hide_props` step is retried after the combined script failed.
+///
+/// Ten attempts one second apart is chosen for the one command that can lose a race with the
+/// framework: `/system/bin/settings` goes through the settings provider inside `system_server`, and
+/// at `late_start service` that provider is not always published yet. `resetprop` writes the property
+/// area directly and has no such dependency, so it succeeds on the first try.
+const STEP_ATTEMPTS: u32 = 10;
+const STEP_RETRY_DELAY: Duration = Duration::from_secs(1);
+
+/// Re-runs a failed `hide_props` script one command at a time.
+///
+/// `ShShell` runs the whole script through a single `sh -c`, so a non-zero exit says only that *some*
+/// command failed — the exit status of `sh -c` is the status of its last command, and an earlier
+/// failure is invisible. That is exactly how a working property spoof could be reported as a total
+/// failure: four `resetprop` writes landed, the trailing `settings put` did not, and the log blamed
+/// the script. Replaying the lines names the culprit and lets the racing command be retried.
+fn replay_steps(script: &str) {
+    let mut failed = 0usize;
+    let mut recovered = 0usize;
+    for line in script.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        if run_step(line) {
+            log::info(format!("hide_props: recovered '{line}'"));
+            recovered += 1;
+        } else {
+            log::warn(format!(
+                "hide_props: '{line}' still fails after {STEP_ATTEMPTS} attempts"
+            ));
+            failed += 1;
+        }
+    }
+    if failed == 0 {
+        log::info(format!(
+            "hide_props: all {recovered} command(s) applied on replay"
+        ));
+    } else {
+        log::warn(format!(
+            "hide_props: {failed} command(s) failed, {recovered} recovered on replay"
+        ));
+    }
+}
+
+/// Runs one command, retrying while it may still be racing the rest of the boot.
+fn run_step(line: &str) -> bool {
+    for attempt in 1..=STEP_ATTEMPTS {
+        if ShShell.run(line).is_some() {
+            return true;
+        }
+        if attempt < STEP_ATTEMPTS {
+            thread::sleep(STEP_RETRY_DELAY);
+        }
+    }
+    false
 }
 
 /// Command line. Deliberately hand-rolled: four flags do not justify a parser dependency in a binary

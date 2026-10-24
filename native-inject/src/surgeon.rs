@@ -126,14 +126,52 @@ pub fn is_installed() -> bool {
 
 /// The rewrite for one reply, or `None` to keep the reply untouched.
 pub fn plan_reply_rewrite(reply: &[u8]) -> Option<ReplyRewrite> {
-    let config = CONFIG.get()?;
-    let (range, certificates) = find_certificate_array(reply)?;
-    let replacement = resign_chain(config, &certificates)?;
-    Some(ReplyRewrite { range, replacement })
+    let Some(config) = CONFIG.get() else {
+        crate::probe::mark("surgeon: no config installed");
+        return None;
+    };
+    let Some((range, certificates, encoding)) = find_certificate_array(reply) else {
+        crate::probe::mark(&format!("surgeon: no chain found in {} bytes", reply.len()));
+        return None;
+    };
+    crate::probe::mark(&format!(
+        "surgeon: chain of {} cert(s) at {:?} as {:?}",
+        certificates.len(),
+        range,
+        encoding
+    ));
+    let Some(replacement) = resign_chain(config, &certificates, encoding) else {
+        crate::probe::mark("surgeon: resign failed");
+        return None;
+    };
+    if let Some((_, again)) = parse_chain(&replacement, encoding) {
+        crate::probe::mark(&format!(
+            "surgeon: replacement holds {} cert(s) of {:?} bytes",
+            again.len(),
+            again.iter().map(|c| c.len()).collect::<Vec<_>>()
+        ));
+    } else {
+        crate::probe::mark("surgeon: replacement does not parse");
+    }
+    let enclosing_sizes = enclosing_size_words(reply, &range);
+    crate::probe::mark(&format!(
+        "surgeon: replacement {} bytes, totals at {:?}",
+        replacement.len(),
+        enclosing_sizes
+    ));
+    Some(ReplyRewrite {
+        range,
+        replacement,
+        enclosing_sizes,
+    })
 }
 
 /// Re-signs the leaf and re-encodes the chain as a parcel fragment.
-fn resign_chain(config: &RuntimeConfig, certificates: &[Vec<u8>]) -> Option<Vec<u8>> {
+fn resign_chain(
+    config: &RuntimeConfig,
+    certificates: &[Vec<u8>],
+    encoding: ChainEncoding,
+) -> Option<Vec<u8>> {
     let leaf = certificates.first()?;
     let request = encode_request(config, leaf);
     // `certgen` owns the DER work and returns leaf-first concatenated DER. It validates that the
@@ -141,7 +179,16 @@ fn resign_chain(config: &RuntimeConfig, certificates: &[Vec<u8>]) -> Option<Vec<
     // structurally valid but is not an attestation leaf ends up here as `None`.
     let chain = certgen::hack_leaf::hack_certificate_chain_blob(&request).ok()?;
     let resigned = split_der_chain(&chain)?;
-    Some(encode_certificate_array(&resigned))
+    Some(encode_certificate_array(&resigned, encoding))
+}
+
+/// How the reply frames the `Certificate[]` it carries.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ChainEncoding {
+    /// `int32 count`, then `count` length-prefixed DER structures.
+    Plain,
+    /// `int32 count`, `int32 total`, then the elements; `total` is self-inclusive.
+    Sized,
 }
 
 /// Finds the trailing `Certificate[]` of the reply.
@@ -156,17 +203,23 @@ fn resign_chain(config: &RuntimeConfig, certificates: &[Vec<u8>]) -> Option<Vec<
 /// both of which vary per key. What *is* fixed is that the chain is the last field, so the
 /// candidates are checked from the right and the first one that parses to within the trailing
 /// padding wins. A rejected candidate costs one big-endian count read.
-pub fn find_certificate_array(reply: &[u8]) -> Option<(Range<usize>, Vec<Vec<u8>>)> {
+pub fn find_certificate_array(reply: &[u8]) -> Option<(Range<usize>, Vec<Vec<u8>>, ChainEncoding)> {
     let lowest = reply.len().saturating_sub(SCAN_WINDOW);
     let last = reply.len().checked_sub(4)?;
     for start in (lowest..last).rev() {
-        let Some((consumed, certificates)) = parse_certificate_array(&reply[start..]) else {
-            continue;
-        };
-        // At most three bytes of padding may follow the array: four or more would be another
-        // field, and a reply with a field after the chain is not one whose layout we understand.
-        if reply.len() - (start + consumed) <= 3 {
-            return Some((start..reply.len(), certificates));
+        // The sized framing is tried first: a plain parse of the same bytes would read the total
+        // as the first certificate's length and reject itself, but there is no reason to pay for
+        // that attempt when the leading dialect is the one this device speaks.
+        for encoding in [ChainEncoding::Sized, ChainEncoding::Plain] {
+            let Some((consumed, certificates)) = parse_chain(&reply[start..], encoding) else {
+                continue;
+            };
+            // At most three bytes of padding may follow the array: four or more would be another
+            // field, and a reply with a field after the chain is not one whose layout we
+            // understand.
+            if reply.len() - (start + consumed) <= 3 {
+                return Some((start..reply.len(), certificates, encoding));
+            }
         }
     }
     None
@@ -174,14 +227,32 @@ pub fn find_certificate_array(reply: &[u8]) -> Option<(Range<usize>, Vec<Vec<u8>
 
 /// Parses `int32 count` followed by `count` length-prefixed DER certificates.
 ///
-/// Returns the number of bytes the array occupies; the caller decides whether the padding that
-/// follows is acceptable.
-fn parse_certificate_array(data: &[u8]) -> Option<(usize, Vec<Vec<u8>>)> {
+/// `Sized` adds a second `int32` in front of the elements: the byte count of everything after it
+/// *plus its own four bytes*. KeyMint on this device writes the chain that way -- a single EC
+/// leaf arrives as `01 00 00 00 | cc 02 00 00 | c4 02 00 00 | 30 82 02 c0 ...`, i.e. one
+/// certificate, a total of 716 that covers the 712 bytes behind it and itself, then the DER.
+///
+/// Returns the number of bytes the array occupies, header included; the caller decides whether
+/// the padding that follows is acceptable.
+fn parse_chain(data: &[u8], encoding: ChainEncoding) -> Option<(usize, Vec<Vec<u8>>)> {
     let count = read_i32(data, 0)?;
     if !(1..=MAX_CERTIFICATES).contains(&count) {
         return None;
     }
-    let mut position = 4usize;
+    let declared_total = match encoding {
+        ChainEncoding::Plain => None,
+        ChainEncoding::Sized => {
+            let total = read_i32(data, 4)?;
+            if total < 8 {
+                return None;
+            }
+            Some(total as usize)
+        }
+    };
+    let mut position = match encoding {
+        ChainEncoding::Plain => 4usize,
+        ChainEncoding::Sized => 8usize,
+    };
     let mut certificates = Vec::new();
     for _ in 0..count {
         let length = read_i32(data, position)?;
@@ -199,14 +270,24 @@ fn parse_certificate_array(data: &[u8]) -> Option<(usize, Vec<Vec<u8>>)> {
         // padding, so clamp instead of rejecting.
         position = align4(end).min(data.len());
     }
+    if let Some(declared_total) = declared_total {
+        // Self-inclusive: the total is the elements plus the four bytes holding the total.
+        if declared_total != position.checked_sub(4)? {
+            return None;
+        }
+    }
     Some((position, certificates))
 }
 
-/// Reads a big-endian `i32` at `offset`, or `None` when it does not fit.
+/// Reads a little-endian `i32` at `offset`, or `None` when it does not fit.
+///
+/// Little-endian because that is what a binder parcel is: `libbinder` writes `int32` through a
+/// native-endian copy, and every Android ABI this runs on is little-endian. Reading the reply's
+/// counters big-endian was why a chain of one certificate was never recognised.
 fn read_i32(data: &[u8], offset: usize) -> Option<i32> {
     let bytes = data.get(offset..offset.checked_add(4)?)?;
     let bytes: [u8; 4] = bytes.try_into().ok()?;
-    Some(i32::from_be_bytes(bytes))
+    Some(i32::from_le_bytes(bytes))
 }
 
 /// Rounds `value` up to the next multiple of four.
@@ -263,17 +344,39 @@ fn split_der_chain(data: &[u8]) -> Option<Vec<Vec<u8>>> {
 ///
 /// Always a multiple of four bytes long, which is what keeps the rebuilt parcel aligned after a
 /// replacement of a different length.
-fn encode_certificate_array(certificates: &[Vec<u8>]) -> Vec<u8> {
-    let mut out = Vec::new();
-    out.extend_from_slice(&(certificates.len() as i32).to_be_bytes());
+fn encode_certificate_array(certificates: &[Vec<u8>], encoding: ChainEncoding) -> Vec<u8> {
+    let mut elements = Vec::new();
     for certificate in certificates {
-        out.extend_from_slice(&(certificate.len() as i32).to_be_bytes());
-        out.extend_from_slice(certificate);
-        while out.len() % 4 != 0 {
-            out.push(0);
+        elements.extend_from_slice(&(certificate.len() as i32).to_le_bytes());
+        elements.extend_from_slice(certificate);
+        while elements.len() % 4 != 0 {
+            elements.push(0);
         }
     }
+    let mut out = Vec::with_capacity(elements.len() + 8);
+    out.extend_from_slice(&(certificates.len() as i32).to_le_bytes());
+    if encoding == ChainEncoding::Sized {
+        out.extend_from_slice(&((elements.len() + 4) as i32).to_le_bytes());
+    }
+    out.extend_from_slice(&elements);
     out
+}
+
+/// Offsets of the self-inclusive `int32` totals that enclose `range`.
+///
+/// The reply frames its payload with counts that include their own four bytes -- the outermost one
+/// of a `generateKey` answer reads `1568` for the 1576-byte parcel. Those totals sit in front of
+/// the chain, so a longer or shorter chain has to move them by the same amount, and leaving one
+/// behind would hand `keystore2` a parcel whose sizes no longer add up.
+fn enclosing_size_words(reply: &[u8], range: &Range<usize>) -> Vec<usize> {
+    let limit = range.start.min(reply.len().saturating_sub(3));
+    let mut offsets = Vec::new();
+    for offset in 0..limit {
+        if read_i32(reply, offset) == Some((reply.len() - offset) as i32) {
+            offsets.push(offset);
+        }
+    }
+    offsets
 }
 
 /// Packs the leaf-hack request blob.
@@ -319,14 +422,36 @@ mod tests {
         der
     }
 
-    /// A reply with a key blob and a characteristics array in front of the chain.
+    /// A reply framed the way this device frames one: status, a presence word, a self-inclusive
+    /// total for the payload, then key blob, characteristics and the sized chain.
     fn reply_with(certificates: &[Vec<u8>]) -> Vec<u8> {
+        let mut body = Vec::new();
+        body.extend_from_slice(&64i32.to_le_bytes()); // key blob length
+        body.extend(std::iter::repeat_n(0xAAu8, 64));
+        body.extend_from_slice(&0i32.to_le_bytes()); // empty characteristics
+        body.extend_from_slice(&encode_certificate_array(
+            certificates,
+            ChainEncoding::Sized,
+        ));
         let mut reply = Vec::new();
-        reply.extend_from_slice(&0i32.to_be_bytes()); // status header
-        reply.extend_from_slice(&64i32.to_be_bytes()); // key blob length
+        reply.extend_from_slice(&0i32.to_le_bytes()); // status
+        reply.extend_from_slice(&1i32.to_le_bytes()); // presence word
+        reply.extend_from_slice(&((body.len() + 4) as i32).to_le_bytes());
+        reply.extend_from_slice(&body);
+        reply
+    }
+
+    /// The same shape with the plain framing: `int32 count`, then the elements.
+    fn plain_reply_with(certificates: &[Vec<u8>]) -> Vec<u8> {
+        let mut reply = Vec::new();
+        reply.extend_from_slice(&0i32.to_le_bytes());
+        reply.extend_from_slice(&64i32.to_le_bytes());
         reply.extend(std::iter::repeat_n(0xAAu8, 64));
-        reply.extend_from_slice(&0i32.to_be_bytes()); // empty characteristics
-        reply.extend_from_slice(&encode_certificate_array(certificates));
+        reply.extend_from_slice(&0i32.to_le_bytes());
+        reply.extend_from_slice(&encode_certificate_array(
+            certificates,
+            ChainEncoding::Plain,
+        ));
         reply
     }
 
@@ -338,16 +463,17 @@ mod tests {
         // starts at a multiple of four from the start of the buffer we were handed, so the
         // scan must not depend on it.
         reply.insert(5, 0xEE);
-        let (range, found) = find_certificate_array(&reply).expect("chain is found");
+        let (range, found, encoding) = find_certificate_array(&reply).expect("chain is found");
         assert_eq!(found, chain);
+        assert_eq!(encoding, ChainEncoding::Sized);
         assert_eq!(range.end, reply.len());
     }
 
     #[test]
     fn a_reply_without_a_chain_is_left_alone() {
         let mut reply = Vec::new();
-        reply.extend_from_slice(&0i32.to_be_bytes());
-        reply.extend_from_slice(&16i32.to_be_bytes());
+        reply.extend_from_slice(&0i32.to_le_bytes());
+        reply.extend_from_slice(&16i32.to_le_bytes());
         reply.extend(std::iter::repeat_n(0xBBu8, 16));
         assert!(find_certificate_array(&reply).is_none());
     }
@@ -364,8 +490,8 @@ mod tests {
     #[test]
     fn a_count_without_bytes_behind_it_is_rejected() {
         let mut reply = Vec::new();
-        reply.extend_from_slice(&2i32.to_be_bytes());
-        reply.extend_from_slice(&16i32.to_be_bytes());
+        reply.extend_from_slice(&2i32.to_le_bytes());
+        reply.extend_from_slice(&16i32.to_le_bytes());
         reply.extend(std::iter::repeat_n(0x30u8, 16));
         assert!(find_certificate_array(&reply).is_none());
     }
@@ -377,8 +503,8 @@ mod tests {
         der.extend_from_slice(&[1, 2]);
         assert_eq!(der_total_length(&der), Some(2 + 0x30));
         let mut reply = Vec::new();
-        reply.extend_from_slice(&1i32.to_be_bytes());
-        reply.extend_from_slice(&(der.len() as i32).to_be_bytes());
+        reply.extend_from_slice(&1i32.to_le_bytes());
+        reply.extend_from_slice(&(der.len() as i32).to_le_bytes());
         reply.extend_from_slice(&der);
         assert!(find_certificate_array(&reply).is_none());
     }
@@ -386,11 +512,13 @@ mod tests {
     #[test]
     fn an_encoded_array_round_trips_and_stays_aligned() {
         let chain = vec![certificate(9, 5), certificate(9, 6)];
-        let encoded = encode_certificate_array(&chain);
-        assert_eq!(encoded.len() % 4, 0);
-        let (consumed, parsed) = parse_certificate_array(&encoded).expect("array parses");
-        assert_eq!(consumed, encoded.len());
-        assert_eq!(parsed, chain);
+        for encoding in [ChainEncoding::Plain, ChainEncoding::Sized] {
+            let encoded = encode_certificate_array(&chain, encoding);
+            assert_eq!(encoded.len() % 4, 0);
+            let (consumed, parsed) = parse_chain(&encoded, encoding).expect("array parses");
+            assert_eq!(consumed, encoded.len());
+            assert_eq!(parsed, chain);
+        }
     }
 
     #[test]
@@ -399,6 +527,34 @@ mod tests {
         let joined: Vec<u8> = chain.concat();
         assert_eq!(split_der_chain(&joined), Some(chain));
         assert_eq!(split_der_chain(&[]), None);
+    }
+
+    #[test]
+    fn the_sized_framing_is_preferred_when_both_could_parse() {
+        let chain = vec![certificate(4, 44)];
+        let reply = reply_with(&chain);
+        let (_, found, encoding) = find_certificate_array(&reply).expect("chain is found");
+        assert_eq!(found, chain);
+        assert_eq!(encoding, ChainEncoding::Sized);
+    }
+
+    #[test]
+    fn the_plain_framing_is_still_understood() {
+        let chain = vec![certificate(5, 12), certificate(6, 13)];
+        let reply = plain_reply_with(&chain);
+        let (range, found, encoding) = find_certificate_array(&reply).expect("chain is found");
+        assert_eq!(found, chain);
+        assert_eq!(encoding, ChainEncoding::Plain);
+        assert_eq!(range.end, reply.len());
+    }
+
+    #[test]
+    fn the_enclosing_totals_are_the_ones_that_cover_the_chain() {
+        let reply = reply_with(&vec![certificate(8, 20)]);
+        let (range, _, _) = find_certificate_array(&reply).expect("chain is found");
+        // The payload total at offset 8 and the chain's own total are both self-inclusive; only the
+        // first one is in front of the chain, so only that one is left for `rebuild` to move.
+        assert_eq!(enclosing_size_words(&reply, &range), vec![8]);
     }
 
     #[test]

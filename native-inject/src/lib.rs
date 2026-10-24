@@ -117,6 +117,54 @@ mod diag {
     }
 }
 
+/// File-based probe used while the interception path is being brought up.
+///
+/// logd is not trustworthy for this: a line written from inside `commit` either arrives very
+/// late or not at all when the hook machinery touches the caller's own mappings, so the only
+/// way to see how far execution got is to append to a file the target uid can write.
+mod probe {
+    /// Appends one line to the probe file.
+    #[cfg(target_os = "android")]
+    pub fn mark(message: &str) {
+        use std::io::Write;
+        if let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open("/data/misc/keystore/.inject-probe.log")
+        {
+            let _ = writeln!(file, "{} {}", std::process::id(), message);
+        }
+    }
+    /// Saves the first marshalled reply verbatim so the layout can be inspected offline.
+    ///
+    /// Written once: a second `generateKey` reply would only overwrite the sample being looked at.
+    #[cfg(target_os = "android")]
+    pub fn dump_reply(bytes: &[u8]) {
+        let path = "/data/misc/keystore/.inject-reply.bin";
+        if std::path::Path::new(path).exists() {
+            return;
+        }
+        let _ = std::fs::write(path, bytes);
+    }
+    /// Saves the first spliced reply next to the original sample.
+    #[cfg(target_os = "android")]
+    pub fn dump_patched(bytes: &[u8]) {
+        let path = "/data/misc/keystore/.inject-patched.bin";
+        if std::path::Path::new(path).exists() {
+            return;
+        }
+        let _ = std::fs::write(path, bytes);
+    }
+    #[cfg(not(target_os = "android"))]
+    pub fn dump_patched(_bytes: &[u8]) {}
+    /// The host has no probe sink: tests assert on the returned values instead.
+    #[cfg(not(target_os = "android"))]
+    pub fn mark(_message: &str) {}
+    /// The host keeps no reply samples either.
+    #[cfg(not(target_os = "android"))]
+    pub fn dump_reply(_bytes: &[u8]) {}
+}
+
 /// The payload entry point, called by the injector after `dlopen`.
 ///
 /// Signature matches the C++ implementation it replaces: a `dlopen` handle (unused -- the crate
@@ -139,15 +187,25 @@ pub extern "C" fn entry(_library_handle: *mut std::ffi::c_void) -> bool {
     }
     #[cfg(target_os = "android")]
     {
+        diag::info("probe: entry begin");
+        probe::mark("entry: begin");
         if let Err(error) = intercept::platform::install() {
             diag::error(&format!(
                 "cannot install the AIBinder_transact hook: {error}"
             ));
             return false;
         }
-        if let Err(error) = intercept::platform::commit() {
+        diag::info("probe: install returned ok");
+        probe::mark("entry: install ok");
+        // The commit resolves the trampoline, so it is also the first point where the hook can be
+        // shown to be live: `lsplt` accepts registrations for objects that have no such PLT slot.
+        diag::info("probe: committing");
+        probe::mark("entry: committing");
+        let commit_result = intercept::platform::commit();
+        diag::info(&format!("probe: commit returned {commit_result:?}"));
+        if let Err(error) = commit_result {
             diag::error(&format!(
-                "cannot commit the AIBinder_transact hook: {error}"
+                "cannot activate the AIBinder_transact hook: {error}"
             ));
             return false;
         }

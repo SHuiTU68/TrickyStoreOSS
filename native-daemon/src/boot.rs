@@ -27,7 +27,9 @@ const BOOT_KEY_PROP: &str = "ro.boot.vbmeta.public_key_digest";
 const BOOT_HASH_PROP: &str = "ro.boot.vbmeta.digest";
 /// Persisted fallback for the boot key, kept outside the module directory so a module update does not
 /// change the value the device has been reporting.
-const BOOT_KEY_FILE: &str = "boot_key";
+///
+/// Public because `main` mirrors it into the payload's readable directory alongside the keybox.
+pub const BOOT_KEY_FILE: &str = "boot_key";
 
 /// Where a resolved value came from. Logged verbatim, and part of the `--dump` output, because the
 /// three cases are not equivalent: only the property and attestation paths describe the real device.

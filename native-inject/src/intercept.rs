@@ -103,6 +103,10 @@ pub struct ReplyRewrite {
     pub range: Range<usize>,
     /// Encoded bytes that take its place.
     pub replacement: Vec<u8>,
+    /// Offsets of little-endian `int32` totals in front of `range` that count the bytes after
+    /// them, their own four included. They are moved by however much the splice changes the
+    /// length, because a reply whose totals no longer add up is a corrupted parcel.
+    pub enclosing_sizes: Vec<usize>,
 }
 
 /// Copies `original` around `rewrite`.
@@ -121,6 +125,19 @@ pub fn rebuild(original: &[u8], rewrite: &ReplyRewrite) -> Option<Vec<u8>> {
     out.extend_from_slice(&original[..start]);
     out.extend_from_slice(&rewrite.replacement);
     out.extend_from_slice(&original[end..]);
+    let delta = rewrite.replacement.len() as i64 - (end - start) as i64;
+    for &offset in &rewrite.enclosing_sizes {
+        let field = offset..offset + 4;
+        if field.end > start {
+            return None;
+        }
+        let current: [u8; 4] = original[field.clone()].try_into().ok()?;
+        let adjusted = i32::from_le_bytes(current) as i64 + delta;
+        if !(0..=i32::MAX as i64).contains(&adjusted) {
+            return None;
+        }
+        out[field].copy_from_slice(&(adjusted as i32).to_le_bytes());
+    }
     Some(out)
 }
 
@@ -144,6 +161,14 @@ pub mod platform {
 
     static ORIGINAL_TRANSACT: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
 
+    // `#[link(name = "binder_ndk")]` is load-bearing, not cosmetic: `librustinject.so` is
+    // `dlopen`ed into `keystore2` long after that process started, and the dynamic linker
+    // resolves these symbols from the shared objects listed in our own `DT_NEEDED`. Without
+    // the entry the payload loads but every symbol below is unrelocatable and `dlopen` fails
+    // with `cannot locate symbol "AIBinder_getClass"`. `keystore2` always has
+    // `libbinder_ndk.so` mapped (it is how it talks to KeyMint), so naming it here costs a
+    // lookup of an already-loaded library and nothing else.
+    #[link(name = "binder_ndk")]
     extern "C" {
         fn AIBinder_transact(
             binder: *mut c_void,
@@ -153,35 +178,77 @@ pub mod platform {
             flags: u32,
         ) -> i32;
         fn AIBinder_getClass(binder: *mut c_void) -> *const c_void;
-        fn AIBinder_descriptorForType(clazz: *const c_void) -> *const c_char;
-        fn AParcel_marshal(parcel: *const c_void, length: *mut usize, buffer: *mut *mut u8) -> i32;
+        /// `AIBinder_descriptorForType` does not exist in `libbinder_ndk.so`; the public
+        /// accessor for a class descriptor is `AIBinder_Class_getDescriptor` (API 31+).
+        fn AIBinder_Class_getDescriptor(clazz: *const c_void) -> *const c_char;
+        /// Payload length of the parcel, in bytes. A plain getter: `AParcel*` in, `size_t` out.
+        fn AParcel_getDataSize(parcel: *const c_void) -> usize;
+        /// Real ABI (`LIBBINDER_NDK33`): copies `length` bytes of the parcel payload starting at
+        /// `offset` into a caller-owned buffer and returns a `binder_status_t`.
+        /// Four arguments, not three -- a two-argument reading silently returns `BAD_VALUE`.
+        fn AParcel_marshal(
+            parcel: *const c_void,
+            buffer: *mut u8,
+            offset: usize,
+            length: usize,
+        ) -> i32;
+        /// Allocates an empty parcel, which is the only way to build a reply we can hand back.
+        fn AParcel_create() -> *mut c_void;
+        /// Read cursor of a parcel, in bytes. `AParcel_unmarshal` leaves it at the *end* of the
+        /// data it installed (the parcel is treated as fully written), so a caller that starts
+        /// reading immediately would see EOF.
+        fn AParcel_getDataPosition(parcel: *const c_void) -> i32;
+        /// Moves the read cursor. Returning it to zero is what makes an unmarshalled parcel
+        /// readable from the first byte.
+        fn AParcel_setDataPosition(parcel: *const c_void, position: i32) -> i32;
         fn AParcel_delete(parcel: *mut c_void) -> i32;
-        fn AParcel_unmarshal(buffer: *const u8, length: usize, parcel: *mut *mut c_void) -> i32;
+        /// Fills an *existing* parcel from a byte range; it does not allocate the parcel.
+        fn AParcel_unmarshal(parcel: *mut c_void, buffer: *const u8, length: usize) -> i32;
     }
 
-    /// Installs the hook. Called from `entry`; the trampoline is only live after the caller
-    /// commits, so a failed install leaves the process completely untouched.
+    /// Registers the hook on every loaded object that imports `AIBinder_transact`.
+    ///
+    /// The PLT slot this code patches lives in the *caller*, not in `libbinder_ndk.so`: that
+    /// library defines the symbol, so it has no PLT entry of its own to redirect. `lsplt` looks
+    /// the symbol up per object, so the registration has to be repeated for every mapped ELF
+    /// object that has the slot, and the only object that must be excluded is the definer.
+    ///
+    /// `lsplt` reports success even when an object has no matching slot and leaves the backup
+    /// pointer untouched until `commit` resolves it, so this call proves nothing on its own --
+    /// `commit` below is what establishes whether the hook is live.
     pub fn install() -> std::io::Result<()> {
-        use crate::plthook::{HookSpec, HookSpec as _};
+        use crate::plthook::HookSpec;
         let spec = HookSpec {
-            libraries: &["libbinder_ndk.so", "libbinder.so", "libcore_bundle.so"],
+            exclude: &["libbinder_ndk.so"],
             symbol: "AIBinder_transact",
         };
-        let original = crate::plthook::install(&spec, hooked_transact as *mut c_void)?;
-        if original.is_null() {
-            // The registration went through but the object has no such PLT slot. Continuing
-            // would mean forwarding through null.
-            return Err(std::io::Error::other(
-                "AIBinder_transact is not plumbed through the PLT of the binder library",
-            ));
-        }
-        ORIGINAL_TRANSACT.store(original, Ordering::Release);
-        Ok(())
+        crate::plthook::install(&spec, hooked_transact as *mut c_void)
     }
-
-    /// Commits the installed hook.
+    /// Commits the installed hook and caches the trampoline.
+    ///
+    /// The trampoline only exists after the commit. Every registration resolves to the same real
+    /// function in `libbinder_ndk.so`, so the first slot that got filled serves all call sites.
     pub fn commit() -> std::io::Result<()> {
-        crate::plthook::commit()
+        crate::diag::info("probe: commit_hook enter");
+        crate::probe::mark("commit: hook enter");
+        let hook_result = crate::plthook::commit();
+        crate::probe::mark(&format!("commit: hook returned {hook_result:?}"));
+        crate::diag::info(&format!("probe: commit_hook returned {hook_result:?}"));
+        hook_result?;
+        let slot = crate::plthook::trampoline();
+        crate::probe::mark(&format!("commit: trampoline {slot:?}"));
+        crate::diag::info(&format!("probe: trampoline {slot:?}"));
+        match slot {
+            Some(original) => {
+                ORIGINAL_TRANSACT.store(original, Ordering::Release);
+                Ok(())
+            }
+            // No object on this device routes `AIBinder_transact` through a PLT slot. Continuing
+            // would mean forwarding through a null pointer, so the payload declines to arm.
+            None => Err(std::io::Error::other(
+                "no mapped object imports AIBinder_transact through the PLT",
+            )),
+        }
     }
 
     fn original() -> TransactFn {
@@ -203,7 +270,7 @@ pub mod platform {
             if class.is_null() {
                 return None;
             }
-            let descriptor = AIBinder_descriptorForType(class);
+            let descriptor = AIBinder_Class_getDescriptor(class);
             if descriptor.is_null() {
                 return None;
             }
@@ -229,6 +296,7 @@ pub mod platform {
         if plan(descriptor, code, false) == Plan::Forward {
             return original()(binder, code, input, reply, flags);
         }
+        crate::probe::mark(&format!("transact: rewrite {descriptor} code {code}"));
         // Ask the real HAL with a reply parcel we own, so the rewrite can look at the bytes.
         let mut scratch: *mut c_void = std::ptr::null_mut();
         let status = original()(binder, code, input, &mut scratch, flags);
@@ -242,7 +310,9 @@ pub mod platform {
             *reply = scratch;
             return status;
         }
-        match rewrite_or_passthrough(scratch, reply) {
+        let rewritten = rewrite_or_passthrough(scratch, reply);
+        crate::probe::mark(&format!("transact: rewritten {}", rewritten.is_some()));
+        match rewritten {
             Some(patched) => {
                 AParcel_delete(scratch);
                 if !reply.is_null() {
@@ -270,19 +340,59 @@ pub mod platform {
         if reply.is_null() {
             return None;
         }
-        let mut length: usize = 0;
-        let mut buffer: *mut u8 = std::ptr::null_mut();
-        if AParcel_marshal(scratch, &mut length, &mut buffer) != 0 || buffer.is_null() {
+        let size = AParcel_getDataSize(scratch);
+        if size == 0 {
+            crate::probe::mark("rewrite: empty parcel");
             return None;
         }
-        let bytes = std::slice::from_raw_parts(buffer, length);
-        let rewrite: ReplyRewrite = crate::surgeon::plan_reply_rewrite(bytes)?;
-        let patched = rebuild(bytes, &rewrite)?;
-        let mut parcel: *mut c_void = std::ptr::null_mut();
-        if AParcel_unmarshal(patched.as_ptr(), patched.len(), &mut parcel) != 0 || parcel.is_null()
-        {
+        let mut buffer = vec![0u8; size];
+        if AParcel_marshal(scratch, buffer.as_mut_ptr(), 0, size) != 0 {
+            crate::probe::mark("rewrite: marshal failed");
             return None;
         }
+        let bytes: &[u8] = buffer.as_slice();
+        crate::probe::mark(&format!("rewrite: marshalled {size} bytes"));
+        crate::probe::dump_reply(bytes);
+        let Some(rewrite) = crate::surgeon::plan_reply_rewrite(bytes) else {
+            return None;
+        };
+        crate::probe::mark(&format!(
+            "rewrite: range {:?} replacement {}",
+            rewrite.range,
+            rewrite.replacement.len()
+        ));
+        let Some(patched) = rebuild(bytes, &rewrite) else {
+            crate::probe::mark("rewrite: rebuild failed");
+            return None;
+        };
+        // The spliced parcel has to still look like one: the chain is found again at the same
+        // place, and the totals in front of it agree with the new length. Handing `keystore2`
+        // bytes that fail this check would break the caller instead of the attestation.
+        crate::probe::dump_patched(&patched);
+        if crate::surgeon::find_certificate_array(&patched).is_none() {
+            crate::probe::mark("rewrite: patched reply does not re-parse");
+            return None;
+        }
+        let parcel = AParcel_create();
+        if parcel.is_null() {
+            crate::probe::mark("rewrite: create failed");
+            return None;
+        }
+        if AParcel_unmarshal(parcel, patched.as_ptr(), patched.len()) != 0 {
+            crate::probe::mark("rewrite: unmarshal failed");
+            AParcel_delete(parcel);
+            return None;
+        }
+        let position = AParcel_getDataPosition(parcel);
+        if position != 0 {
+            let rewind = AParcel_setDataPosition(parcel, 0);
+            crate::probe::mark(&format!("rewrite: cursor {position} -> rewind {rewind}"));
+            if rewind != 0 {
+                AParcel_delete(parcel);
+                return None;
+            }
+        }
+        crate::probe::mark(&format!("rewrite: unmarshalled {} bytes", patched.len()));
         Some(parcel)
     }
 }
@@ -346,6 +456,7 @@ mod tests {
         let rewrite = ReplyRewrite {
             range: 4..8,
             replacement: b"xy".to_vec(),
+            enclosing_sizes: Vec::new(),
         };
         assert_eq!(
             rebuild(original, &rewrite).expect("in range"),
@@ -359,6 +470,7 @@ mod tests {
         let past_the_end = ReplyRewrite {
             range: 4..9,
             replacement: b"xy".to_vec(),
+            enclosing_sizes: Vec::new(),
         };
         assert_eq!(rebuild(original, &past_the_end), None);
         let inverted = ReplyRewrite {
@@ -366,6 +478,7 @@ mod tests {
             // clippy refuses a literal `6..4` outright, and this case has to stay in the test.
             range: core::ops::Range { start: 6, end: 4 },
             replacement: b"xy".to_vec(),
+            enclosing_sizes: Vec::new(),
         };
         assert_eq!(rebuild(original, &inverted), None);
     }
@@ -376,14 +489,36 @@ mod tests {
         let rewrite = ReplyRewrite {
             range: 4..8,
             replacement: Vec::new(),
+            enclosing_sizes: Vec::new(),
         };
         assert_eq!(
             rebuild(original, &rewrite).expect("in range"),
-            b"AAAA CCCC"
-                .to_vec()
-                .into_iter()
-                .filter(|byte| *byte != b' ')
-                .collect::<Vec<u8>>()
+            b"AAAACCCC".to_vec()
         );
+    }
+    #[test]
+    fn a_splice_moves_the_totals_enclosing_it() {
+        let mut original = Vec::new();
+        original.extend_from_slice(&12i32.to_le_bytes());
+        original.extend_from_slice(b"AAAABBBB");
+        let rewrite = ReplyRewrite {
+            range: 4..8,
+            replacement: b"xy".to_vec(),
+            enclosing_sizes: vec![0],
+        };
+        let patched = rebuild(&original, &rewrite).expect("in range");
+        assert_eq!(patched.len(), 10);
+        assert_eq!(i32::from_le_bytes(patched[..4].try_into().unwrap()), 10);
+        assert_eq!(&patched[4..], b"xyBBBB");
+    }
+    #[test]
+    fn a_total_inside_the_splice_is_refused() {
+        let original = b"AAAABBBBCCCC";
+        let rewrite = ReplyRewrite {
+            range: 4..8,
+            replacement: b"xy".to_vec(),
+            enclosing_sizes: vec![6],
+        };
+        assert_eq!(rebuild(original, &rewrite), None);
     }
 }
