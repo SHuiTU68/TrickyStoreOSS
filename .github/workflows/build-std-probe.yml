@@ -1,0 +1,50 @@
+name: build-std probe
+
+# Throwaway measurement: how much does libcertgen.so shrink when std/core are
+# rebuilt with `panic_immediate_abort` instead of using the precompiled std?
+# Manual dispatch only, and it never touches the shipped artifacts.
+on:
+  workflow_dispatch:
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out
+        uses: actions/checkout@v7
+        with:
+          submodules: "recursive"
+          fetch-depth: 0
+
+      - name: Setup nightly Rust toolchain
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          targets: aarch64-linux-android
+          components: rust-src
+
+      - name: Install cargo-ndk
+        run: command -v cargo-ndk || cargo install cargo-ndk
+
+      - name: Build both variants
+        working-directory: native-certgen
+        run: |
+          set -x
+          NDK="${ANDROID_NDK_LATEST_HOME:-${ANDROID_NDK_HOME}}"
+          echo "NDK=$NDK"
+          mkdir -p /tmp/probe
+          cargo ndk -t arm64-v8a -o /tmp/probe/plain build --release
+          cargo ndk -t arm64-v8a -o /tmp/probe/buildstd build \
+            -Z build-std=std,panic_abort \
+            -Z build-std-features=panic_immediate_abort \
+            --release
+
+      - name: Report sizes
+        run: |
+          set -e
+          for v in plain buildstd; do
+            f=/tmp/probe/$v/arm64-v8a/libcertgen.so
+            echo "### $v: $(stat -c %s "$f") bytes"
+            readelf -SW "$f" | grep -E '\.text|\.rodata|\.data\.rel\.ro|\.got' || true
+            echo "panic-related strings: $(strings "$f" | grep -c 'panicked at' || true)"
+            echo "unwind sections: $(readelf -SW "$f" | grep -c 'eh_frame' || true)"
+          done
