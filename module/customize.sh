@@ -64,14 +64,8 @@ for file in customize.sh module.prop post-fs-data.sh service.sh sepolicy.rule da
   install_file "$file" "$MODPATH"
 done
 
-# Handle service.apk or classes.dex
-if unzip -l "$ZIPFILE" | grep -q "service.apk"; then
-  install_file "service.apk" "$MODPATH"
-elif unzip -l "$ZIPFILE" | grep -q "classes.dex"; then
-  install_file "classes.dex" "$MODPATH"
-else
-  abort "! Neither service.apk nor classes.dex found"
-fi
+# The daemon runs app_process with service.apk as its classpath.
+install_file "service.apk" "$MODPATH"
 
 chmod 755 "$MODPATH/daemon"
 ui_print ""

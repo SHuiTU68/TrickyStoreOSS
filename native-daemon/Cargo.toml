@@ -1,0 +1,25 @@
+[package]
+name = "native-daemon"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+description = "JVM-free control plane for TrickyStoreOSS: resolves the boot attestation inputs, applies the boot-time property spoofing, loads the target configuration, and supervises the keystore interceptor."
+license = "GPL-3.0-or-later"
+publish = false
+
+[[bin]]
+name = "tricky-daemon"
+path = "src/main.rs"
+
+[dependencies]
+# Every parser, the property planner and the persistence layer live in the certificate crate; the
+# daemon is only the control plane on top of them, so it never duplicates a format definition.
+certgen = { path = "../native-certgen" }
+libc = "0.2"
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = "symbols"
+panic = "abort"

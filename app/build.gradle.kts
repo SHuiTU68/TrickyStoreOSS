@@ -219,7 +219,7 @@ androidComponents {
                 sourceDir.walkTopDown()
                     .filter { file ->
                         file.isFile &&
-                            file.name !in setOf("module.prop", "service.apk", "classes.dex") &&
+                            file.name !in setOf("module.prop", "service.apk") &&
                             !file.relativeTo(sourceDir).invariantSeparatorsPath.startsWith("lib/")
                     }
                     .forEach { file ->
@@ -242,16 +242,13 @@ androidComponents {
                 check(apks.size == 1) { "Expected exactly one APK output for $variantName, found ${apks.size}" }
                 val apk = apks.single()
 
-                ZipFile(apk).use { zip ->
-                    if (variantName.contains("debug", ignoreCase = true)) {
-                        apk.copyTo(tempDir.resolve("service.apk"), overwrite = true)
-                    } else {
-                        val dex = zip.getEntry("classes.dex") ?: error("Release APK does not contain classes.dex")
-                        zip.getInputStream(dex).use { input ->
-                            tempDir.resolve("classes.dex").outputStream().use(input::copyTo)
-                        }
-                    }
+                // The daemon points app_process at service.apk as its classpath, for both variants.
+                // Pulling classes.dex out of the release APK instead used to look like a saving, but
+                // a single dex silently loses any classes2.dex that R8 may emit, and it carries
+                // neither the resources nor the manifest that the code is allowed to touch.
+                apk.copyTo(tempDir.resolve("service.apk"), overwrite = true)
 
+                ZipFile(apk).use { zip ->
                     val entries = zip.entries()
                     while (entries.hasMoreElements()) {
                         val entry = entries.nextElement()
