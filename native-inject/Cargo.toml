@@ -7,10 +7,12 @@ publish = false
 [lib]
 name = "rustinject"
 # `cdylib` is what the injector loads: the payload is `librustinject.so`, dlopen'ed into
-# `keystore2`/`system_server`, and `entry` is looked up by name. `rlib` is kept so the modules
-# stay reachable from unit tests and from any future Rust consumer without compiling a second
-# copy per target.
-crate-type = ["cdylib", "rlib"]
+# `keystore2`/`system_server`, and `entry` is looked up by name. `staticlib` is what the injector
+# links against: CMake pulls `librustinject.a` into `libinject.so` for the `ts_*` helpers
+# (`ts_maps_find_module`, `ts_translate_remote_symbol`, ...), so dropping it breaks the link with
+# undefined symbols. `rlib` is kept so the modules stay reachable from unit tests and from any
+# future Rust consumer without compiling a second copy per target.
+crate-type = ["cdylib", "staticlib", "rlib"]
 
 [dependencies]
 # The DER/attestation half of the surgery: keybox parsing, leaf re-signing, record rebuilding.
