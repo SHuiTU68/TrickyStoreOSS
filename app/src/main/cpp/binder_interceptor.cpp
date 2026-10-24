@@ -46,6 +46,13 @@ constexpr uint32_t kBackdoorCode = 0xdeadbeef;
 // AIDL user codes stay under this; system protocol codes (PING/INTERFACE/DUMP/...) sit above
 constexpr uint32_t kMaxUserTransactionCode = 0x00ffffff;
 constexpr size_t kMaxInterceptorCodes = 1024;
+// Registrations are keyed by a weak pointer but each one holds a strong reference to the
+// interceptor binder, so targets that die would otherwise stay registered for the life of the
+// daemon. Pruning on every registration keeps the map proportional to the live targets.
+constexpr size_t kMaxInterceptorRegistrations = 512;
+// The per-thread transaction queue is populated before the reply arrives and drained by
+// BinderStub::onTransact; a transaction the stub never sees would otherwise leave its entry behind.
+constexpr size_t kMaxPendingThreadTransactions = 8;
 } // namespace intercept_constants
 } // namespace
 
@@ -76,6 +83,8 @@ public:
 
 private:
     status_t handleRegisterInterceptor(const android::Parcel &data);
+
+    void pruneDeadRegistrationsLocked();
 
     template <typename ParcelWriter>
     status_t writeInterceptorCallData(ParcelWriter &writer, sp<BBinder> target_binder, uint32_t transaction_code,
@@ -170,6 +179,11 @@ bool processBinderTransaction(binder_transaction_data *transaction_data) {
 
     if (should_intercept) {
         LOGD("Redirecting transaction through stub");
+        if (g_thread_transaction_queue.size() >= intercept_constants::kMaxPendingThreadTransactions) {
+            LOGW("Thread transaction queue already holds %zu entries, dropping them",
+                 g_thread_transaction_queue.size());
+            g_thread_transaction_queue = {};
+        }
         transaction_data->target.ptr = reinterpret_cast<uintptr_t>(g_binder_stub->getWeakRefs());
         transaction_data->cookie = reinterpret_cast<uintptr_t>(g_binder_stub.get());
         transaction_data->code = intercept_constants::kBackdoorCode;
@@ -278,6 +292,22 @@ status_t BinderInterceptor::onTransact(uint32_t code, const android::Parcel &dat
     }
 }
 
+// Caller must hold `interceptor_registry_lock_` for writing.
+void BinderInterceptor::pruneDeadRegistrationsLocked() {
+    size_t removed = 0;
+    for (auto it = interceptor_registry_.begin(); it != interceptor_registry_.end();) {
+        if (it->first.promote() == nullptr) {
+            it = interceptor_registry_.erase(it);
+            ++removed;
+        } else {
+            ++it;
+        }
+    }
+    if (removed > 0) {
+        LOGI("Pruned %zu dead interceptor registrations (%zu still live)", removed, interceptor_registry_.size());
+    }
+}
+
 status_t BinderInterceptor::handleRegisterInterceptor(const android::Parcel &data) {
     if (IPCThreadState::self()->getCallingUid() != 0) {
         LOGE("Rejected interceptor registration from non-root uid=%d", IPCThreadState::self()->getCallingUid());
@@ -326,6 +356,12 @@ status_t BinderInterceptor::handleRegisterInterceptor(const android::Parcel &dat
 
     {
         WriteGuard write_guard{interceptor_registry_lock_};
+        pruneDeadRegistrationsLocked();
+        if (interceptor_registry_.size() >= intercept_constants::kMaxInterceptorRegistrations) {
+            LOGE("Interceptor registry is full (%zu live registrations), refusing to grow further",
+                 interceptor_registry_.size());
+            return NO_MEMORY;
+        }
         wp<IBinder> weak_target = target_binder;
 
         auto iterator = interceptor_registry_.lower_bound(weak_target);

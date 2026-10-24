@@ -62,6 +62,8 @@ class SecurityLevelInterceptor(private val original: IKeystoreSecurityLevel, pri
 
     companion object {
         private const val DEFAULT_KEYGEN_MS = 3.0
+        private const val MAX_PENDING_KEYGENS = 64
+        private const val PENDING_KEYGEN_TTL_NANOS = 30_000_000_000L
         private const val MAX_PLAUSIBLE_TIMESTAMP_MS = 4_102_444_800_000L
         private val generateKeyTransaction = getTransactCode(IKeystoreSecurityLevel.Stub::class.java, "generateKey")
         private val createOperationTransaction =
@@ -264,10 +266,30 @@ class SecurityLevelInterceptor(private val original: IKeystoreSecurityLevel, pri
 
         @Keep val usageRemaining = ConcurrentHashMap<Key, Int>()
         @Keep val perBootRemaining = ConcurrentHashMap<Key, Int>()
-        private val usageLocks = ConcurrentHashMap<Key, Any>()
 
-        internal fun <T> withKeyLock(key: Key, action: () -> T): T =
-            synchronized(usageLocks.computeIfAbsent(key) { Any() }, action)
+        // One lock per key, but not one lock *kept* per key: `keys` shrinks when aliases are
+        // deleted, while a plain computeIfAbsent cache would retain a lock object for every alias
+        // the process has ever touched. Entry count is tracked so the last releaser can drop it.
+        private class KeyLock {
+            var users = 0
+        }
+
+        private val usageLocks = ConcurrentHashMap<Key, KeyLock>()
+
+        internal fun <T> withKeyLock(key: Key, action: () -> T): T {
+            val lock = usageLocks.compute(key) { _, existing -> (existing ?: KeyLock()).also { it.users++ } }!!
+            try {
+                return synchronized(lock) { action() }
+            } finally {
+                usageLocks.computeIfPresent(key) { _, existing ->
+                    when {
+                        existing !== lock -> existing
+                        --existing.users == 0 -> null
+                        else -> existing
+                    }
+                }
+            }
+        }
 
         @Keep
         fun consumeUsage(key: Key, params: CertificateGen.KeyGenParameters) {
@@ -656,8 +678,21 @@ class SecurityLevelInterceptor(private val original: IKeystoreSecurityLevel, pri
     }
 
     private fun forwardKeygen(alias: String?, startNanos: Long): Result {
-        alias?.let { pendingKeygenStarts[it] = startNanos }
+        alias?.let {
+            pendingKeygenStarts[it] = startNanos
+            // The entry is only consumed when the real keygen reports back. A request that is
+            // abandoned (client dies, TEE returns an error) never reports, so the map is pruned
+            // instead of growing with every alias that was ever forwarded.
+            if (pendingKeygenStarts.size > MAX_PENDING_KEYGENS) prunePendingKeygens(startNanos)
+        }
         return Continue
+    }
+
+    private fun prunePendingKeygens(nowNanos: Long) {
+        pendingKeygenStarts.entries.removeIf { nowNanos - it.value > PENDING_KEYGEN_TTL_NANOS }
+        // Everything left is younger than the TTL, so the map can only still be over the cap while
+        // a burst of concurrent keygens is in flight; dropping the samples is harmless timing noise.
+        if (pendingKeygenStarts.size > MAX_PENDING_KEYGENS) pendingKeygenStarts.clear()
     }
 
     private fun recordRealKeygen(alias: String?) {
