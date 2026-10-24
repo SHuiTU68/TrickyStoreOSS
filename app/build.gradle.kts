@@ -6,7 +6,9 @@
 import com.android.build.api.artifact.SingleArtifact
 import com.android.build.api.variant.ApplicationVariant
 import java.util.Properties
+import java.util.zip.ZipEntry
 import java.util.zip.ZipFile
+import java.util.zip.ZipOutputStream
 
 plugins { alias(libs.plugins.android.application) }
 
@@ -392,19 +394,46 @@ androidComponents {
                         .replace("REPLACEMEVER", "$verName ($gitCommitCount-$gitCommitHash-$variantName)"),
                 )
 
-                // `module/daemon` hands this container to `app_process` as the classpath, and ART
-                // reads `classes*.dex` out of any zip, so the module ships one opaque `payload.bin`
-                // instead of a bare classes.dex or a service.apk.
-                val container = tempDir.resolve("payload.bin")
-                val dexEntryName = Regex("classes(\\d+)?\\.dex")
+                // The module needs the .so files unpacked, so they are pulled out of the APK and
+                // installed loose. The JVM control plane itself ships as `payload.bin`, a zip whose
+                // root holds `classes.dex`: `module/daemon` hands it to `app_process` as the
+                // classpath and ART reads `classes*.dex` out of any zip whatever the file is named,
+                // so the module carries neither a bare `classes.dex` nor a `service.apk`.
+                val apks =
+                    apkFile
+                        .get()
+                        .asFile
+                        .walkTopDown()
+                        .filter { it.isFile && it.extension == "apk" }
+                        .sortedBy { it.invariantSeparatorsPath }
+                        .toList()
+                check(apks.size == 1) { "Expected exactly one APK output for $variantName, found ${apks.size}" }
+                val apk = apks.single()
+
+                ZipFile(apk).use { zip ->
+                    val entries = zip.entries()
+                    while (entries.hasMoreElements()) {
+                        val entry = entries.nextElement()
+                        if (!entry.isDirectory && entry.name.startsWith("lib/") &&
+                            entry.name.substringAfterLast('/') in
+                                setOf("libinject.so", "libTrickyStoreOSS.so", "libcertgen.so")
+                        ) {
+                            val destination = tempDir.resolve(entry.name)
+                            destination.parentFile.mkdirs()
+                            zip.getInputStream(entry).use { input ->
+                                destination.outputStream().use(input::copyTo)
+                            }
+                        }
+                    }
+                }
+
+                val dexEntry = Regex("""classes\d*\.dex""")
                 var carried = 0
-                java.util.zip.ZipOutputStream(container.outputStream()).use { out ->
+                ZipOutputStream(tempDir.resolve("payload.bin").outputStream()).use { out ->
                     ZipFile(apk).use { zip ->
-                        val entries = zip.entries()
-                        while (entries.hasMoreElements()) {
-                            val entry = entries.nextElement()
-                            if (entry.isDirectory || !dexEntryName.matches(entry.name)) continue
-                            out.putNextEntry(java.util.zip.ZipEntry(entry.name))
+                        for (entry in zip.entries()) {
+                            if (entry.isDirectory || !dexEntry.matches(entry.name)) continue
+                            out.putNextEntry(ZipEntry(entry.name))
                             zip.getInputStream(entry).use { input -> input.copyTo(out) }
                             out.closeEntry()
                             carried++
