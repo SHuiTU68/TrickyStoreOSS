@@ -259,11 +259,17 @@ mod tests {
     fn the_stack_size_wraps_like_the_cpp_multiply() {
         // Reaching this needs an argument count no ABI can express, but the arithmetic must not
         // trap in debug builds where it would abort the tracee.
-        assert_eq!(stack_args_layout(2, 0, usize::MAX).stack_args_size, usize::MAX - 1);
+        assert_eq!(
+            stack_args_layout(2, 0, usize::MAX).stack_args_size,
+            usize::MAX - 1
+        );
     }
 
     #[test]
     fn reserving_past_the_stack_pointer_wraps() {
-        assert_eq!(reserve_stack(0x10, 0x20), usize::MAX & !STACK_ALIGNMENT_MASK);
+        assert_eq!(
+            reserve_stack(0x10, 0x20),
+            usize::MAX & !STACK_ALIGNMENT_MASK
+        );
     }
 }

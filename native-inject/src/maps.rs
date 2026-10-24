@@ -55,7 +55,13 @@ pub enum ModuleMatch {
 /// Kept apart from the walks below so the predicate has a single definition:
 /// [`find_module_start`] walks [`MapEntry`]s, while the FFI layer walks its C-facing twin and
 /// calls this per entry.
-pub fn matches_module(path: &[u8], offset: usize, perms: u8, suffix: &[u8], mode: ModuleMatch) -> bool {
+pub fn matches_module(
+    path: &[u8],
+    offset: usize,
+    perms: u8,
+    suffix: &[u8],
+    mode: ModuleMatch,
+) -> bool {
     let suffix_ok = path.len() >= suffix.len() && path[path.len() - suffix.len()..] == *suffix;
     if !suffix_ok {
         return false;
@@ -256,8 +262,8 @@ mod tests {
         let entries = parse(DOCUMENT);
         assert_eq!(entries.len(), 4);
         let first = &entries[0];
-        assert_eq!(first.start, 0x7f8a_5c00_00);
-        assert_eq!(first.end, 0x7f8a_5c20_00);
+        assert_eq!(first.start, 0x007f_8a5c_0000);
+        assert_eq!(first.end, 0x007f_8a5c_2000);
         assert_eq!(first.perms, PROT_READ | PROT_EXEC);
         assert!(first.is_private);
         assert_eq!(first.offset, 0);
@@ -322,37 +328,61 @@ mod tests {
     #[test]
     fn finds_the_offset_zero_mapping_as_the_base() {
         let entries = parse(MODULE_DOCUMENT);
-        assert_eq!(find_module_start(&entries, b"libc.so", ModuleMatch::Base), Some(0x7f00));
+        assert_eq!(
+            find_module_start(&entries, b"libc.so", ModuleMatch::Base),
+            Some(0x7f00)
+        );
     }
 
     #[test]
     fn base_lookup_ignores_mappings_with_a_nonzero_offset() {
         // Only a non-zero-offset mapping of `libc.so` exists, so there is no base to report.
         let entries = parse(b"7f10-7f20 r-xp 00001000 fd:01 42 /lib/libc.so\n");
-        assert_eq!(find_module_start(&entries, b"libc.so", ModuleMatch::Base), None);
+        assert_eq!(
+            find_module_start(&entries, b"libc.so", ModuleMatch::Base),
+            None
+        );
     }
 
     #[test]
     fn return_region_lookup_wants_a_mapping_without_exec() {
         let entries = parse(MODULE_DOCUMENT);
-        assert_eq!(find_module_start(&entries, b"libc.so", ModuleMatch::NonExecutable), Some(0x7f00));
+        assert_eq!(
+            find_module_start(&entries, b"libc.so", ModuleMatch::NonExecutable),
+            Some(0x7f00)
+        );
         // Every mapping of the module is executable here, so nothing qualifies.
         let entries = parse(b"7f10-7f20 r-xp 00001000 fd:01 42 /lib/libc.so\n");
-        assert_eq!(find_module_start(&entries, b"libc.so", ModuleMatch::NonExecutable), None);
+        assert_eq!(
+            find_module_start(&entries, b"libc.so", ModuleMatch::NonExecutable),
+            None
+        );
     }
 
     #[test]
     fn lookups_need_the_whole_suffix_to_match() {
         let entries = parse(MODULE_DOCUMENT);
-        assert_eq!(find_module_start(&entries, b"libc", ModuleMatch::Base), None);
-        assert_eq!(find_module_start(&entries, b"bionic/libc.so", ModuleMatch::Base), Some(0x7f00));
-        assert_eq!(find_module_start(&entries, b"/libc.so/", ModuleMatch::Base), None);
+        assert_eq!(
+            find_module_start(&entries, b"libc", ModuleMatch::Base),
+            None
+        );
+        assert_eq!(
+            find_module_start(&entries, b"bionic/libc.so", ModuleMatch::Base),
+            Some(0x7f00)
+        );
+        assert_eq!(
+            find_module_start(&entries, b"/libc.so/", ModuleMatch::Base),
+            None
+        );
     }
 
     #[test]
     fn lookups_on_an_empty_document_find_nothing() {
         assert_eq!(find_module_start(&[], b"libc.so", ModuleMatch::Base), None);
-        assert_eq!(find_module_start(&[], b"libc.so", ModuleMatch::NonExecutable), None);
+        assert_eq!(
+            find_module_start(&[], b"libc.so", ModuleMatch::NonExecutable),
+            None
+        );
     }
 
     #[test]

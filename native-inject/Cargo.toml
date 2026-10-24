@@ -6,7 +6,29 @@ publish = false
 
 [lib]
 name = "rustinject"
-crate-type = ["staticlib"]
+# `cdylib` is what the injector loads: the payload is `librustinject.so`, dlopen'ed into
+# `keystore2`/`system_server`, and `entry` is looked up by name. `rlib` is kept so the modules
+# stay reachable from unit tests and from any future Rust consumer without compiling a second
+# copy per target.
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+# The DER/attestation half of the surgery: keybox parsing, leaf re-signing, record rebuilding.
+# Same crate the daemon and the JNI side use, so a change to the attestation layout reaches all
+# three call sites at once.
+certgen = { path = "../native-certgen" }
+
+# The mechanism layer of the interception: register a PLT hook by (dev, inode) and commit once.
+# Version pinned because the API surface used here (`MapInfo::scan_self`, `register_hook` with
+# the optional backup slot, `commit_hook`) is the 2.x one.
+#
+# Android-only on purpose. `lsplt-sys` runs bindgen over the LSPlt C++ sources, so depending on it
+# unconditionally would make a host `cargo test` require libclang and a cross compiler for no
+# benefit: on a host there is no PLT to hook and `plthook::platform` is the recording stub. The
+# build machine that produces the payload needs `libclang` and the NDK clang driver; a developer
+# machine running the unit tests needs neither.
+[target.'cfg(target_os = "android")'.dependencies]
+lsplt-rs = "2.1.6"
 
 # Mirrors native-certgen: the library is linked into a shared object that is injected into
 # system_server, so an unwinding panic would be worse than a crash on the spot.

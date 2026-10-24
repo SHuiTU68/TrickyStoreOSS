@@ -294,7 +294,11 @@ pub unsafe extern "C" fn ts_describe_status(
 ///
 /// `out` must be null or point to at least `capacity` writable bytes.
 #[no_mangle]
-pub unsafe extern "C" fn ts_generate_magic(length: usize, out: *mut c_char, capacity: usize) -> usize {
+pub unsafe extern "C" fn ts_generate_magic(
+    length: usize,
+    out: *mut c_char,
+    capacity: usize,
+) -> usize {
     let Some(magic) = crate::magic::generate(length) else {
         return 0;
     };
@@ -391,7 +395,11 @@ pub unsafe extern "C" fn ts_ptrace_event(status: c_int) -> *const c_char {
 /// benign `SIGCHLD` that should be swallowed, and `TS_CALL_UNEXPECTED` (3) otherwise. The
 /// raw `ptrace`/`waitpid` calls stay in C++.
 #[no_mangle]
-pub extern "C" fn ts_classify_stop(stop_signal: c_int, reg_ip: u64, expected_return_addr: u64) -> c_int {
+pub extern "C" fn ts_classify_stop(
+    stop_signal: c_int,
+    reg_ip: u64,
+    expected_return_addr: u64,
+) -> c_int {
     remote::classify_stop(stop_signal, reg_ip, expected_return_addr).code()
 }
 
@@ -428,9 +436,16 @@ mod tests {
         // SAFETY: `buffer` provides the capacity that is passed alongside it.
         let needed = unsafe { ts_describe_status(3, buffer.as_mut_ptr().cast(), buffer.len()) };
         let expected = status::describe(3);
-        assert!(needed > buffer.len(), "the sample status must not fit in 8 bytes");
+        assert!(
+            needed > buffer.len(),
+            "the sample status must not fit in 8 bytes"
+        );
         assert_eq!(needed, expected.len());
-        assert_eq!(&buffer[..7], &expected.as_bytes()[..7], "the prefix is copied");
+        assert_eq!(
+            &buffer[..7],
+            &expected.as_bytes()[..7],
+            "the prefix is copied"
+        );
         assert_eq!(buffer[7], 0, "the terminator must fit inside the buffer");
     }
 
@@ -459,7 +474,10 @@ mod tests {
             // SAFETY: the entry lives as long as the list, and `path`/`path_len` describe a
             // slice inside the list's path buffer.
             let entry = unsafe { &*entry };
-            let path = unsafe { core::slice::from_raw_parts(entry.path.cast::<u8>(), entry.path_len) };
+            // SAFETY: the entry lives as long as the list, and the list guarantees `path` points at
+            // `path_len` initialized bytes inside its own path buffer.
+            let path =
+                unsafe { core::slice::from_raw_parts(entry.path.cast::<u8>(), entry.path_len) };
             if path.starts_with(b"/") && entry.perms & maps::PROT_EXEC != 0 {
                 found_executable = true;
             }
@@ -467,7 +485,10 @@ mod tests {
             // SAFETY: the byte at `path_len` is the terminator by construction.
             assert_eq!(unsafe { *entry.path.add(entry.path_len) }, 0);
         }
-        assert!(found_executable, "expected at least one executable file mapping");
+        assert!(
+            found_executable,
+            "expected at least one executable file mapping"
+        );
 
         // SAFETY: ownership goes back exactly once.
         unsafe { ts_maps_free(list) };
@@ -488,7 +509,9 @@ mod tests {
         let written = unsafe { ts_generate_magic(16, buffer.as_mut_ptr().cast(), buffer.len()) };
         assert_eq!(written, 16);
         assert_eq!(buffer[16], 0);
-        assert!(buffer[..16].iter().all(|byte| crate::magic::ALPHABET.contains(byte)));
+        assert!(buffer[..16]
+            .iter()
+            .all(|byte| crate::magic::ALPHABET.contains(byte)));
     }
 
     #[test]
@@ -502,14 +525,28 @@ mod tests {
         let list = Box::into_raw(Box::new(TsMapList::build(maps::parse(document))));
         let suffix = b"libc.so";
         // SAFETY: `list` is a live, owned list and `suffix` is a readable slice.
-        let base = unsafe { ts_maps_find_module(list, suffix.as_ptr().cast(), suffix.len(), TS_MODULE_BASE) };
+        let base = unsafe {
+            ts_maps_find_module(list, suffix.as_ptr().cast(), suffix.len(), TS_MODULE_BASE)
+        };
         assert_eq!(base, 0x7f00, "the offset-zero mapping is the base");
         // SAFETY: same live list and suffix, different selector.
-        let region = unsafe { ts_maps_find_module(list, suffix.as_ptr().cast(), suffix.len(), TS_MODULE_NON_EXEC) };
-        assert_eq!(region, 0x7f00, "the r--p mapping is the only one without PROT_EXEC");
+        let region = unsafe {
+            ts_maps_find_module(
+                list,
+                suffix.as_ptr().cast(),
+                suffix.len(),
+                TS_MODULE_NON_EXEC,
+            )
+        };
+        assert_eq!(
+            region, 0x7f00,
+            "the r--p mapping is the only one without PROT_EXEC"
+        );
         let missing = b"libm.so";
         // SAFETY: same live list; the suffix simply matches nothing.
-        let not_found = unsafe { ts_maps_find_module(list, missing.as_ptr().cast(), missing.len(), TS_MODULE_BASE) };
+        let not_found = unsafe {
+            ts_maps_find_module(list, missing.as_ptr().cast(), missing.len(), TS_MODULE_BASE)
+        };
         assert_eq!(not_found, 0);
         // SAFETY: ownership goes back exactly once.
         unsafe { ts_maps_free(list) };
@@ -517,8 +554,11 @@ mod tests {
 
     #[test]
     fn maps_find_module_tolerates_null() {
-        // SAFETY: both pointers are null, which the function checks before reading anything.
-        assert_eq!(unsafe { ts_maps_find_module(core::ptr::null(), core::ptr::null(), 0, TS_MODULE_BASE) }, 0);
+        assert_eq!(
+            // SAFETY: both pointers are null, which the function checks before reading anything.
+            unsafe { ts_maps_find_module(core::ptr::null(), core::ptr::null(), 0, TS_MODULE_BASE) },
+            0
+        );
     }
 
     #[test]
@@ -537,8 +577,11 @@ mod tests {
     }
     #[test]
     fn setfilecon_rejects_null() {
-        // SAFETY: the function only checks for null before touching the pointers.
-        assert_eq!(unsafe { ts_setfilecon(core::ptr::null(), core::ptr::null()) }, -1);
+        assert_eq!(
+            // SAFETY: the function only checks for null before touching the pointers.
+            unsafe { ts_setfilecon(core::ptr::null(), core::ptr::null()) },
+            -1
+        );
         // SAFETY: `errno` is thread-local and always readable.
         assert_eq!(unsafe { *sys::errno_location() }, 22);
     }
