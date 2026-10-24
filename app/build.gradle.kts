@@ -343,6 +343,29 @@ fun compactElf(python: String, script: File, artifact: File) {
 // --- Native cert generation (Rust cdylib) ---
 // Builds libcertgen.so for arm64-v8a straight into app/src/main/jniLibs, which AGP merges into
 // the APK; the module packaging below then extracts it from the APK.
+// `-Z build-std` rebuilds core and std from source with this crate's release profile, which is
+// what `panic_immediate_abort` needs in order to actually drop the formatting machinery behind
+// `panic!` instead of only the unwinder. Both flags are unstable, so they only go in when the
+// environment asks for them (TSTORE_BUILD_STD=1, plus RUSTC_BOOTSTRAP=1 and a rust-src
+// component); a plain `./gradlew` keeps linking the precompiled std.
+fun buildCertgenCommandLine(): List<String> {
+    val args =
+        mutableListOf(
+            "cargo",
+            "ndk",
+            "-t",
+            "arm64-v8a",
+            "-o",
+            rootProject.projectDir.resolve("app/src/main/jniLibs").absolutePath,
+            "build",
+        )
+    if (System.getenv("TSTORE_BUILD_STD") == "1") {
+        args += listOf("-Z", "build-std=std,panic_abort", "-Z", "build-std-features=panic_immediate_abort")
+    }
+    args += "--release"
+    return args
+}
+
 val buildRustCertgen =
     tasks.register<Exec>("buildRustCertgen") {
         group = "TrickyStoreOSS Native Build"
@@ -352,16 +375,7 @@ val buildRustCertgen =
 
         workingDir = rootProject.projectDir.resolve("native-certgen")
 
-        commandLine(
-            "cargo",
-            "ndk",
-            "-t",
-            "arm64-v8a",
-            "-o",
-            rootProject.projectDir.resolve("app/src/main/jniLibs").absolutePath,
-            "build",
-            "--release",
-        )
+        commandLine(buildCertgenCommandLine())
 
         inputs.dir(rootProject.projectDir.resolve("native-certgen/src"))
         inputs.file(rootProject.projectDir.resolve("native-certgen/Cargo.toml"))
