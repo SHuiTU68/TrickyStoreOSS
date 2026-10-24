@@ -23,3 +23,4 @@ app/src/main/jniLibs/**/*.so
 
 # local scan/report artifacts uploaded from the device
 .uploads/
+__pycache__/

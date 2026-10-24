@@ -301,6 +301,45 @@ fun stripUnwindTables(ndk: File, artifact: File) {
     )
 }
 
+// `llvm-objcopy --remove-section` leaves the removed bytes behind as a zero hole inside the
+// preceding PT_LOAD, so files hardly shrink on disk even though whole tables are gone.
+// elf_compact.py slides the following segments down over that hole (respecting each segment's
+// p_align) and rewrites the headers. It verifies its own output and is a no-op when the hole is
+// too small to be removed without breaking the loader's offset/vaddr congruence.
+fun resolvePython(): String? {
+    for (candidate in listOf("python3", "python")) {
+        try {
+            val process =
+                ProcessBuilder(candidate, "-c", "import sys; sys.exit(0 if sys.version_info >= (3, 8) else 1)")
+                    .redirectErrorStream(true)
+                    .start()
+            val ok = process.waitFor() == 0
+            process.inputStream.close()
+            if (ok) return candidate
+        } catch (e: Exception) {
+            // Not installed under this name; try the next candidate.
+        }
+    }
+    return null
+}
+
+fun compactElf(python: String, script: File, artifact: File) {
+    val before = artifact.length()
+    val process =
+        ProcessBuilder(python, script.absolutePath, artifact.absolutePath)
+            .directory(script.parentFile.parentFile)
+            .redirectErrorStream(true)
+            .start()
+    val output = process.inputStream.bufferedReader().use { it.readText() }.trim()
+    val exit = process.waitFor()
+    if (exit != 0) {
+        throw GradleException("elf_compact.py failed on ${artifact.name} (exit $exit): $output")
+    }
+    output.lineSequence().filter { it.isNotBlank() }.forEach { println("compact: $it") }
+    val after = artifact.length()
+    println("compact: ${artifact.name} $before -> $after bytes (${before - after} bytes reclaimed)")
+}
+
 // --- Native cert generation (Rust cdylib) ---
 // Builds libcertgen.so for arm64-v8a straight into app/src/main/jniLibs, which AGP merges into
 // the APK; the module packaging below then extracts it from the APK.
@@ -513,6 +552,11 @@ androidComponents {
                 // ELF files that actually get installed. Sizes are printed so the saving shows up
                 // in the CI log instead of only in the zip.
                 val ndk = resolveAndroidNdk()
+                val compactScript = rootProject.projectDir.resolve("tools/elf_compact.py")
+                val python = if (compactScript.isFile) resolvePython() else null
+                if (compactScript.isFile && python == null) {
+                    println("compact: skipped, no python3 (>= 3.8) on PATH; zip will keep the zero holes")
+                }
                 for (name in listOf("libcertgen.so", "libinject.so", "libTrickyStoreOSS.so")) {
                     val artifact = tempDir.resolve("lib/arm64-v8a/$name")
                     if (!artifact.isFile) {
@@ -521,6 +565,7 @@ androidComponents {
                         )
                     }
                     stripUnwindTables(ndk, artifact)
+                    if (python != null) compactElf(python, compactScript, artifact)
                 }
             }
         }
