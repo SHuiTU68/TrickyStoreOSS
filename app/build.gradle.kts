@@ -376,7 +376,7 @@ androidComponents {
                 sourceDir.walkTopDown()
                     .filter { file ->
                         file.isFile &&
-                            file.name !in setOf("module.prop", "service.apk") &&
+                            file.name !in setOf("module.prop", "service.apk", "payload.bin") &&
                             !file.relativeTo(sourceDir).invariantSeparatorsPath.startsWith("lib/")
                     }
                     .forEach { file ->
@@ -392,39 +392,27 @@ androidComponents {
                         .replace("REPLACEMEVER", "$verName ($gitCommitCount-$gitCommitHash-$variantName)"),
                 )
 
-                // `module/daemon` starts the JVM control plane with this APK as its classpath, so the
-                // APK has to be shipped next to the module scripts. The Rust daemon
-                // (`tricky-daemon`/`librustinject.so`) is still built but no longer installed: the
-                // Kotlin interceptors are the control plane again.
-                val apks = apkFile.get().asFile.walkTopDown()
-                    .filter { it.isFile && it.extension == "apk" }
-                    .sortedBy { it.invariantSeparatorsPath }
-                    .toList()
-                check(apks.size == 1) { "Expected exactly one APK output for $variantName, found ${apks.size}" }
-                val apk = apks.single()
-
-                // The module needs the .so files unpacked, so they are pulled out of the APK and
-                // installed loose; the APK itself ships as `service.apk` because `module/daemon`
-                // runs `app_process` with it as the classpath.
-                ZipFile(apk).use { zip ->
-                    val entries = zip.entries()
-                    while (entries.hasMoreElements()) {
-                        val entry = entries.nextElement()
-                        if (!entry.isDirectory && entry.name.startsWith("lib/") &&
-                            entry.name.substringAfterLast('/') in
-                                setOf("libinject.so", "libTrickyStoreOSS.so", "libcertgen.so")
-                        ) {
-                            val destination = tempDir.resolve(entry.name)
-                            destination.parentFile.mkdirs()
-                            zip.getInputStream(entry).use { input ->
-                                destination.outputStream().use(input::copyTo)
-                            }
+                // `module/daemon` hands this container to `app_process` as the classpath, and ART
+                // reads `classes*.dex` out of any zip, so the module ships one opaque `payload.bin`
+                // instead of a bare classes.dex or a service.apk.
+                val container = tempDir.resolve("payload.bin")
+                val dexEntryName = Regex("classes(\\d+)?\\.dex")
+                var carried = 0
+                java.util.zip.ZipOutputStream(container.outputStream()).use { out ->
+                    ZipFile(apk).use { zip ->
+                        val entries = zip.entries()
+                        while (entries.hasMoreElements()) {
+                            val entry = entries.nextElement()
+                            if (entry.isDirectory || !dexEntryName.matches(entry.name)) continue
+                            out.putNextEntry(java.util.zip.ZipEntry(entry.name))
+                            zip.getInputStream(entry).use { input -> input.copyTo(out) }
+                            out.closeEntry()
+                            carried++
                         }
                     }
                 }
+                check(carried > 0) { "the $variantName APK carries no classes.dex to publish" }
 
-                // Shipped under the name `module/daemon` and `customize.sh` expect.
-                apk.copyTo(tempDir.resolve("service.apk"), overwrite = true)
             }
         }
 

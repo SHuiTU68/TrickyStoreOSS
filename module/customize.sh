@@ -55,15 +55,9 @@ for file in customize.sh module.prop post-fs-data.sh service.sh sepolicy.rule da
   install_file "$file" "$MODPATH"
 done
 
-# The JVM control plane ships either as a bare classes.dex (manual build without aapt2) or as
-# service.apk (AGP build). daemon accepts both, so install whichever the zip carries.
-if unzip -l "$ZIPFILE" | grep -q "classes.dex$"; then
-  install_file "classes.dex" "$MODPATH"
-elif unzip -l "$ZIPFILE" | grep -q "service.apk$"; then
-  install_file "service.apk" "$MODPATH"
-else
-  abort "! Neither classes.dex nor service.apk found in package"
-fi
+# The JVM control plane ships as a zip container holding `classes.dex`, named `payload.bin` so the
+# module directory carries neither a bare classes.dex nor a service.apk.
+install_file "payload.bin" "$MODPATH"
 chmod 755 "$MODPATH/daemon"
 ui_print ""
 ui_print "- Extracting $ARCH libraries"
