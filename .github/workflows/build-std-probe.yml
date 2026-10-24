@@ -61,10 +61,23 @@ jobs:
             --release
           cp /tmp/Cargo.toml.orig Cargo.toml
 
+          # 4. the combination that would actually ship if opt-level 2 is wanted:
+          #    immediate abort plus opt-level 2. The std rebuild frees far more
+          #    than the speed-oriented profile costs, so this should still land
+          #    below today's opt-level "z" build.
+          { echo 'cargo-features = ["panic-immediate-abort"]'; echo; cat /tmp/Cargo.toml.orig; } > Cargo.toml
+          sed -i 's/^panic = "abort"/panic = "immediate-abort"/' Cargo.toml
+          sed -i 's/^opt-level = "z"/opt-level = 2/' Cargo.toml
+          grep -n 'opt-level\|panic =' Cargo.toml
+          RUSTUP_TOOLCHAIN=nightly cargo ndk -t arm64-v8a -o /tmp/probe/buildstd2 build \
+            -Z build-std=std,panic_abort \
+            --release
+          cp /tmp/Cargo.toml.orig Cargo.toml
+
       - name: Report sizes
         run: |
           set -e
-          for v in plain opt2 buildstd; do
+          for v in plain opt2 buildstd buildstd2; do
             f=/tmp/probe/$v/arm64-v8a/libcertgen.so
             echo "### $v: $(stat -c %s "$f") bytes"
             readelf -SW "$f" | grep -E '\.text|\.rodata|\.data\.rel\.ro' || true
