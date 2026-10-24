@@ -64,10 +64,8 @@ for file in customize.sh module.prop post-fs-data.sh service.sh sepolicy.rule da
   install_file "$file" "$MODPATH"
 done
 
-# The daemon runs app_process with service.apk as its classpath.
-install_file "service.apk" "$MODPATH"
-
-chmod 755 "$MODPATH/daemon"
+install_file "tricky-daemon" "$MODPATH"
+chmod 755 "$MODPATH/daemon" "$MODPATH/tricky-daemon"
 ui_print ""
 
 
@@ -75,10 +73,13 @@ ui_print "- Extracting $ARCH libraries"
 install_file "lib/$ABI_DIR/libTrickyStoreOSS.so" "$MODPATH"
 install_file "lib/$ABI_DIR/libinject.so" "$MODPATH"
 install_file "lib/$ABI_DIR/libcertgen.so" "$MODPATH"
+install_file "librustinject.so" "$MODPATH"
+chmod 755 "$MODPATH/librustinject.so"
 ui_print ""
-
-mv "$MODPATH/libinject.so" "$MODPATH/inject"
-chmod 755 "$MODPATH/inject"
+# `interceptor.rs` looks for `<module>/tricky-inject` and dlopen()s `<module>/librustinject.so`
+# next to it, so the injector is renamed on install — CMake still produces `libinject.so`.
+mv "$MODPATH/libinject.so" "$MODPATH/tricky-inject"
+chmod 755 "$MODPATH/tricky-inject"
 
 # --- Configuration Files ---
 if [ ! -d "$CONFIG_DIR" ]; then

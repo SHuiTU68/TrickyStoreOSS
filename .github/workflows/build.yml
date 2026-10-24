@@ -58,7 +58,8 @@ jobs:
             ~/.cargo/bin/cargo-ndk
             native-certgen/target
             native-inject/target
-          key: rust-${{ runner.os }}-${{ hashFiles('native-certgen/Cargo.lock', 'native-inject/Cargo.lock') }}
+            native-daemon/target
+          key: rust-${{ runner.os }}-${{ hashFiles('native-certgen/Cargo.lock', 'native-inject/Cargo.lock', 'native-daemon/Cargo.lock') }}
           restore-keys: rust-${{ runner.os }}-
 
       - name: Install cargo-ndk
