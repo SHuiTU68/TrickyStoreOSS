@@ -1,8 +1,11 @@
 name: build-std probe
 
-# Throwaway measurement: how much does libcertgen.so shrink when std/core are
-# rebuilt with `panic_immediate_abort` instead of using the precompiled std?
-# Manual dispatch only, and it never touches the shipped artifacts.
+# Throwaway measurement, manual dispatch only, never touches the shipped
+# artifacts. Answers two questions about libcertgen.so:
+#   1. how much does it shrink when std/core are rebuilt with the immediate-abort
+#      panic strategy instead of the precompiled std;
+#   2. how much does it grow if the crate itself is built at opt-level 2 instead
+#      of the current opt-level "z".
 on:
   workflow_dispatch:
 
@@ -25,35 +28,46 @@ jobs:
       - name: Install cargo-ndk
         run: command -v cargo-ndk || cargo install cargo-ndk
 
-      - name: Build both variants
+      - name: Build the three variants
         working-directory: native-certgen
         run: |
           set -x
-          NDK="${ANDROID_NDK_LATEST_HOME:-${ANDROID_NDK_HOME}}"
-          echo "NDK=$NDK"
           mkdir -p /tmp/probe
+          cp Cargo.toml /tmp/Cargo.toml.orig
+
+          # 1. what ships today: precompiled std, opt-level "z", panic = abort
           cargo ndk -t arm64-v8a -o /tmp/probe/plain build --release
-          # native-certgen/rust-toolchain.toml pins stable, and a toolchain file
-          # outranks the default toolchain, so the nightly switch has to be an
-          # explicit environment override for `-Z` to be accepted.
-          # `-Zbuild-std-features=panic_immediate_abort` is gone in current
-          # nightlies: immediate abort is a real panic strategy now, selected
-          # through the profile, and it still needs core built from source.
-          cp Cargo.toml /tmp/Cargo.toml.bak
+
+          # 2. opt-level 2 for the crate, still precompiled std: the size cost of
+          #    trading the size-oriented profile for a speed-oriented one.
+          sed -i 's/^opt-level = "z"/opt-level = 2/' Cargo.toml
+          grep -n 'opt-level' Cargo.toml
+          cargo ndk -t arm64-v8a -o /tmp/probe/opt2 build --release
+          cp /tmp/Cargo.toml.orig Cargo.toml
+
+          # 3. immediate abort. `-Zbuild-std-features=panic_immediate_abort` is
+          #    gone in current nightlies: immediate abort is a real panic
+          #    strategy now, opted into with a cargo-features entry plus a
+          #    profile setting, and still needs core built from source.
+          #    native-certgen/rust-toolchain.toml pins stable and a toolchain
+          #    file outranks the default toolchain, so RUSTUP_TOOLCHAIN has to
+          #    be overridden for `-Z` to be accepted at all.
+          { echo 'cargo-features = ["panic-immediate-abort"]'; echo; cat /tmp/Cargo.toml.orig; } > Cargo.toml
           sed -i 's/^panic = "abort"/panic = "immediate-abort"/' Cargo.toml
+          head -3 Cargo.toml
           grep -n 'panic =' Cargo.toml
           RUSTUP_TOOLCHAIN=nightly cargo ndk -t arm64-v8a -o /tmp/probe/buildstd build \
             -Z build-std=std,panic_abort \
             --release
-          cp /tmp/Cargo.toml.bak Cargo.toml
+          cp /tmp/Cargo.toml.orig Cargo.toml
 
       - name: Report sizes
         run: |
           set -e
-          for v in plain buildstd; do
+          for v in plain opt2 buildstd; do
             f=/tmp/probe/$v/arm64-v8a/libcertgen.so
             echo "### $v: $(stat -c %s "$f") bytes"
-            readelf -SW "$f" | grep -E '\.text|\.rodata|\.data\.rel\.ro|\.got' || true
-            echo "panic-related strings: $(strings "$f" | grep -c 'panicked at' || true)"
-            echo "unwind sections: $(readelf -SW "$f" | grep -c 'eh_frame' || true)"
+            readelf -SW "$f" | grep -E '\.text|\.rodata|\.data\.rel\.ro' || true
+            echo "panic strings: $(strings "$f" | grep -c 'panicked at' || true)"
+            echo "eh_frame sections: $(readelf -SW "$f" | grep -c 'eh_frame' || true)"
           done
