@@ -5,54 +5,59 @@
 //! BouncyCastle fallback, so a missing shared object or an unsupported request surfaces as an
 //! error rather than a silent switch to another provider.
 
+// Shipped code must turn every bad input into an error rather than a panic, so these two lints
+// stay denied for the real build. Test bodies are the one place where panicking *is* the
+// assertion, and rewriting 68 of them into `match` arms would make the tests harder to read
+// without making anything safer, so the deny is lifted for the test target only.
 #![deny(clippy::unwrap_used, clippy::expect_used)]
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 // Every `unsafe` block has to justify its invariants; there is exactly one, in
 // `read_byte_array`, and the reason it is sound is written above it.
 #![deny(clippy::undocumented_unsafe_blocks)]
 
-mod error;
+pub mod error;
 // Parses the keybox ahead of the certbuilder that consumes it.
-mod keybox;
+pub mod keybox;
 // Parses the keybox XML document itself, handed over by the Kotlin config loader.
-mod keybox_xml;
+pub mod keybox_xml;
 // Builds the DER certificates for the attestation chain.
-mod certbuilder;
+pub mod certbuilder;
 // Builds the KeyMint attestation extension the certbuilder embeds in the leaf.
-mod attestation;
+pub mod attestation;
 // Rewrites an existing leaf's attestation extension and re-signs it with the keybox.
-mod hack_leaf;
+pub mod hack_leaf;
 // Reads the verified-boot fields back out of a probe certificate's attestation extension.
-mod attest_parse;
+pub mod attest_parse;
 // Request/response wire format for the certificate-chain JNI entry point.
-mod chaingen;
+pub mod chaingen;
 // Request wire format for the attestation-extension JNI entry point.
-mod attreq;
-mod keygen;
-mod types;
+pub mod attreq;
+pub mod keygen;
+pub mod types;
 // Bounds-checked reader shared by the request blobs.
-mod wire;
+pub mod wire;
 // Minimal DER reader shared by the hand-rolled parsers.
-mod tlv;
+pub mod tlv;
 // Log lines the native side hands back for Kotlin to replay through `Logger`.
-mod report;
+pub mod report;
 // Plans the boot-time global property spoofing without touching the device itself.
-mod hide_props;
+pub mod hide_props;
 // The Android implementations of the traits `hide_props` plans against.
-mod system;
+pub mod system;
 // On-disk key persistence: the record format, its bounds checks, and the crash-safe write sequence.
-mod persist;
+pub mod persist;
 
 // The three text files the daemon reads at boot: `target.txt`, `security_patch.txt` and the
 // `tee_status` report. Parsing and formatting live here; inotify and binder stay in Kotlin.
-mod config;
+pub mod config;
 
 // The KeyMint/Keymaster version tables. `KeyMintVersionResolver` keeps the binder calls; the
 // number-to-version mappings live here so they can be tested without a device.
-mod version;
+pub mod version;
 
 // Assembles the attestation application id and derives `unique_id`. `CertificateGen` keeps the
 // `PackageManager` traversal; the DER container and the HMAC live here.
-mod aaid;
+pub mod aaid;
 
 use jni::objects::{JByteArray, JClass, JString};
 use jni::sys::{jboolean, jbyteArray, jint, jlong, jstring};
@@ -689,7 +694,7 @@ fn self_test() -> std::result::Result<(), &'static str> {
 }
 
 #[cfg(test)]
-mod tests {
+pub mod tests {
     use super::*;
 
     #[test]

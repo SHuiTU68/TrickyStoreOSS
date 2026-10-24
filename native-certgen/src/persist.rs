@@ -442,7 +442,8 @@ impl Record {
         } else {
             None
         };
-        let mut use_state = None;
+        // Both branches below assign this exactly once, so no placeholder initial value is needed.
+        let use_state;
         let mut owner_identity_fingerprint = None;
         if version >= FORMAT_VERSION {
             params.max_uses_per_boot = cur.i32()?;
