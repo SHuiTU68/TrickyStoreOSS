@@ -169,6 +169,194 @@ dependencies {
 //
 // Resolution happens inside the tasks rather than at configuration time because on a fresh CI
 // runner the NDK only exists after the workflow (or AGP) has installed it.
+//
+// The helpers live in a static nested object, not in the script itself: task actions are
+// serialized by the configuration cache and must not capture the script instance, which calling
+// script-level functions or reading script-level vals would do. Task bodies snapshot the values
+// they need into locals (Files/Strings/Booleans — all serializable) and call into this object;
+// `object` members resolve through a static reference, so nothing captures the script.
+private object Toolchains {
+    /** Locates the NDK every `cargo` invocation below must use. Called from task actions only. */
+    fun resolveAndroidNdk(sdkDir: File?, ndkVersion: String, minSdk: Int): File {
+        val sdkNdkRoot = sdkDir?.resolve("ndk")
+        // AGP downloads the revision named by `ndkVersion`, but runner images also ship a few others
+        // side by side. Any installed revision that carries the LLVM toolchain beats failing the build,
+        // so they are appended newest-first after the exact match.
+        val installedRevisions =
+            sdkNdkRoot
+                ?.listFiles()
+                ?.filter { it.isDirectory }
+                ?.sortedByDescending { it.name }
+                .orEmpty()
+        val candidates =
+            (
+                listOfNotNull(
+                    System.getenv("ANDROID_NDK_HOME"),
+                    System.getenv("ANDROID_NDK_ROOT"),
+                    System.getenv("ANDROID_NDK"),
+                    System.getenv("NDK_HOME"),
+                    sdkNdkRoot?.resolve(ndkVersion)?.absolutePath,
+                ).map { File(it) } + installedRevisions
+            ).distinct()
+        return candidates.firstOrNull { it.resolve("toolchains/llvm/prebuilt").isDirectory }
+            ?: throw GradleException(
+                "No usable Android NDK $ndkVersion found; the Rust cross-builds need " +
+                    "aarch64-linux-android$minSdk-clang. Looked at: " +
+                    candidates.joinToString { it.absolutePath } +
+                    ". Set ANDROID_NDK_HOME or install it with " +
+                    "`sdkmanager \"ndk;$ndkVersion\"`.",
+            )
+    }
+
+    /**
+     * Everything a cross-build needs, keyed by environment variable name.
+     *
+     * `PATH` is still extended because `native-inject/.cargo/config.toml` names the linker without a
+     * directory, but nothing depends on it any more: the absolute paths below are what `cc-rs` and
+     * `rustc` actually consume.
+     */
+    fun rustAndroidEnvironment(ndk: File, minSdk: Int): Map<String, String> {
+        val prebuilt =
+            ndk.resolve("toolchains/llvm/prebuilt").listFiles()?.firstOrNull { it.isDirectory }
+                ?: throw GradleException(
+                    "The NDK at ${ndk.absolutePath} has no toolchains/llvm/prebuilt/<host> directory.",
+                )
+        val bin = prebuilt.resolve("bin")
+        // The API-versioned wrappers bake in `--target` and `--sysroot`, so the unversioned
+        // `<triple>-clang` that `cc-rs` probes for is never needed.
+        val clang = bin.resolve("aarch64-linux-android$minSdk-clang")
+        val clangxx = bin.resolve("${clang.name}++")
+        if (!clang.isFile || !clangxx.isFile) {
+            val clangBinaries =
+                bin.listFiles()
+                    ?.filter { it.isFile && it.name.contains("clang") }
+                    ?.map { it.name }
+                    ?.sorted()
+                    ?.take(12)
+                    ?.joinToString()
+                    ?.takeIf { it.isNotEmpty() }
+                    ?: "none"
+            throw GradleException(
+                "Missing ${clang.absolutePath}. The NDK at ${ndk.absolutePath} is not usable " +
+                    "(clang binaries present: $clangBinaries).",
+            )
+        }
+        // bindgen (run by `lsplt-sys` before its C++ step) loads libclang from the NDK.
+        val libclangDir =
+            listOf(prebuilt.resolve("lib"), prebuilt.resolve("lib64"))
+                .firstOrNull { it.resolve("libclang.so").isFile || it.resolve("libclang.dylib").isFile }
+        val env =
+            mutableMapOf(
+                "ANDROID_NDK_HOME" to ndk.absolutePath,
+                "ANDROID_NDK_ROOT" to ndk.absolutePath,
+                "ANDROID_NDK" to ndk.absolutePath,
+                "NDK_HOME" to ndk.absolutePath,
+                "PATH" to
+                    listOfNotNull(
+                            bin.absolutePath,
+                            "${System.getProperty("user.home")}/.cargo/bin",
+                            System.getenv("PATH"),
+                        )
+                        .joinToString(":"),
+                "CC_aarch64_linux_android" to clang.absolutePath,
+                "CXX_aarch64_linux_android" to clangxx.absolutePath,
+                "AR_aarch64_linux_android" to bin.resolve("llvm-ar").absolutePath,
+                "RANLIB_aarch64_linux_android" to bin.resolve("llvm-ranlib").absolutePath,
+                "CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER" to clang.absolutePath,
+            )
+        libclangDir?.let { env["LIBCLANG_PATH"] = it.absolutePath }
+        return env
+    }
+
+    /**
+     * Drops the DWARF unwind tables (`.eh_frame` / `.eh_frame_hdr`) from a shipped ELF.
+     *
+     * Every native artifact this module ships is built without exceptions and with `panic = "abort"`,
+     * so no frame is ever unwound on purpose. The tables are still emitted for two reasons no flag set
+     * in this file can reach: `libcertgen`/`inject` link the precompiled Rust std, which carries
+     * `.eh_frame` for all of its own code, and clang keeps a call-site table per function wherever a
+     * landing pad exists. Post-link removal is the only place that catches all of them at once.
+     *
+     * `.eh_frame_hdr` has to go with `.eh_frame` — it is a sorted binary index into it. The loader
+     * reads neither: `dlopen` needs `.dynamic`, `.dynsym`/`.dynstr`, the relocation tables and the
+     * program headers, all of which stay untouched. The only real loss is stack unwinding for these
+     * files in a crash report (frames show up as `<unknown>`).
+     */
+    fun stripUnwindTables(ndk: File, artifact: File) {
+        val objcopy =
+            ndk.resolve("toolchains/llvm/prebuilt")
+                .listFiles()
+                ?.firstOrNull { it.isDirectory }
+                ?.resolve("bin/llvm-objcopy")
+        if (objcopy == null || !objcopy.isFile) {
+            throw GradleException("No llvm-objcopy in the NDK at ${ndk.absolutePath}.")
+        }
+        val before = artifact.length()
+        val process =
+            ProcessBuilder(
+                    objcopy.absolutePath,
+                    "--remove-section=.eh_frame",
+                    "--remove-section=.eh_frame_hdr",
+                    // `.comment` is a plain compiler-version string ("clang version 19.x …"); it
+                    // identifies the exact toolchain that produced the artifact and serves no
+                    // runtime purpose. The GNU build-id stays: it is a content hash that helps
+                    // symbolication and does not fingerprint the build environment.
+                    "--remove-section=.comment",
+                    artifact.absolutePath,
+                )
+                .redirectErrorStream(true)
+                .start()
+        val output = process.inputStream.bufferedReader().use { it.readText() }.trim()
+        val exit = process.waitFor()
+        if (exit != 0) {
+            throw GradleException("llvm-objcopy failed on ${artifact.name} (exit $exit): $output")
+        }
+        val after = artifact.length()
+        println(
+            "shrink: ${artifact.name} $before -> $after bytes " +
+                "(${before - after} bytes of unwind tables dropped)",
+        )
+    }
+
+    // `llvm-objcopy --remove-section` leaves the removed bytes behind as a zero hole inside the
+    // preceding PT_LOAD, so files hardly shrink on disk even though whole tables are gone.
+    // elf_compact.py slides the following segments down over that hole (respecting each segment's
+    // p_align) and rewrites the headers. It verifies its own output and is a no-op when the hole is
+    // too small to be removed without breaking the loader's offset/vaddr congruence.
+    fun resolvePython(): String? {
+        for (candidate in listOf("python3", "python")) {
+            try {
+                val process =
+                    ProcessBuilder(candidate, "-c", "import sys; sys.exit(0 if sys.version_info >= (3, 8) else 1)")
+                        .redirectErrorStream(true)
+                        .start()
+                val ok = process.waitFor() == 0
+                process.inputStream.close()
+                if (ok) return candidate
+            } catch (e: Exception) {
+                // Not installed under this name; try the next candidate.
+            }
+        }
+        return null
+    }
+
+    fun compactElf(python: String, script: File, artifact: File) {
+        val before = artifact.length()
+        val process =
+            ProcessBuilder(python, script.absolutePath, artifact.absolutePath)
+                .directory(script.parentFile.parentFile)
+                .redirectErrorStream(true)
+                .start()
+        val output = process.inputStream.bufferedReader().use { it.readText() }.trim()
+        val exit = process.waitFor()
+        if (exit != 0) {
+            throw GradleException("elf_compact.py failed on ${artifact.name} (exit $exit): $output")
+        }
+        output.lineSequence().filter { it.isNotBlank() }.forEach { println("compact: $it") }
+        val after = artifact.length()
+        println("compact: ${artifact.name} $before -> $after bytes (${before - after} bytes reclaimed)")
+    }
+}
 
 val androidSdkDir: File? =
     run {
@@ -184,187 +372,6 @@ val androidSdkDir: File? =
             }
         (fromEnv ?: fromLocalProperties)?.let { file(it) }
     }
-
-/** Locates the NDK every `cargo` invocation below must use. Called from task actions only. */
-fun resolveAndroidNdk(): File {
-    val sdkNdkRoot = androidSdkDir?.resolve("ndk")
-    // AGP downloads the revision named by `ndkVersion`, but runner images also ship a few others
-    // side by side. Any installed revision that carries the LLVM toolchain beats failing the build,
-    // so they are appended newest-first after the exact match.
-    val installedRevisions =
-        sdkNdkRoot
-            ?.listFiles()
-            ?.filter { it.isDirectory }
-            ?.sortedByDescending { it.name }
-            .orEmpty()
-    val candidates =
-        (
-            listOfNotNull(
-                System.getenv("ANDROID_NDK_HOME"),
-                System.getenv("ANDROID_NDK_ROOT"),
-                System.getenv("ANDROID_NDK"),
-                System.getenv("NDK_HOME"),
-                sdkNdkRoot?.resolve(androidNdkVersion)?.absolutePath,
-            ).map { file(it) } + installedRevisions
-        ).distinct()
-    return candidates.firstOrNull { it.resolve("toolchains/llvm/prebuilt").isDirectory }
-        ?: throw GradleException(
-            "No usable Android NDK $androidNdkVersion found; the Rust cross-builds need " +
-                "aarch64-linux-android$androidMinSdk-clang. Looked at: " +
-                candidates.joinToString { it.absolutePath } +
-                ". Set ANDROID_NDK_HOME or install it with " +
-                "`sdkmanager \"ndk;$androidNdkVersion\"`.",
-        )
-}
-
-/**
- * Everything a cross-build needs, keyed by environment variable name.
- *
- * `PATH` is still extended because `native-inject/.cargo/config.toml` names the linker without a
- * directory, but nothing depends on it any more: the absolute paths below are what `cc-rs` and
- * `rustc` actually consume.
- */
-fun rustAndroidEnvironment(ndk: File): Map<String, String> {
-    val prebuilt =
-        ndk.resolve("toolchains/llvm/prebuilt").listFiles()?.firstOrNull { it.isDirectory }
-            ?: throw GradleException(
-                "The NDK at ${ndk.absolutePath} has no toolchains/llvm/prebuilt/<host> directory.",
-            )
-    val bin = prebuilt.resolve("bin")
-    // The API-versioned wrappers bake in `--target` and `--sysroot`, so the unversioned
-    // `<triple>-clang` that `cc-rs` probes for is never needed.
-    val clang = bin.resolve("aarch64-linux-android$androidMinSdk-clang")
-    val clangxx = bin.resolve("${clang.name}++")
-    if (!clang.isFile || !clangxx.isFile) {
-        val clangBinaries =
-            bin.listFiles()
-                ?.filter { it.isFile && it.name.contains("clang") }
-                ?.map { it.name }
-                ?.sorted()
-                ?.take(12)
-                ?.joinToString()
-                ?.takeIf { it.isNotEmpty() }
-                ?: "none"
-        throw GradleException(
-            "Missing ${clang.absolutePath}. The NDK at ${ndk.absolutePath} is not usable " +
-                "(clang binaries present: $clangBinaries).",
-        )
-    }
-    // bindgen (run by `lsplt-sys` before its C++ step) loads libclang from the NDK.
-    val libclangDir =
-        listOf(prebuilt.resolve("lib"), prebuilt.resolve("lib64"))
-            .firstOrNull { it.resolve("libclang.so").isFile || it.resolve("libclang.dylib").isFile }
-    val env =
-        mutableMapOf(
-            "ANDROID_NDK_HOME" to ndk.absolutePath,
-            "ANDROID_NDK_ROOT" to ndk.absolutePath,
-            "ANDROID_NDK" to ndk.absolutePath,
-            "NDK_HOME" to ndk.absolutePath,
-            "PATH" to
-                listOfNotNull(
-                        bin.absolutePath,
-                        "${System.getProperty("user.home")}/.cargo/bin",
-                        System.getenv("PATH"),
-                    )
-                    .joinToString(":"),
-            "CC_aarch64_linux_android" to clang.absolutePath,
-            "CXX_aarch64_linux_android" to clangxx.absolutePath,
-            "AR_aarch64_linux_android" to bin.resolve("llvm-ar").absolutePath,
-            "RANLIB_aarch64_linux_android" to bin.resolve("llvm-ranlib").absolutePath,
-            "CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER" to clang.absolutePath,
-        )
-    libclangDir?.let { env["LIBCLANG_PATH"] = it.absolutePath }
-    return env
-}
-
-/**
- * Drops the DWARF unwind tables (`.eh_frame` / `.eh_frame_hdr`) from a shipped ELF.
- *
- * Every native artifact this module ships is built without exceptions and with `panic = "abort"`,
- * so no frame is ever unwound on purpose. The tables are still emitted for two reasons no flag set
- * in this file can reach: `libcertgen`/`inject` link the precompiled Rust std, which carries
- * `.eh_frame` for all of its own code, and clang keeps a call-site table per function wherever a
- * landing pad exists. Post-link removal is the only place that catches all of them at once.
- *
- * `.eh_frame_hdr` has to go with `.eh_frame` — it is a sorted binary index into it. The loader
- * reads neither: `dlopen` needs `.dynamic`, `.dynsym`/`.dynstr`, the relocation tables and the
- * program headers, all of which stay untouched. The only real loss is stack unwinding for these
- * files in a crash report (frames show up as `<unknown>`).
- */
-fun stripUnwindTables(ndk: File, artifact: File) {
-    val objcopy =
-        ndk.resolve("toolchains/llvm/prebuilt")
-            .listFiles()
-            ?.firstOrNull { it.isDirectory }
-            ?.resolve("bin/llvm-objcopy")
-    if (objcopy == null || !objcopy.isFile) {
-        throw GradleException("No llvm-objcopy in the NDK at ${ndk.absolutePath}.")
-    }
-    val before = artifact.length()
-    val process =
-        ProcessBuilder(
-                objcopy.absolutePath,
-                "--remove-section=.eh_frame",
-                "--remove-section=.eh_frame_hdr",
-                // `.comment` is a plain compiler-version string ("clang version 19.x …"); it
-                // identifies the exact toolchain that produced the artifact and serves no
-                // runtime purpose. The GNU build-id stays: it is a content hash that helps
-                // symbolication and does not fingerprint the build environment.
-                "--remove-section=.comment",
-                artifact.absolutePath,
-            )
-            .redirectErrorStream(true)
-            .start()
-    val output = process.inputStream.bufferedReader().use { it.readText() }.trim()
-    val exit = process.waitFor()
-    if (exit != 0) {
-        throw GradleException("llvm-objcopy failed on ${artifact.name} (exit $exit): $output")
-    }
-    val after = artifact.length()
-    println(
-        "shrink: ${artifact.name} $before -> $after bytes " +
-            "(${before - after} bytes of unwind tables dropped)",
-    )
-}
-
-// `llvm-objcopy --remove-section` leaves the removed bytes behind as a zero hole inside the
-// preceding PT_LOAD, so files hardly shrink on disk even though whole tables are gone.
-// elf_compact.py slides the following segments down over that hole (respecting each segment's
-// p_align) and rewrites the headers. It verifies its own output and is a no-op when the hole is
-// too small to be removed without breaking the loader's offset/vaddr congruence.
-fun resolvePython(): String? {
-    for (candidate in listOf("python3", "python")) {
-        try {
-            val process =
-                ProcessBuilder(candidate, "-c", "import sys; sys.exit(0 if sys.version_info >= (3, 8) else 1)")
-                    .redirectErrorStream(true)
-                    .start()
-            val ok = process.waitFor() == 0
-            process.inputStream.close()
-            if (ok) return candidate
-        } catch (e: Exception) {
-            // Not installed under this name; try the next candidate.
-        }
-    }
-    return null
-}
-
-fun compactElf(python: String, script: File, artifact: File) {
-    val before = artifact.length()
-    val process =
-        ProcessBuilder(python, script.absolutePath, artifact.absolutePath)
-            .directory(script.parentFile.parentFile)
-            .redirectErrorStream(true)
-            .start()
-    val output = process.inputStream.bufferedReader().use { it.readText() }.trim()
-    val exit = process.waitFor()
-    if (exit != 0) {
-        throw GradleException("elf_compact.py failed on ${artifact.name} (exit $exit): $output")
-    }
-    output.lineSequence().filter { it.isNotBlank() }.forEach { println("compact: $it") }
-    val after = artifact.length()
-    println("compact: ${artifact.name} $before -> $after bytes (${before - after} bytes reclaimed)")
-}
 
 // --- Native cert generation (Rust cdylib) ---
 // Builds libcertgen.so for arm64-v8a straight into app/src/main/jniLibs, which AGP merges into
@@ -403,13 +410,17 @@ val buildStdNightly = System.getenv("TSTORE_NIGHTLY") ?: "nightly-2026-10-23"
 // fails, or is skipped. `onlyIf` keeps it a no-op whenever no stash exists.
 val restoreCertgenManifest =
     tasks.register("restoreCertgenManifest") {
+        // Locals only: task actions are serialized by the configuration cache and must not
+        // capture the script instance through script-level vals.
+        val stash = certgenManifestStash
+        val manifest = certgenManifest
         group = "TrickyStoreOSS Native Build"
         description = "Restores native-certgen/Cargo.toml from the build-std stash, even after a failed build"
-        onlyIf { certgenManifestStash.exists() }
+        onlyIf { stash.exists() }
         doLast {
-            certgenManifestStash.copyTo(certgenManifest, overwrite = true)
-            certgenManifestStash.delete()
-            println("Restored ${certgenManifest.name} from build-std stash")
+            stash.copyTo(manifest, overwrite = true)
+            stash.delete()
+            println("Restored ${manifest.name} from build-std stash")
         }
     }
 
@@ -440,8 +451,6 @@ val buildRustCertgen =
         // when no stash exists (e.g. build-std not requested).
         finalizedBy(restoreCertgenManifest)
 
-        notCompatibleWithConfigurationCache("resolves the NDK when the task runs")
-
         workingDir = rootProject.projectDir.resolve("native-certgen")
 
         commandLine(buildCertgenCommandLine())
@@ -451,25 +460,42 @@ val buildRustCertgen =
         inputs.file(rootProject.projectDir.resolve("native-certgen/Cargo.lock"))
         outputs.dir(rootProject.projectDir.resolve("app/src/main/jniLibs"))
 
+        // Snapshots for the action below: task actions are serialized by the configuration cache,
+        // so they may only capture serializable locals — reading script members from inside the
+        // action would capture the script instance. Snapshotting happens here, at configuration
+        // time; the toolchain lookups still run through the static Toolchains object at execution.
+        val sdkDir = androidSdkDir
+        val ndkVersion = androidNdkVersion
+        val minSdk = androidMinSdk
+        val certgenStash = certgenManifestStash
+        val certgenManifest = certgenManifest
+        val buildStdRequested = buildStdRequested()
+        val buildStdNightlyPinned = buildStdNightly
+
         doFirst {
-            rustAndroidEnvironment(resolveAndroidNdk()).forEach { (key, value) -> environment(key, value) }
+            // The Kotlin DSL renders `doFirst`'s Action as a receiver lambda, so `this` is the
+            // task at execution time — no configuration receiver is captured. A cast keeps the
+            // Exec-only surface (environment) reachable from the plain Task receiver.
+            val exec = this as Exec
+            Toolchains.rustAndroidEnvironment(Toolchains.resolveAndroidNdk(sdkDir, ndkVersion, minSdk), minSdk)
+                .forEach { (key, value) -> exec.environment(key, value) }
             // Self-heal first: a build-std run that died hard (killed daemon, dropped CI job)
             // can outlive its finalizer and leave a stale stash — start from a clean manifest
             // so a normal stable build never sees the patched file.
-            if (certgenManifestStash.exists()) {
-                certgenManifestStash.copyTo(certgenManifest, overwrite = true)
-                certgenManifestStash.delete()
+            if (certgenStash.exists()) {
+                certgenStash.copyTo(certgenManifest, overwrite = true)
+                certgenStash.delete()
             }
-            if (buildStdRequested()) {
-                certgenManifest.copyTo(certgenManifestStash, overwrite = true)
+            if (buildStdRequested) {
+                certgenManifest.copyTo(certgenStash, overwrite = true)
                 certgenManifest.writeText(
                     "cargo-features = [\"panic-immediate-abort\"]\n\n" +
-                        certgenManifestStash.readText().replaceFirst(
+                        certgenStash.readText().replaceFirst(
                             Regex("(?m)^panic = \"abort\"$"),
                             "panic = \"immediate-abort\"",
                         ),
                 )
-                environment("RUSTUP_TOOLCHAIN", buildStdNightly)
+                exec.environment("RUSTUP_TOOLCHAIN", buildStdNightlyPinned)
             }
         }
     }
@@ -493,8 +519,6 @@ val buildRustInject =
         group = "TrickyStoreOSS Native Build"
         description = "Builds librustinject.a/.so for arm64-v8a (the archive is linked into libinject.so)."
 
-        notCompatibleWithConfigurationCache("resolves the NDK when the task runs")
-
         workingDir = rustInjectCrateDir
         commandLine(
             "sh",
@@ -511,8 +535,17 @@ val buildRustInject =
         inputs.file(rustInjectCrateDir.resolve("Cargo.lock"))
         outputs.dir(rustInjectAbiDir)
 
+        // Snapshots for the action below — see buildRustCertgen: actions may only capture
+        // serializable locals, never script members.
+        val sdkDir = androidSdkDir
+        val ndkVersion = androidNdkVersion
+        val minSdk = androidMinSdk
+
         doFirst {
-            rustAndroidEnvironment(resolveAndroidNdk()).forEach { (key, value) -> environment(key, value) }
+            // Receiver form — see buildRustCertgen: `this` is the task at execution time.
+            val exec = this as Exec
+            Toolchains.rustAndroidEnvironment(Toolchains.resolveAndroidNdk(sdkDir, ndkVersion, minSdk), minSdk)
+                .forEach { (key, value) -> exec.environment(key, value) }
         }
     }
 
@@ -528,8 +561,6 @@ val buildRustDaemon =
         group = "TrickyStoreOSS Native Build"
         description = "Builds the tricky-daemon binary for arm64-v8a."
 
-        notCompatibleWithConfigurationCache("resolves the NDK when the task runs")
-
         workingDir = rustDaemonCrateDir
         commandLine(
             "sh",
@@ -543,8 +574,17 @@ val buildRustDaemon =
         inputs.file(rustDaemonCrateDir.resolve("Cargo.lock"))
         outputs.dir(rustDaemonAbiDir)
 
+        // Snapshots for the action below — see buildRustCertgen: actions may only capture
+        // serializable locals, never script members.
+        val sdkDir = androidSdkDir
+        val ndkVersion = androidNdkVersion
+        val minSdk = androidMinSdk
+
         doFirst {
-            rustAndroidEnvironment(resolveAndroidNdk()).forEach { (key, value) -> environment(key, value) }
+            // Receiver form — see buildRustCertgen: `this` is the task at execution time.
+            val exec = this as Exec
+            Toolchains.rustAndroidEnvironment(Toolchains.resolveAndroidNdk(sdkDir, ndkVersion, minSdk), minSdk)
+                .forEach { (key, value) -> exec.environment(key, value) }
         }
     }
 
@@ -570,8 +610,19 @@ androidComponents {
         val apkFile = variant.artifacts.get(SingleArtifact.APK)
 
         tasks.register("prepareModuleFiles${capitalized}") {
-            notCompatibleWithConfigurationCache("stages APK contents into the variant module directory")
             dependsOn(buildRustCertgen, buildRustInject, buildRustDaemon)
+            // Locals only: the configuration cache serializes doLast, so it may not capture the
+            // script instance through script-level vals or functions. Everything that must be
+            // computed here is snapshotted up front; the toolchain helpers run through the static
+            // Toolchains object and still resolve at execution time.
+            val commitCount = gitCommitCount
+            val commitHash = gitCommitHash
+            val versionName = verName
+            val sourceDir = project.rootDir.resolve("module")
+            val toolsDir = project.rootDir.resolve("tools")
+            val sdkDir = androidSdkDir
+            val ndkVersion = androidNdkVersion
+            val minSdk = androidMinSdk
             inputs.dir(sourceDir)
             inputs.dir(apkFile)
             inputs.file(rustDaemonBinary)
@@ -598,8 +649,8 @@ androidComponents {
                 tempDir.resolve("module.prop").writeText(
                     sourceDir.resolve("module.prop")
                         .readText()
-                        .replace("REPLACEMEVERCODE", gitCommitCount.toString())
-                        .replace("REPLACEMEVER", "$verName ($gitCommitCount-$gitCommitHash-$variantName)"),
+                        .replace("REPLACEMEVERCODE", commitCount.toString())
+                        .replace("REPLACEMEVER", "$versionName ($commitCount-$commitHash-$variantName)"),
                 )
 
                 // The module needs the .so files unpacked, so they are pulled out of the APK and
@@ -657,9 +708,9 @@ androidComponents {
                 // Last step before the zip is assembled: drop the unwind tables from the three
                 // ELF files that actually get installed. Sizes are printed so the saving shows up
                 // in the CI log instead of only in the zip.
-                val ndk = resolveAndroidNdk()
-                val compactScript = rootProject.projectDir.resolve("tools/elf_compact.py")
-                val python = if (compactScript.isFile) resolvePython() else null
+                val ndk = Toolchains.resolveAndroidNdk(sdkDir, ndkVersion, minSdk)
+                val compactScript = toolsDir.resolve("elf_compact.py")
+                val python = if (compactScript.isFile) Toolchains.resolvePython() else null
                 if (compactScript.isFile && python == null) {
                     println("compact: skipped, no python3 (>= 3.8) on PATH; zip will keep the zero holes")
                 }
@@ -670,8 +721,8 @@ androidComponents {
                             "expected $name in the staged module at ${artifact.absolutePath}",
                         )
                     }
-                    stripUnwindTables(ndk, artifact)
-                    if (python != null) compactElf(python, compactScript, artifact)
+                    Toolchains.stripUnwindTables(ndk, artifact)
+                    if (python != null) Toolchains.compactElf(python, compactScript, artifact)
                 }
             }
         }
