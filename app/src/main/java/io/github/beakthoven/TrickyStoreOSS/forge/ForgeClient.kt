@@ -49,7 +49,14 @@ object ForgeClient {
     private fun request(op: Int, payload: ByteArray): ByteArray? {
         val response =
             runCatching { exchange(op, payload) }
-                .onFailure { Logger.d("Forge daemon unreachable (op=$op): ${it.message}") }
+                .onFailure {
+                    // A null `message` (bare EOFException, e.g. the daemon closed the connection
+                    // without replying) is the most common failure shape here — the class name is
+                    // what makes the log line actionable.
+                    Logger.d(
+                        "Forge daemon unreachable (op=$op): ${it.javaClass.simpleName}: ${it.message}",
+                    )
+                }
                 .getOrNull() ?: return null
         return when (val result = ForgeProtocol.decodeResponse(response)) {
             is ForgeResult.Success -> result.payload

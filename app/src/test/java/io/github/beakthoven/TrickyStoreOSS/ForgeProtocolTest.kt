@@ -8,8 +8,10 @@ package io.github.beakthoven.TrickyStoreOSS
 import io.github.beakthoven.TrickyStoreOSS.forge.ChainBuildRequest
 import io.github.beakthoven.TrickyStoreOSS.forge.ForgeProtocol
 import io.github.beakthoven.TrickyStoreOSS.forge.ForgeResult
+import io.github.beakthoven.TrickyStoreOSS.forge.ForgeServer
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import java.io.ByteArrayOutputStream
@@ -190,5 +192,20 @@ class ForgeProtocolTest {
         } catch (expected: IllegalArgumentException) {
             assertTrue(expected.message!!.contains("malformed request frame"))
         }
+    }
+
+    @Test
+    fun forge_gate_admits_system_uids_and_rejects_apps() {
+        // Root and every system daemon pass: pinning keystore2 to a single uid silently broke the
+        // channel once already on a device where keystore2 ran as a different system uid.
+        assertTrue(ForgeServer.admitsPeerUid(0))
+        assertTrue(ForgeServer.admitsPeerUid(1000)) // AID_SYSTEM
+        assertTrue(ForgeServer.admitsPeerUid(1017)) // AID_KEYSTORE
+        assertTrue(ForgeServer.admitsPeerUid(9999))
+        // The first application uid and everything above it — including a uid that failed to
+        // resolve (-1) — must never receive keybox-signed material.
+        assertFalse(ForgeServer.admitsPeerUid(10_000))
+        assertFalse(ForgeServer.admitsPeerUid(10_374))
+        assertFalse(ForgeServer.admitsPeerUid(-1))
     }
 }

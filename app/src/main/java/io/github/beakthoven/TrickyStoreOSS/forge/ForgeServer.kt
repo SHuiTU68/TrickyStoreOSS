@@ -82,8 +82,17 @@ object ForgeServer {
     private fun peerUid(client: LocalSocket): Int =
         runCatching { client.peerCredentials.uid }.getOrDefault(-1)
 
-    private fun admits(client: LocalSocket): Boolean =
-        peerUid(client) in intArrayOf(ForgeProtocol.KEYSTORE_UID, 0)
+    private fun admits(client: LocalSocket): Boolean = admitsPeerUid(peerUid(client))
+
+    /**
+     * Accepts root and every system uid, rejects applications. The abstract namespace is global,
+     * so the gate still has to keep arbitrary apps away from keybox-signed material — but it must
+     * NOT pin a single uid for keystore: the injector supervisor was already broken once by a
+     * pinned keystore constant on a device where keystore2 ran as a different system uid (see
+     * `interceptor.rs::looks_like_keystore`). System daemons live below `AID_APP` (10000); the
+     * first application uid can never squat in that range.
+     */
+    internal fun admitsPeerUid(uid: Int): Boolean = uid in 0 until 10_000
 
     private fun handle(client: LocalSocket) {
         try {
