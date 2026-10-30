@@ -2,3 +2,10 @@ allow keystore system_file unix_dgram_socket *
 allow system_file keystore unix_dgram_socket *
 allow keystore system_file file *
 allow crash_dump keystore process *
+# The forge daemon answers keybox-signed material on an abstract-namespace socket; abstract
+# sockets have no file label, so the only gate is connectto against the daemon's domain —
+# whichever root implementation started it.
+allow keystore magisk unix_stream_socket connectto
+allow keystore su unix_stream_socket connectto
+allow keystore ksu unix_stream_socket connectto
+allow keystore uad unix_stream_socket connectto

@@ -17,6 +17,8 @@ import android.security.keymaster.KeymasterDefs
 import android.security.keystore.KeyProperties
 import android.system.keystore2.KeyDescriptor
 import io.github.beakthoven.TrickyStoreOSS.config.PkgConfig
+import io.github.beakthoven.TrickyStoreOSS.forge.ChainBuildRequest
+import io.github.beakthoven.TrickyStoreOSS.forge.ForgeClient
 import io.github.beakthoven.TrickyStoreOSS.interceptors.SecurityLevelInterceptor
 import io.github.beakthoven.TrickyStoreOSS.logging.Logger
 import java.io.ByteArrayOutputStream
@@ -46,7 +48,7 @@ object CertificateGen {
      * The material used to sign a freshly generated leaf: the signing key and its certificate chain
      * as DER (leaf first). The native builder derives the issuer from that chain itself.
      */
-    private class SigningMaterial(
+    class SigningMaterial(
         val keyPair: KeyPair,
         val certChainDer: ByteArray?,
     )
@@ -309,44 +311,60 @@ object CertificateGen {
 
             params.createdAtMs = params.createdAtMs ?: System.currentTimeMillis()
             val keyPair = generateKeyPair(params) ?: return null
-            val keybox = getKeyboxForAlgorithm(params.algorithm) ?: return null
-            if (keybox.certificates.isEmpty()) {
-                Logger.e("Keybox has no certificates")
-                return null
+            if (attestKeyDescriptor != null) {
+                // Designated attestation key: signs with a previously forged key whose material is
+                // already held in this process — no keybox involved, so the whole chain build
+                // stays in-process.
+                val signing = getAttestationKeyInfo(uid, attestKeyDescriptor, securityLevel)
+                return@runCatching keyPair to buildChain(
+                    keyPair,
+                    params,
+                    signing,
+                    uid,
+                    securityLevel,
+                    appendSigningChain = false,
+                )
             }
-
-            val signing =
-                if (attestKeyDescriptor != null) {
-                    getAttestationKeyInfo(uid, attestKeyDescriptor, securityLevel)
-                } else {
-                    keyboxSigningMaterial(keybox)
-                }
-
-            // A designated attestation key signs a standalone leaf; the keybox case appends the
-            // whole keybox chain after it.
-            val appendSigningChain = attestKeyDescriptor == null
-            val chain =
-                buildChain(keyPair, params, signing, uid, securityLevel, appendSigningChain)
-            keyPair to chain
+            // Keybox path: the Google attestation key must never enter this process, so the chain
+            // is signed by the daemon and only the public DER chain comes back.
+            val chain = ForgeClient.forgeChain(chainBuildRequest(keyPair, params, uid, securityLevel))
+                ?: return null
+            keyPair to chain.mapNotNull(::parseCertificateDer)
         }
         raw.exceptionOrNull()?.let { if (it is ServiceSpecificException) throw it }
         return raw.onFailure { Logger.e("Failed to generate key pair with certificates", it) }.getOrNull()
     }
 
-    private fun getKeyboxForAlgorithm(algorithm: Int): KeyBox? {
-        val name =
-            when (algorithm) {
-                Algorithm.EC -> KeyProperties.KEY_ALGORITHM_EC
-
-                Algorithm.RSA -> KeyProperties.KEY_ALGORITHM_RSA
-
-                else -> {
-                    Logger.e("Unsupported algorithm: $algorithm")
-                    null
-                }
-            } ?: return null
-        return KeyBoxUtils.keyboxes[name] ?: KeyBoxUtils.keyboxes.values.firstOrNull()
+    /**
+     * Packs everything the daemon needs to sign the fresh leaf with the keybox: the leaf key
+     * (its material returns to this process for software operations regardless, so sending it is
+     * not a new exposure), the pre-encoded attestation extension and the certificate fields.
+     */
+    private fun chainBuildRequest(
+        keyPair: KeyPair,
+        params: KeyGenParameters,
+        uid: Int,
+        securityLevel: Int,
+    ): ChainBuildRequest {
+        val creationTimeMs = params.createdAtMs ?: System.currentTimeMillis()
+        params.createdAtMs = creationTimeMs
+        return ChainBuildRequest(
+            algorithm = params.algorithm,
+            leafPrivateKey = keyPair.private.encoded,
+            attestationDer = buildAttestationDer(params, uid, securityLevel, creationTimeMs),
+            notBeforeMs = (params.certificateNotBefore ?: Date(0)).time,
+            notAfterMs = (params.certificateNotAfter ?: Date(253402300799000L)).time,
+            appendSigningChain = true,
+            purposes = params.purpose.toIntArray(),
+            serialDer = params.certificateSerial?.toByteArray() ?: ByteArray(0),
+            subjectDer = params.certificateSubject ?: ByteArray(0),
+        )
     }
+
+    private fun parseCertificateDer(der: ByteArray): Certificate? =
+        runCatching {
+            CertificateUtils.certificateFactory.generateCertificate(der.inputStream()) as Certificate
+        }.onFailure { Logger.e("Failed to parse forged certificate", it) }.getOrNull()
 
     private fun getAttestationKeyInfo(
         uid: Int,
@@ -400,8 +418,8 @@ object CertificateGen {
         )
     }
 
-    /** Wraps a keybox as the signing material for the freshly minted leaf. */
-    private fun keyboxSigningMaterial(keybox: KeyBox): SigningMaterial =
+    /** Wraps a keybox as the signing material for the freshly minted leaf. Daemon-side only. */
+    fun keyboxSigningMaterial(keybox: KeyBox): SigningMaterial =
         SigningMaterial(
             keyPair = keybox.keyPair,
             certChainDer = CertificateUtils.run { keybox.certificates.toByteArray() },
@@ -448,7 +466,20 @@ object CertificateGen {
         if (signingChain.isEmpty()) return null
 
         val request =
-            runCatching { encodeChainBuildRequest(keyPair, attestationDer, signing, params, appendSigningChain) }
+            runCatching {
+                encodeChainBuildRequest(
+                    algorithm = params.algorithm,
+                    leafPrivateKey = keyPair.private.encoded,
+                    attestationDer = attestationDer,
+                    signing = signing,
+                    notBeforeMs = (params.certificateNotBefore ?: Date(0)).time,
+                    notAfterMs = (params.certificateNotAfter ?: Date(253402300799000L)).time,
+                    appendSigningChain = appendSigningChain,
+                    purposes = params.purpose.toIntArray(),
+                    serialDer = params.certificateSerial?.toByteArray() ?: ByteArray(0),
+                    subjectDer = params.certificateSubject ?: ByteArray(0),
+                )
+            }
                 .onFailure { Logger.e("Failed to encode native chain request", it) }
                 .getOrNull() ?: return null
 
@@ -465,31 +496,37 @@ object CertificateGen {
 
     /**
      * Packs the chain-build request for the native builder: leaf key, pre-encoded attestation
-     * extension and signing material (see the Rust `chaingen` module for the layout). Absent
-     * optional values are encoded as zero-length fields so the native side applies its defaults,
-     * and the validity dates are pre-resolved to the defaults the native builder expects.
+     * extension and signing material (see the Rust `chaingen` module for the layout). Shared by
+     * the in-process designated-attest-key path and the daemon-side keybox path so the wire and
+     * native layouts cannot drift apart. Absent optional values are encoded as zero-length fields
+     * so the native side applies its defaults.
      */
-    private fun encodeChainBuildRequest(
-        keyPair: KeyPair,
+    fun encodeChainBuildRequest(
+        algorithm: Int,
+        leafPrivateKey: ByteArray,
         attestationDer: ByteArray,
         signing: SigningMaterial,
-        params: KeyGenParameters,
+        notBeforeMs: Long,
+        notAfterMs: Long,
         appendSigningChain: Boolean,
+        purposes: IntArray,
+        serialDer: ByteArray,
+        subjectDer: ByteArray,
     ): ByteArray {
         val out = ByteArrayOutputStream()
         DataOutputStream(out).use { data ->
-            data.writeInt(params.algorithm)
-            data.writeLong((params.certificateNotBefore ?: Date(0)).time)
-            data.writeLong((params.certificateNotAfter ?: Date(253402300799000L)).time)
+            data.writeInt(algorithm)
+            data.writeLong(notBeforeMs)
+            data.writeLong(notAfterMs)
             data.writeByte(if (appendSigningChain) 1 else 0)
-            data.writeLengthPrefixed(keyPair.private.encoded)
+            data.writeLengthPrefixed(leafPrivateKey)
             data.writeLengthPrefixed(attestationDer)
             data.writeLengthPrefixed(signing.keyPair.private.encoded)
             data.writeLengthPrefixed(signing.certChainDer ?: ByteArray(0))
-            data.writeInt(params.purpose.size)
-            params.purpose.forEach { data.writeInt(it) }
-            data.writeLengthPrefixed(params.certificateSerial?.toByteArray() ?: ByteArray(0))
-            data.writeLengthPrefixed(params.certificateSubject ?: ByteArray(0))
+            data.writeInt(purposes.size)
+            purposes.forEach { data.writeInt(it) }
+            data.writeLengthPrefixed(serialDer)
+            data.writeLengthPrefixed(subjectDer)
         }
         return out.toByteArray()
     }
@@ -517,9 +554,8 @@ object CertificateGen {
     fun generateChain(uid: Int, params: KeyGenParameters, keyPair: KeyPair, securityLevel: Int = 1): List<ByteArray>? {
         val raw = runCatching {
             params.createdAtMs = params.createdAtMs ?: System.currentTimeMillis()
-            val keybox = getKeyboxForAlgorithm(params.algorithm) ?: return null
-            buildChain(keyPair, params, keyboxSigningMaterial(keybox), uid, securityLevel, true)
-                .map { it.encoded }
+            // Signing runs in the daemon (keybox private key); only DER comes back.
+            ForgeClient.forgeChain(chainBuildRequest(keyPair, params, uid, securityLevel))
         }
         return raw.onFailure { Logger.e("Failed to generate certificate chain", it) }.getOrNull()
     }

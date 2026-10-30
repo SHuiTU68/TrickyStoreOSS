@@ -16,12 +16,17 @@ import android.security.keystore.KeystoreResponse
 import io.github.beakthoven.TrickyStoreOSS.logging.Logger
 import kotlin.system.exitProcess
 
+private const val RESTART_RETRY_DELAY_MS = 1000L
+
 abstract class BaseKeystoreInterceptor : BinderInterceptor() {
 
     protected lateinit var keystore: IBinder
-    protected var triedCount = 0
-    protected var injected = false
-    protected open val maxRetries: Int = 3
+    @Volatile protected var triedCount = 0
+    @Volatile protected var injected = false
+    protected open val maxRetries: Int = 30
+
+    private val restartLock = Any()
+    @Volatile private var reregistering = false
 
     protected abstract val serviceName: String
     protected abstract val injectionCommand: String
@@ -91,10 +96,43 @@ abstract class BaseKeystoreInterceptor : BinderInterceptor() {
     protected open fun createDeathRecipient(): IBinder.DeathRecipient =
         object : IBinder.DeathRecipient {
             override fun binderDied() {
-                Logger.d("$serviceName died, daemon restarting")
-                exitProcess(0)
+                Logger.w("$serviceName died; watching for its restart instead of exiting")
+                scheduleReregistration()
             }
         }
+
+    /**
+     * Re-enters the registration loop in place. The dead service's binder is gone; the next
+     * attempts pick up the freshly restarted keystore process (new pid, empty maps), inject again
+     * and re-register. Staying alive avoids the old design's cost: a daemon exit meant a JVM cold
+     * start plus a fresh probe and property pass, and in that window target apps transacted with
+     * the real, unhooked keystore — the exact race that surfaced as probe failures after a
+     * keystore2 crash. The shell supervisor remains as the backstop for genuine daemon failures.
+     */
+    private fun scheduleReregistration() {
+        synchronized(restartLock) {
+            if (reregistering) return
+            reregistering = true
+        }
+        Thread({
+            try {
+                // Fresh budget for the fresh process: the counters guard the *startup* path, and
+                // leaking them here would give up before the new keystore finishes booting.
+                triedCount = 0
+                injected = false
+                while (!tryRunKeystoreInterceptor()) {
+                    Logger.d("Waiting for $serviceName to come back...")
+                    Thread.sleep(RESTART_RETRY_DELAY_MS)
+                }
+                Logger.i("$serviceName re-registered after restart")
+            } catch (e: Exception) {
+                Logger.e("Re-registration loop failed; falling back to supervisor restart", e)
+                exitProcess(0)
+            } finally {
+                synchronized(restartLock) { reregistering = false }
+            }
+        }, "tsoss-reregister").apply { isDaemon = true }.start()
+    }
 
     protected open fun onInterceptorSetup(service: IBinder, backdoor: IBinder) {
         // Default implementation does nothing

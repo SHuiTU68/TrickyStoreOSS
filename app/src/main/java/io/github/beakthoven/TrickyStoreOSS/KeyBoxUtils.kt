@@ -28,10 +28,26 @@ object KeyBoxUtils {
     val keyboxes: Map<String, KeyBox>
         get() = keyboxSnapshot
 
-    fun hasKeyboxes(): Boolean = keyboxSnapshot.isNotEmpty()
+    /**
+     * In the daemon this is the local snapshot. Inside the keystore process no keybox is ever
+     * parsed — the material lives with the forge daemon — so the gate asks the daemon instead,
+     * preserving the legacy chain-hack decision semantics without the private key ever crossing.
+     */
+    fun hasKeyboxes(): Boolean =
+        if (io.github.beakthoven.TrickyStoreOSS.forge.ProcessRole.isForgeHost) {
+            keyboxSnapshot.isNotEmpty()
+        } else {
+            io.github.beakthoven.TrickyStoreOSS.forge.ForgeClient.keyboxAvailable()
+        }
 
     @Synchronized
     fun readFromXml(xmlData: String?, isCurrent: (() -> Boolean)? = null): Boolean {
+        if (!io.github.beakthoven.TrickyStoreOSS.forge.ProcessRole.isForgeHost) {
+            // The keystore-process copy of this dex must never hold keybox material; its needs
+            // are served over the forge socket instead.
+            if (xmlData != null) Logger.i("Keybox ignored outside the daemon process")
+            return xmlData == null
+        }
         if (xmlData == null) {
             if (isCurrent != null && !isCurrent()) return false
             val previous = keyboxSnapshot
