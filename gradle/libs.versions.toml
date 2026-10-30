@@ -1,10 +1,14 @@
 [versions]
 agp = "9.4.1"
 annotation = "1.11.0"
+junit = "4.13.2"
 libcxx = "29.0.14206865"
+mockito = "5.18.0"
 
 [libraries]
 annotation = { module = "androidx.annotation:annotation", version.ref = "annotation" }
+junit = { module = "junit:junit", version.ref = "junit" }
+mockito = { module = "org.mockito:mockito-core", version.ref = "mockito" }
 org-lsposed-libcxx-libcxx = { module = "org.lsposed.libcxx:libcxx", version.ref = "libcxx" }
 
 [plugins]

@@ -122,12 +122,26 @@ android {
     }
     buildFeatures { prefab = true }
     packaging { resources { pickFirsts += setOf("META-INF/LICENSE.md", "META-INF/NOTICE.md", "META-INF/INDEX.LIST") } }
+
+    testOptions {
+        // Public framework APIs (android.util.Log, …) must return defaults under the mockable
+        // android.jar instead of aborting tests with "not mocked". Hidden APIs come from
+        // `project(":stub")`, whose statics throw — Logger guards those itself.
+        unitTests.isReturnDefaultValues = true
+    }
 }
 
 dependencies {
     compileOnly(project(":stub"))
     compileOnly(libs.annotation)
     implementation(libs.org.lsposed.libcxx.libcxx)
+
+    // Unit tests run against the framework stubs (keymint Tag/Algorithm/KeyParameterValue, …)
+    // rather than the mockable android.jar, which only carries the public SDK surface. The
+    // stub's union statics all throw, so KeyParameterValue instances are Mockito mocks.
+    testImplementation(project(":stub"))
+    testImplementation(libs.junit)
+    testImplementation(libs.mockito)
 }
 
 // --- Rust cross-compilation plumbing ---
@@ -370,6 +384,30 @@ val certgenManifestStash = certgenCrateDir.resolve("Cargo.toml.build-std-stash")
 
 fun buildStdRequested() = System.getenv("TSTORE_BUILD_STD") == "1"
 
+// Pinned nightly for the `-Z build-std` rebuild. `panic = "immediate-abort"` only resolves on
+// recent nightlies, so an unpinned `nightly` drifting under us would silently change — or break —
+// the shipped library. Keep in sync with the `rustup toolchain install` steps in
+// .github/workflows/{build,release,build-std-probe}.yml; override with TSTORE_NIGHTLY to try a
+// different toolchain locally.
+val buildStdNightly = System.getenv("TSTORE_NIGHTLY") ?: "nightly-2026-10-23"
+
+// The manifest rewrite inside buildRustCertgen is a doFirst/doLast pair, and Gradle skips doLast
+// when the task fails — a failed build-std run would leave Cargo.toml carrying `cargo-features`
+// and `panic = "immediate-abort"`, which the pinned stable toolchain then refuses to parse. The
+// restore therefore lives in a *finalizer* task: finalizers run whether the build succeeds,
+// fails, or is skipped. `onlyIf` keeps it a no-op whenever no stash exists.
+val restoreCertgenManifest =
+    tasks.register("restoreCertgenManifest") {
+        group = "TrickyStoreOSS Native Build"
+        description = "Restores native-certgen/Cargo.toml from the build-std stash, even after a failed build"
+        onlyIf { certgenManifestStash.exists() }
+        doLast {
+            certgenManifestStash.copyTo(certgenManifest, overwrite = true)
+            certgenManifestStash.delete()
+            println("Restored ${certgenManifest.name} from build-std stash")
+        }
+    }
+
 fun buildCertgenCommandLine(): List<String> {
     val args =
         mutableListOf(
@@ -393,6 +431,10 @@ val buildRustCertgen =
         group = "TrickyStoreOSS Native Build"
         description = "Builds libcertgen.so via cargo-ndk for arm64-v8a."
 
+        // Run the restore after this task no matter how it ended; onlyIf inside keeps it free
+        // when no stash exists (e.g. build-std not requested).
+        finalizedBy(restoreCertgenManifest)
+
         notCompatibleWithConfigurationCache("resolves the NDK when the task runs")
 
         workingDir = rootProject.projectDir.resolve("native-certgen")
@@ -406,6 +448,13 @@ val buildRustCertgen =
 
         doFirst {
             rustAndroidEnvironment(resolveAndroidNdk()).forEach { (key, value) -> environment(key, value) }
+            // Self-heal first: a build-std run that died hard (killed daemon, dropped CI job)
+            // can outlive its finalizer and leave a stale stash — start from a clean manifest
+            // so a normal stable build never sees the patched file.
+            if (certgenManifestStash.exists()) {
+                certgenManifestStash.copyTo(certgenManifest, overwrite = true)
+                certgenManifestStash.delete()
+            }
             if (buildStdRequested()) {
                 certgenManifest.copyTo(certgenManifestStash, overwrite = true)
                 certgenManifest.writeText(
@@ -415,14 +464,7 @@ val buildRustCertgen =
                             "panic = \"immediate-abort\"",
                         ),
                 )
-                environment("RUSTUP_TOOLCHAIN", "nightly")
-            }
-        }
-
-        doLast {
-            if (certgenManifestStash.exists()) {
-                certgenManifestStash.copyTo(certgenManifest, overwrite = true)
-                certgenManifestStash.delete()
+                environment("RUSTUP_TOOLCHAIN", buildStdNightly)
             }
         }
     }

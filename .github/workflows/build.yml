@@ -54,13 +54,12 @@ jobs:
       # 318 KB off the library with every `panicked at` string gone. Rebuilding std needs `-Z`,
       # which needs nightly, so a second toolchain is installed next to the pinned stable one.
       # native-certgen/rust-toolchain.toml stays on stable for everything else (including the
-      # `cargo test` gates below); the Gradle task overrides it with RUSTUP_TOOLCHAIN=nightly for
-      # this one build. rust-src is what build-std compiles from.
-      - name: Setup nightly Rust toolchain (build-std for libcertgen)
-        uses: dtolnay/rust-toolchain@nightly
-        with:
-          targets: aarch64-linux-android
-          components: rust-src
+      # `cargo test` gates below); the Gradle task overrides it with RUSTUP_TOOLCHAIN for this
+      # one build. rust-src is what build-std compiles from.
+      # The date is pinned to keep the shipped library reproducible — keep in sync with
+      # `buildStdNightly` in app/build.gradle.kts (override there with TSTORE_NIGHTLY).
+      - name: Setup pinned nightly Rust toolchain (build-std for libcertgen)
+        run: rustup toolchain install nightly-2026-10-23 --profile minimal --component rust-src --target aarch64-linux-android
 
       - name: Cache Rust artifacts
         uses: actions/cache@v4
@@ -99,6 +98,11 @@ jobs:
       - name: Test Rust injection helpers
         working-directory: native-inject
         run: cargo test --locked
+      # The daemon owns config parsing, the probe plumbing and the interceptor decision logic,
+      # so its tests gate the build alongside the other two crates.
+      - name: Test Rust daemon logic
+        working-directory: native-daemon
+        run: cargo test --locked
 
       - name: Setup Gradle
         uses: gradle/actions/setup-gradle@v6.4.0
@@ -108,7 +112,9 @@ jobs:
           # Opts libcertgen into the std rebuild described above. Everything else in the
           # Gradle build stays on the pinned stable toolchain.
           TSTORE_BUILD_STD: "1"
-        run: ./gradlew --parallel assembleRelease assembleDebug lintRelease --stacktrace
+        # testDebugUnitTest gates the Kotlin layer (request parsing, auth-policy validity,
+        # the platform keygen fallback) alongside the Rust crate tests above.
+        run: ./gradlew --parallel assembleRelease assembleDebug lintRelease testDebugUnitTest --stacktrace
 
       - name: Prepare artifact
         id: prepareArtifact

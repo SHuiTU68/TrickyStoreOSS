@@ -19,6 +19,8 @@ out/
 native-certgen/target/
 native-inject/target/
 native-daemon/target/
+# transient manifest copy made while building libcertgen under `-Z build-std`
+native-certgen/Cargo.toml.build-std-stash
 app/src/main/jniLibs/**/*.so
 
 # local scan/report artifacts uploaded from the device

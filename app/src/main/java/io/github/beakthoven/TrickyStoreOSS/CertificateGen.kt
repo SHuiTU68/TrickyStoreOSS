@@ -158,7 +158,12 @@ object CertificateGen {
             }
             authPolicyProvenance =
                 if (authPolicyParsed) AuthPolicyProvenance.RAW_REQUEST else AuthPolicyProvenance.UNKNOWN
-            if (ecCurveName == null && keySize != 0) ecCurveName = resolveEcCurveName(0, keySize)
+            // Key-size fallback must go straight to the size lookup: EcCurve.P_224 is 0, so
+            // passing 0 as the curve into resolveEcCurveName would match P_224 and label every
+            // size-only request "secp224r1".
+            if (ecCurveName == null && keySize != 0) {
+                ecCurveName = EC_CURVES.firstOrNull { it.size == keySize }?.name ?: "secp256r1"
+            }
         }
 
         val noAuthRequiredIsValid: Boolean

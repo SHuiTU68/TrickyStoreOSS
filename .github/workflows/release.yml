@@ -29,6 +29,34 @@ jobs:
           distribution: temurin
           java-version: 26
 
+      # The release build compiles the Rust crates (libcertgen/librustinject/librustdaemon),
+      # so it needs the same toolchain setup the regular Build workflow uses: pinned stable for
+      # cargo test / non-certgen crates, plus the pinned nightly that rebuilds std for
+      # libcertgen (see `buildStdNightly` in app/build.gradle.kts).
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android
+
+      - name: Setup pinned nightly Rust toolchain (build-std for libcertgen)
+        run: rustup toolchain install nightly-2026-10-23 --profile minimal --component rust-src --target aarch64-linux-android
+
+      - name: Cache Rust artifacts
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            ~/.cargo/bin/cargo-ndk
+            native-certgen/target
+            native-inject/target
+            native-daemon/target
+          key: rust-${{ runner.os }}-${{ hashFiles('native-certgen/Cargo.lock', 'native-inject/Cargo.lock', 'native-daemon/Cargo.lock') }}
+          restore-keys: rust-${{ runner.os }}-
+
+      - name: Install cargo-ndk
+        run: command -v cargo-ndk || cargo install cargo-ndk
+
       - name: Set up ccache
         uses: hendrikmuhs/ccache-action@v1.2
         with:
@@ -42,6 +70,10 @@ jobs:
         uses: gradle/actions/setup-gradle@v6.4.0
 
       - name: Build release
+        env:
+          # Ship the size-optimized libcertgen (std rebuilt under immediate-abort), same as
+          # the regular Build workflow.
+          TSTORE_BUILD_STD: "1"
         run: ./gradlew --parallel assembleRelease --stacktrace
 
       - name: Resolve release zip

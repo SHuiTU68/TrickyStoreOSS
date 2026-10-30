@@ -19,11 +19,10 @@ jobs:
           submodules: "recursive"
           fetch-depth: 0
 
-      - name: Setup nightly Rust toolchain
-        uses: dtolnay/rust-toolchain@nightly
-        with:
-          targets: aarch64-linux-android
-          components: rust-src
+      - name: Setup pinned nightly Rust toolchain
+        # Same pin as app/build.gradle.kts `buildStdNightly`, so probe numbers describe the
+        # toolchain the real build uses instead of whatever nightly happens to be current.
+        run: rustup toolchain install nightly-2026-10-23 --profile minimal --component rust-src --target aarch64-linux-android
 
       - name: Install cargo-ndk
         run: command -v cargo-ndk || cargo install cargo-ndk
@@ -56,7 +55,7 @@ jobs:
           sed -i 's/^panic = "abort"/panic = "immediate-abort"/' Cargo.toml
           head -3 Cargo.toml
           grep -n 'panic =' Cargo.toml
-          RUSTUP_TOOLCHAIN=nightly cargo ndk -t arm64-v8a -o /tmp/probe/buildstd build \
+          RUSTUP_TOOLCHAIN=nightly-2026-10-23 cargo ndk -t arm64-v8a -o /tmp/probe/buildstd build \
             -Z build-std=std,panic_abort \
             --release
           cp /tmp/Cargo.toml.orig Cargo.toml
@@ -69,7 +68,7 @@ jobs:
           sed -i 's/^panic = "abort"/panic = "immediate-abort"/' Cargo.toml
           sed -i 's/^opt-level = "z"/opt-level = 2/' Cargo.toml
           grep -n 'opt-level\|panic =' Cargo.toml
-          RUSTUP_TOOLCHAIN=nightly cargo ndk -t arm64-v8a -o /tmp/probe/buildstd2 build \
+          RUSTUP_TOOLCHAIN=nightly-2026-10-23 cargo ndk -t arm64-v8a -o /tmp/probe/buildstd2 build \
             -Z build-std=std,panic_abort \
             --release
           cp /tmp/Cargo.toml.orig Cargo.toml

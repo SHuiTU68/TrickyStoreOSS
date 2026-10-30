@@ -11,7 +11,11 @@ import android.util.Log
 private const val TAG = "TrickyStoreOSS"
 
 object Logger {
-    private val logdReady: Boolean by lazy { SystemProperties.get("init.svc.logd", "") == "running" }
+    // runCatching: outside the device (JVM unit tests) android.os.SystemProperties comes from the
+    // `stub` classes, whose statics throw — logging must degrade to "off" rather than crash callers.
+    private val logdReady: Boolean by lazy {
+        runCatching { SystemProperties.get("init.svc.logd", "") == "running" }.getOrDefault(false)
+    }
 
     fun v(msg: String, tr: Throwable? = null) = log(Log.VERBOSE, msg, tr)
 
