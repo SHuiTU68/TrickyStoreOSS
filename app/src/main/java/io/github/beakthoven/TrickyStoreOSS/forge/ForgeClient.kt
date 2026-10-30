@@ -19,7 +19,6 @@ import java.io.DataOutputStream
  * path had.
  */
 object ForgeClient {
-    private const val CONNECT_TIMEOUT_MS = 1_500
     private const val IO_TIMEOUT_MS = 15_000
     private const val MAX_RESPONSE = 1 shl 22
 
@@ -69,9 +68,15 @@ object ForgeClient {
 
     private fun exchange(op: Int, payload: ByteArray): ByteArray {
         LocalSocket().use { socket ->
+            // android.net.LocalSocket#connect(LocalSocketAddress, int) is a stub on every
+            // AOSP branch we ship to (13 / 14 / 15 / 16 / master): it throws
+            // UnsupportedOperationException() with a null message, so this overload can
+            // never connect. The single-argument form calls LocalSocketImpl.connect()
+            // directly (fully implemented, and it ignores the timeout anyway), the
+            // abstract-namespace connect to a local daemon returns immediately, and the
+            // read side stays bounded by soTimeout below.
             socket.connect(
                 LocalSocketAddress(ForgeProtocol.SOCKET_NAME, LocalSocketAddress.Namespace.ABSTRACT),
-                CONNECT_TIMEOUT_MS,
             )
             socket.soTimeout = IO_TIMEOUT_MS
             DataOutputStream(socket.outputStream).use { out ->
