@@ -94,9 +94,7 @@ object ForgeServer {
                         val length = input.readInt()
                         if (length !in 1..MAX_REQUEST) break
                         val request = ByteArray(length).also { input.readFully(it) }
-                        val stream = DataInputStream(request.inputStream())
-                        val op = stream.readInt()
-                        val payload = ByteArray(request.size - 4).also { stream.readFully(it) }
+                        val (op, payload) = ForgeProtocol.decodeRequest(request)
                         val response = dispatch(op, payload)
                         out.writeInt(response.size)
                         out.write(response)

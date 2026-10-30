@@ -149,4 +149,46 @@ class ForgeProtocolTest {
         assertEquals(3, ((frame[4].toInt() and 0xFF) shl 24) or ((frame[5].toInt() and 0xFF) shl 16) or ((frame[6].toInt() and 0xFF) shl 8) or (frame[7].toInt() and 0xFF))
         assertArrayEquals(payload, frame.copyOfRange(8, frame.size))
     }
+
+    @Test
+    fun `request frame round trip splits op from payload`() {
+        val payload = byteArrayOf(1, 2, 3, 4, 5)
+        val (op, decoded) = ForgeProtocol.decodeRequest(ForgeProtocol.encodeRequest(ForgeProtocol.OP_HACK_LEAF, payload))
+        assertEquals(ForgeProtocol.OP_HACK_LEAF, op)
+        assertArrayEquals(payload, decoded)
+    }
+
+    @Test
+    fun `request frame with empty payload round trips`() {
+        val (op, decoded) = ForgeProtocol.decodeRequest(ForgeProtocol.encodeRequest(ForgeProtocol.OP_KEYBOX_STATUS, ByteArray(0)))
+        assertEquals(ForgeProtocol.OP_KEYBOX_STATUS, op)
+        assertEquals(0, decoded.size)
+    }
+
+    @Test
+    fun `leaf hack op decodes after the full daemon frame`() {
+        // Regression: ForgeServer used to slice `request.size - 4` as the payload, folding the
+        // four-byte payload-length header into it. Every payload-carrying op then failed (EOF on
+        // the trailing read), the daemon answered with a failure blob, and callers degraded to the
+        // real TEE chain — which surfaced as bootloader attestation leaking the unlocked state.
+        val leaf = ByteArray(700) { (it % 253).toByte() }
+        val opPayload = ForgeProtocol.encodeLeafHack(leaf, 1017)
+        val (op, payload) = ForgeProtocol.decodeRequest(ForgeProtocol.encodeRequest(ForgeProtocol.OP_HACK_LEAF, opPayload))
+        assertEquals(ForgeProtocol.OP_HACK_LEAF, op)
+        val (der, uid) = ForgeProtocol.decodeLeafHack(payload)
+        assertArrayEquals(leaf, der)
+        assertEquals(1017, uid)
+    }
+
+    @Test
+    fun `request frame rejects a length field that disagrees with the blob`() {
+        val frame = ForgeProtocol.encodeRequest(ForgeProtocol.OP_HACK_LEAF, byteArrayOf(1, 2, 3))
+        frame[7] = 4 // claim four payload bytes inside a three-byte payload
+        try {
+            ForgeProtocol.decodeRequest(frame)
+            throw AssertionError("expected a disagreeing length field to be rejected")
+        } catch (expected: IllegalArgumentException) {
+            assertTrue(expected.message!!.contains("malformed request frame"))
+        }
+    }
 }

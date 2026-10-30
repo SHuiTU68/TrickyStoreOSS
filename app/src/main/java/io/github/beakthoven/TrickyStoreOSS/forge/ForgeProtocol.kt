@@ -175,6 +175,24 @@ object ForgeProtocol {
         return out.toByteArray()
     }
 
+    /**
+     * Splits a framed request blob back into its op and payload. The length field is validated
+     * against the blob so a caller that mis-slices the frame (off-by-one-header) fails loudly here
+     * instead of silently handing shifted bytes to the op decoders.
+     */
+    fun decodeRequest(blob: ByteArray): Pair<Int, ByteArray> {
+        DataInputStream(ByteArrayInputStream(blob)).use { data ->
+            val op = data.readInt()
+            val payloadLength = data.readInt()
+            require(payloadLength == blob.size - 8) {
+                "malformed request frame: payload length $payloadLength, blob ${blob.size}"
+            }
+            val payload = ByteArray(payloadLength)
+            data.readFully(payload)
+            return op to payload
+        }
+    }
+
     private const val MAX_PURPOSES = 256
     private const val MAX_CHAIN_LENGTH = 32
     private const val MAX_BLOB = 1 shl 22
