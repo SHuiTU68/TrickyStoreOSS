@@ -1,0 +1,8 @@
+/* Version script for libTrickyStoreOSS.so: the injector dlsym()s `entry` and nothing
+   else, so nothing else leaves the object. See CMakeLists.txt for the wiring. */
+{
+  global:
+    entry;
+  local:
+    *;
+};

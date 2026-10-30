@@ -1,0 +1,12 @@
+# The daemon is cross-built with plain `cargo build --target aarch64-linux-android`; Gradle's
+# rustAndroidEnvironment points CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER at the NDK's
+# API-versioned clang wrapper, the same one the other crates name here.
+[target.aarch64-linux-android]
+linker = "aarch64-linux-android29-clang"
+# Hardening for the control-plane binary: `-z now` gives full RELRO (its GOT holds libc
+# pointers next to root-privileged state); the rest are rustc defaults kept explicit.
+rustflags = [
+    "-C", "link-arg=-Wl,-z,now",
+    "-C", "link-arg=-Wl,-z,noexecstack",
+    "-C", "link-arg=-Wl,--gc-sections",
+]

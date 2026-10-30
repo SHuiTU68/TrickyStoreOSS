@@ -2,3 +2,13 @@
 # can be cross-built the same way. Gradle prepends the NDK toolchain bin directory.
 [target.aarch64-linux-android]
 linker = "aarch64-linux-android29-clang"
+# Hardening for the cdylib payload (link args only affect cdylib/bin link steps): `-z now`
+# pins full RELRO (the GOT holds libc pointers inside keystore2/system_server), the other
+# two are rustc defaults kept explicit. Export control is rustc's own auto-generated
+# version script: the cdylib surface is `entry` plus the ts_* C ABI, the same names the
+# staticlib half must expose for libinject.so to link, so the auto list is already minimal.
+rustflags = [
+    "-C", "link-arg=-Wl,-z,now",
+    "-C", "link-arg=-Wl,-z,noexecstack",
+    "-C", "link-arg=-Wl,--gc-sections",
+]

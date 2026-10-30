@@ -1,5 +1,20 @@
 [target.aarch64-linux-android]
 linker = "aarch64-linux-android29-clang"
+# Hardening for the shipped cdylib (link args only affect cdylib/bin link steps):
+#   * `-z now` — BIND_NOW, so the GOT is fully resolved and mprotected read-only (full
+#     RELRO) before any untrusted input reaches the JNI surface;
+#   * `-z noexecstack` + `--gc-sections` — rustc already passes both for cdylibs; kept
+#     explicit so the guarantee does not depend on a toolchain default.
+# Export control needs no version script here: rustc generates one itself for cdylib
+# links (verified on the aarch64-linux-android triple — rustc passes
+# `-Wl,--version-script=<tmp>/list -Wl,--no-undefined-version`), and that list contains
+# exactly the #[no_mangle] surface, i.e. the Java_* JNI family and nothing else. A
+# hand-written script would race rustc's own in the multi-script merge and silently lose.
+rustflags = [
+    "-C", "link-arg=-Wl,-z,now",
+    "-C", "link-arg=-Wl,-z,noexecstack",
+    "-C", "link-arg=-Wl,--gc-sections",
+]
 
 [target.armv7-linux-androideabi]
 linker = "armv7a-linux-androideabi29-clang"

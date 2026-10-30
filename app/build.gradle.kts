@@ -306,6 +306,11 @@ fun stripUnwindTables(ndk: File, artifact: File) {
                 objcopy.absolutePath,
                 "--remove-section=.eh_frame",
                 "--remove-section=.eh_frame_hdr",
+                // `.comment` is a plain compiler-version string ("clang version 19.x …"); it
+                // identifies the exact toolchain that produced the artifact and serves no
+                // runtime purpose. The GNU build-id stays: it is a content hash that helps
+                // symbolication and does not fingerprint the build environment.
+                "--remove-section=.comment",
                 artifact.absolutePath,
             )
             .redirectErrorStream(true)
@@ -632,11 +637,16 @@ androidComponents {
 
                 val dexEntry = Regex("""classes\d*\.dex""")
                 var carried = 0
+                // Entry timestamps default to "now", which stamps every payload.bin with the
+                // moment of its build. A fixed value drops that fingerprint and makes the
+                // artifact byte-reproducible for a given dex (ZipEntry.time is epoch millis;
+                // 1980-01-01T00:00:00Z is the DOS epoch zip tooling standardizes on).
+                val fixedZipTime = 315_532_800_000L
                 ZipOutputStream(tempDir.resolve("payload.bin").outputStream()).use { out ->
                     ZipFile(apk).use { zip ->
                         for (entry in zip.entries()) {
                             if (entry.isDirectory || !dexEntry.matches(entry.name)) continue
-                            out.putNextEntry(ZipEntry(entry.name))
+                            out.putNextEntry(ZipEntry(entry.name).apply { time = fixedZipTime })
                             zip.getInputStream(entry).use { input -> input.copyTo(out) }
                             out.closeEntry()
                             carried++
