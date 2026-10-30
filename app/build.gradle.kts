@@ -447,8 +447,10 @@ val buildRustCertgen =
         group = "TrickyStoreOSS Native Build"
         description = "Builds libcertgen.so via cargo-ndk for arm64-v8a."
 
-        // Run the restore after this task no matter how it ended; onlyIf inside keeps it free
-        // when no stash exists (e.g. build-std not requested).
+        // On failure the doLast restore is skipped (Gradle skips doLast when the task fails),
+        // so the finalizer is the safety net that keeps the manifest parseable for the stable
+        // toolchain after an aborted build-std run; its onlyIf makes it a no-op when the
+        // doLast above already restored.
         finalizedBy(restoreCertgenManifest)
 
         workingDir = rootProject.projectDir.resolve("native-certgen")
@@ -498,6 +500,19 @@ val buildRustCertgen =
                 exec.environment("RUSTUP_TOOLCHAIN", buildStdNightlyPinned)
             }
         }
+
+        doLast {
+            // Restore the manifest as part of THIS task, not only via the finalizer: the
+            // stable-Cargo consumers below (buildRustInject/buildRustDaemon resolve `certgen`
+            // as a path dependency) depend on this task but do not wait for its finalizers,
+            // so the restore must complete before this task's actions are considered done —
+            // otherwise they would race the patch window under parallel execution.
+            if (certgenStash.exists()) {
+                certgenStash.copyTo(certgenManifest, overwrite = true)
+                certgenStash.delete()
+                println("Restored ${certgenManifest.name} from build-std stash")
+            }
+        }
     }
 
 // --- Native injection helpers (Rust staticlib + cdylib) ---
@@ -518,6 +533,12 @@ val buildRustInject =
     tasks.register<Exec>("buildRustInject") {
         group = "TrickyStoreOSS Native Build"
         description = "Builds librustinject.a/.so for arm64-v8a (the archive is linked into libinject.so)."
+
+        // This crate resolves `certgen` as a path dependency with stable Cargo, which refuses
+        // to parse the build-std-patched manifest. Wait for buildRustCertgen instead of racing
+        // its patch window: its doLast restores the pristine manifest before its actions are
+        // considered complete.
+        dependsOn(buildRustCertgen)
 
         workingDir = rustInjectCrateDir
         commandLine(
@@ -560,6 +581,9 @@ val buildRustDaemon =
     tasks.register<Exec>("buildRustDaemon") {
         group = "TrickyStoreOSS Native Build"
         description = "Builds the tricky-daemon binary for arm64-v8a."
+
+        // Links `certgen` statically — same stable-Cargo constraint as buildRustInject above.
+        dependsOn(buildRustCertgen)
 
         workingDir = rustDaemonCrateDir
         commandLine(
