@@ -32,8 +32,11 @@ fun main(args: Array<String>) {
         Logger.i("Startup attestation probe: ${probe.status} (${probe.failureCategory ?: "none"})")
         AndroidUtils.setupBootHash()
         HideProps.apply()
-        initializeInterceptors()
+        // Start the forge socket before the interceptor goes live: registration is the moment
+        // generateKey traffic can reach hackLeafRemote, and every request landing before the
+        // listening socket exists would degrade to the real TEE chain.
         ForgeServer.start()
+        initializeInterceptors()
         maintainService()
     } catch (e: Exception) {
         Logger.e("Fatal error in main", e)
