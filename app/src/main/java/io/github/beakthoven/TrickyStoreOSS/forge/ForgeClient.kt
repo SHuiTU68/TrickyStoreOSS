@@ -79,19 +79,25 @@ object ForgeClient {
                 LocalSocketAddress(ForgeProtocol.SOCKET_NAME, LocalSocketAddress.Namespace.ABSTRACT),
             )
             socket.soTimeout = IO_TIMEOUT_MS
-            DataOutputStream(socket.outputStream).use { out ->
-                val request = ForgeProtocol.encodeRequest(op, payload)
-                out.writeInt(request.size)
-                out.write(request)
-                out.flush()
-            }
-            DataInputStream(socket.inputStream).use { input ->
-                val length = input.readInt()
-                require(length in 1..MAX_RESPONSE) { "malformed response length $length" }
-                val response = ByteArray(length)
-                input.readFully(response)
-                return response
-            }
+            // Do NOT wrap these streams in use{}: on Android, LocalSocketOutputStream.close()
+            // and LocalSocketInputStream.close() both forward to LocalSocket.close() and take the
+            // whole socket down. Closing the write stream here used to kill the connection before
+            // the response could be read, which surfaced as
+            //   client: Forge daemon unreachable (op=2): IOException: socket not created
+            //   daemon: ForgeServer: connection ended: Broken pipe
+            // The fd is released by the enclosing LocalSocket().use {} block instead.
+            val out = DataOutputStream(socket.outputStream)
+            val request = ForgeProtocol.encodeRequest(op, payload)
+            out.writeInt(request.size)
+            out.write(request)
+            out.flush()
+
+            val input = DataInputStream(socket.inputStream)
+            val length = input.readInt()
+            require(length in 1..MAX_RESPONSE) { "malformed response length $length" }
+            val response = ByteArray(length)
+            input.readFully(response)
+            return response
         }
     }
 }
