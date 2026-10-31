@@ -222,8 +222,44 @@ fn append_adb(script: &mut String, value: &str, notes: &mut Vec<Note>) {
         )));
         return;
     }
-    script.push_str(SETTINGS);
-    script.push_str(" put global adb_enabled 0\n");
+    script.push_str(&adb_disable_script(SETTINGS));
+}
+
+/// How long the retry loop waits for the settings provider, one `put`+`get` attempt per second.
+const ADB_DISABLE_BUDGET: u32 = 30;
+
+/// The `adb=off` applier: a detached retry loop, not a single `settings put`.
+///
+/// The settings provider lives in system_server, which is usually still coming up when the daemon
+/// reaches this script from service.sh. A one-shot `settings put` loses that race, exits non-zero
+/// and its output is discarded by the runner — the toggle is simply still on after boot. That is
+/// the "adb=off stopped working" report, and it is invisible because every other key in this file
+/// goes through `resetprop`, which needs no provider at all.
+///
+/// So the loop keeps `put`-ing once a second until a `get` reads the value back as `0`, and emits
+/// one greppable line through the `log` binary when the budget runs out. The whole block runs
+/// detached — `( ... ) >/dev/null 2>&1 &` — because the caller executes this script synchronously
+/// on the daemon boot path, ahead of the forge socket: waiting out system_server here would delay
+/// every keystore request arriving in the meantime. The redirects also close the inherited stdout
+/// pipe, so the runner's reader sees EOF as soon as the foreground script ends instead of waiting
+/// out the retry budget.
+fn adb_disable_script(settings: &str) -> String {
+    format!(
+        r#"(
+  i=0
+  while [ "$i" -lt {budget} ]; do
+    {settings} put global adb_enabled 0 >/dev/null 2>&1
+    [ "$({settings} get global adb_enabled 2>/dev/null)" = 0 ] && break
+    i=$((i+1))
+    sleep 1
+  done
+  [ "$({settings} get global adb_enabled 2>/dev/null)" = 0 ] ||
+    /system/bin/log -t TrickyStoreOSS "hide_props: adb=off unconfirmed after {budget}s; settings provider never answered"
+) >/dev/null 2>&1 &
+"#,
+        settings = settings,
+        budget = ADB_DISABLE_BUDGET
+    )
 }
 
 /// Rewrites the three USB config properties.
@@ -652,9 +688,23 @@ mod tests {
         let props = FakeProperties::new(&[]);
         let shell = FakeShell::with_resetprop("resetprop");
         for value in ["off", "OFF", "disable", "0"] {
-            let outcome = apply(&format!("adb={value}\n"), &props, &shell);
-            assert_eq!(
-                outcome.script, "/system/bin/settings put global adb_enabled 0\n",
+            let script = apply(&format!("adb={value}\n"), &props, &shell).script;
+            // Detached: the boot script must not wait on the settings provider, and the redirect
+            // must close the inherited stdout pipe so the runner's reader still sees EOF at once.
+            assert!(script.starts_with("(\n"), "value {value}");
+            assert!(script.ends_with(") >/dev/null 2>&1 &\n"), "value {value}");
+            // It keeps putting until a read-back confirms the write landed...
+            assert!(
+                script.contains("/system/bin/settings put global adb_enabled 0"),
+                "value {value}"
+            );
+            assert!(
+                script.contains("/system/bin/settings get global adb_enabled"),
+                "value {value}"
+            );
+            // ...and announces a timeout through the log binary instead of failing silently.
+            assert!(
+                script.contains("hide_props: adb=off unconfirmed after 30s"),
                 "value {value}"
             );
         }
